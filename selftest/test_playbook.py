@@ -395,7 +395,7 @@ class BriefCodingRulesTests(PlaybookTestBase):
                 self.assertEqual("\n### Java\n" in body, java)
                 self.assertEqual("**不用嵌套类和内部类**（写 Java 时）" in body, java)
                 self.assertEqual("\n### MySQL\n" in body, mysql)
-                self.assertEqual("**MySQL 唯一索引名以 `uniq_` 开头**（改动含 MySQL DDL 时）" in body, mysql)
+                self.assertEqual("**MySQL 索引名前缀：普通 `idx_`、唯一 `uniq_`**（改动含 MySQL DDL 时）" in body, mysql)
                 if java and mysql:
                     self.assertLess(body.index("### MySQL"), body.index("### Java"))
                 self.assertNotIn("drover:section", prompt)

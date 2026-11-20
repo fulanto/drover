@@ -51,7 +51,7 @@
 
 - **MySQL 表名、列名不用关键字**（改动含 MySQL DDL 时）：建表、加列时，表名和列名不用 MySQL 保留字或非保留关键字（如 `active`、`status`、`type`、`order`、`key`、`desc`、`group`、`index` 等）。即使加反引号能规避语法错误，也改用语义等价的非关键字名（如 `is_active`、`order_num`）。不同 MySQL 版本 / 工具链对关键字的处理不一致，规避胜于修补。
 - **MySQL 每列写注释和默认值**（改动含 MySQL DDL 时）：所有 DDL（`CREATE TABLE`、`ALTER TABLE … ADD COLUMN`、ORM 模型如 SQLAlchemy `mapped_column` / JPA 注解、启动期自动建列脚本）中，每一列都写 `COMMENT '…'`（说明含义、取值范围 / 枚举、单位或空值语义），并显式声明 `DEFAULT`（`NOT NULL` 列给业务空值如 `''`、`0`、`CURRENT_TIMESTAMP`；可空列写 `DEFAULT NULL`）。表本身也写 `COMMENT`。`TEXT` / `BLOB` / `JSON` 这类 MySQL 不允许字面默认值的列可以不写 `DEFAULT`，但注释不能省。ORM 里对应 `comment=` 与 `server_default=`（不是只有 Python 侧的 `default=`），保证生成的 DDL 与手写 SQL 一致。
-- **MySQL 唯一索引名以 `uniq_` 开头**（改动含 MySQL DDL 时）：手写 SQL 和 ORM（`UniqueConstraint` / unique `Index` 的名字）一律用 `uniq_` 前缀，例如 `uniq_orders_user_id`，不用 `uq_`、`ux_` 之类；手写 SQL 与 ORM 生成的索引名要一致。普通索引的前缀没有硬性规定，按仓库现有惯例。
+- **MySQL 索引名前缀：普通 `idx_`、唯一 `uniq_`**（改动含 MySQL DDL 时）：普通索引名一律以 `idx_` 开头（例如 `idx_orders_created_at`），唯一索引名一律以 `uniq_` 开头（例如 `uniq_orders_user_id`），不用 `ix_`、`uq_`、`ux_`、`key_` 之类。手写 SQL、ORM（`Index` / `UniqueConstraint` 的 `name=`）、启动期自动建索引脚本三处的索引名保持一致。这样一眼分得出普通索引和唯一索引，审核工具也能按前缀校验。
 
 <!-- drover:section java -->
 ### Java

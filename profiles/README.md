@@ -13,7 +13,7 @@ drover 读的规则分三层（包默认又分流程和编码规范两份），�
 | 层 | 在哪 | 放什么 | 谁维护 |
 |---|---|---|---|
 | 包默认 | `flow/dispatch.md`、`bin/drover` | 和团队、仓库无关的通用流程：建 worktree、派发、追踪、验收、集成推送；安全规则（worker 不执行迁移、不写共享 / 生产数据库，数据库写操作默认升级给用户）；需要团队 / 仓库规则的地方挂"按 playbook 做"的钩子 | drover |
-| 包默认编码规范 | `flow/coding-rules.md` | 通用的编码规范，每条只在改到相关代码时适用：通用原则（改编自 Robert C. Martin 的 ub-mode，原文和许可证见 `third_party/ub-mode/`；总带）、MySQL 建表的命名 / 注释 / 默认值 / 唯一索引前缀、Java 的 import 和不用内部类（这两节只给用得上的仓库带，见下面"谁读、什么时候读"）。`config.json` 写 `"default_coding_rules": false` 可以整份关掉，上一行的流程和安全规则不跟着关 | drover |
+| 包默认编码规范 | `flow/coding-rules.md` | 通用的编码规范，每条只在改到相关代码时适用：通用原则（改编自 Robert C. Martin 的 ub-mode，原文和许可证见 `third_party/ub-mode/`；总带）、MySQL 建表的命名 / 注释 / 默认值 / 索引名前缀、Java 的 import 和不用内部类（这两节只给用得上的仓库带，见下面"谁读、什么时候读"）。`config.json` 写 `"default_coding_rules": false` 可以整份关掉，上一行的流程和安全规则不跟着关 | drover |
 | 团队 profile | 团队自己仓库里的一个目录（推荐），或包里的 `profiles/<名字>/` | 团队稳定的、和 drover 流程有关的规则：对团队所有仓库适用的约定、编码规范、各仓库的 playbook（迁移授权和步骤、worktree 位置、基线有失败的命令） | 团队 |
 | 个人覆盖 | `config.json` 的 `playbook_dirs` 里列的目录，按顺序 | 只对你自己成立的补充或改写 | 你自己 |
 
