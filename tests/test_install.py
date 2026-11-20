@@ -1481,6 +1481,21 @@ class MissingAgentCliTests(InstallTestBase):
         self.assert_link(self.skill, self.pkg_dir / "codex" / "skills" / "drover")
         self.assertEqual(self.step(out, "herdr")["level"], "ok")
 
+    def test_check_names_missing_selected_host(self) -> None:
+        """--check：选定的宿主没装时，claude / codex 那一行的装法写出它的官方命令；装在 ~/.local/bin、只是不在 PATH 里时说 PATH"""
+        env = dict(self.env, PATH=self.path_without("codex", "herdr"))
+        self.install_json("--host", "codex", *self.ws_args(), env=env)
+
+        def hint() -> str:
+            rows = self.install_json("--check", rc=None, env=env)["deps"]
+            return [d for d in rows if d["name"].startswith("claude / codex")][0]["hint"]
+        self.assertIn(f"选定的宿主 codex 没装：{CODEX_OFFICIAL}", hint())
+        local = self.home / ".local" / "bin"
+        local.mkdir(parents=True)
+        (local / "codex").write_text("#!/bin/sh\nexit 0\n")
+        (local / "codex").chmod(0o755)
+        self.assertIn("codex 装在 ~/.local/bin，这个目录不在 PATH 里", hint())
+
     def test_no_agents_detected_lists_official_commands(self) -> None:
         env = dict(self.env, PATH=str(self.tmp / "empty-bin"))
         p = self.run_install("--dry-run", rc=2, env=env)

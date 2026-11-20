@@ -167,7 +167,7 @@ cd ~/.drover/src
 
 **两个宿主都没检测到、又没传 `--host` 时**：退出码 2，提示你用 `--host claude|codex|both` 说要哪个（install 会把它一起装上），也列出两个的官方安装命令。
 
-**验收工具**：install 默认还会装两个工具 crapper、dryer 到 `~/.drover/tools`（每个约 18MB，十几秒），要从 GitHub clone、从 PyPI 装依赖，要 Python 3.11+（本机没有时自动用 uv 装一份进同一个目录）。装不上（没网、pip 失败）只记警告，不影响 drover 本身，也不改 install 的退出码；不想要就在 `~/.drover/config.json` 写 `"quality_tools": false`。详见 2.8。
+**验收工具**：install 默认还会装两个工具 crapper、dryer 到 `~/.drover/tools`（本机有 Python 3.11+ 时每个约 18MB、十几秒；没有时还会下一份 drover 自己的 Python 和 uv，全新环境实测共 137MB、114 秒，随网速变），要从 GitHub clone、从 PyPI 装依赖，要 Python 3.11+（本机没有时自动用 uv 装一份进同一个目录）。装不上（没网、pip 失败）只记警告，不影响 drover 本身，也不改 install 的退出码；不想要就在 `~/.drover/config.json` 写 `"quality_tools": false`。详见 2.8。
 
 **装完之后**，汇总的"下一步"按编号写好了怎么开始用（第 4.1 节一样）：开一个新终端运行 herdr（install 刚把 `~/.local/bin` 加进 shell 配置时，新终端里才生效；没让加的，给出 `~/.local/bin/herdr` 的完整路径和手动加 PATH 的写法）→ 在自动开好的 workspace 里点一下 pane、`cd` 到主工作台 → 启动 `claude`（第一次按浏览器提示登录；Codex 先 `codex login`，再 `codex -s danger-full-access`）→ 把信任框、MCP 弹窗点掉 → 离开时 `ctrl+b` 再 `q`。drover 只能在 Herdr 的 pane 里用。
 
@@ -455,7 +455,7 @@ drover 记着主会话"载入时"的规则（`~/.drover/main-rules.json`：会�
 - **不往你的仓库里写东西**：两个工具平时会在项目里写 `.metrics/`。drover 让 dryer 把它写进临时目录；crapper 不走它的命令行，直接调它取函数的那一层拿名字、复杂度和行号（它的输出没有行号，没法只挑改动的函数）。所以 worktree 里不会多出 `.metrics/`，仓库自己跟踪的 `.metrics/` 也不会被动到。
 - **不分析的文件**：没有扩展名的脚本（比如 `bin/drover`）、测试文件、两个工具不支持的语言，列在 `complexity.skipped_files`。两个工具支持 Clojure、Java、Go、TypeScript / JavaScript、Rust、Python（dryer 不含 JavaScript）。
 
-**怎么装的**：装进 `~/.drover/tools/<工具>`，钉提交（crapper `c757ec7`、dryer `66ff6d2`）：git clone、切到钉的提交、建 `.venv`、`pip install -e`（照工具自带入口脚本的装法，用你自己的 pip 配置），再跑一次 `--help` 确认能用。每个约 18MB，十几秒。
+**怎么装的**：装进 `~/.drover/tools/<工具>`，钉提交（crapper `c757ec7`、dryer `66ff6d2`）：git clone、切到钉的提交、建 `.venv`、`pip install -e`（照工具自带入口脚本的装法，用你自己的 pip 配置），再跑一次 `--help` 确认能用。本机已有 Python 3.11+ 时，每个约 18MB、十几秒。本机没有 3.11+ 时，drover 还会再下一份自己的 Python（还有 uv）：全新环境实测 `~/.drover/tools` 一共 137MB、安装 114 秒，这里面有 pip、uv 的下载，各人网速不同，实际用时会有出入。
 
 - **要 Python 3.11+**：install 先找 PATH 上的 python3.14…python3.11、python3（macOS 自带的是 3.9，不够），再问 uv。都没有时，用 uv 装一份 3.12 到 `~/.drover/tools/python`（`--no-bin`，不往 `~/.local/bin` 放东西）。连 uv 也没有，就先用 uv 官方安装脚本装一份 drover 私有的到 `~/.drover/tools/bin`（`UV_NO_MODIFY_PATH=1`，不改 shell 配置）。都在 drover 自己的目录里，卸载时一起删。
 - **语法包**：第一次分析某种语言时，从 GitHub 下载这种语言的 tree-sitter 语法包，放 `~/.drover/tools/grammars`（python、typescript、tsx 三种实测约 29MB、17 秒）。下载失败那次报"测不了"，下次验收自动重试。

@@ -123,7 +123,7 @@
   - 给 Claude Code 加几条权限和一个小检查（hook），让它派任务时少弹确认：那个 hook 会挡住"先 cd 再跑 git"这种每次都要你点确认的写法，让 agent 自己换成不用确认的写法（都在 ~/.claude/settings.json，只加不删，改之前先备份）；
   - ~/code 里放两个说明文件（AGENTS.md、CLAUDE.md）和一个权限设置文件，以后在 ~/code 打开的 agent 就知道怎么分派任务；
   - 让 Herdr 能看出每个 agent 是在干活还是在等你；
-  - 从 GitHub 装两个代码检查工具（crapper、dryer）到 ~/.drover/tools（各十几 MB）：以后验收时自动查改到的函数是不是太复杂、有没有重复代码；你电脑上没有 Python 3.11 的话会顺带装一份进同一个文件夹，不动你自己的 Python。装不上也不影响 drover，只是少这项检查；
+  - 从 GitHub 装两个代码检查工具（crapper、dryer）到 ~/.drover/tools（各十几 MB）：以后验收时自动查改到的函数是不是太复杂、有没有重复代码；你电脑上没有 Python 3.11 的话会顺带装一份进同一个文件夹，不动你自己的 Python（这种情况下这个文件夹一共一百多 MB，装要一两分钟，看网速）。装不上也不影响 drover，只是少这项检查；
   - 从 GitHub 装飞书提醒插件（herdr-oncall），离开电脑时主会话需要你会推到飞书（你说要飞书才有这一条）。
   想撤销，随时一条命令卸载；改之前备份的文件都留着（另外装的 herdr、Claude Code 这些不会跟着卸，你可能还会单独用）。可以正式装吗？
   ```
