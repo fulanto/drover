@@ -149,7 +149,7 @@ ONCALL_NODE_MIN = 18      # 插件跑起来要的 Node
 ONCALL_NODE_REPLIES = 22  # 收飞书回复要的 Node（全局 WebSocket）
 ONCALL_SKIP_HINT = "不要飞书通知可以加 --no-oncall（会记住，以后重跑不用再带）"
 ONCALL_OFF = "不接飞书 oncall（选装：要接时重跑 install 加 --oncall）"
-NODE_INSTALL_HINT = "装 Node 22+：brew install node，或 https://nodejs.org"
+NODE_INSTALL_HINT = "装 Node 22+：brew install node，或 https://nodejs.org（一个 node 都没有时，重跑 install 加 --install-deps 会用 nvm 装）"
 # 在终端里装完、飞书还没配对时当场问一句要不要扫码配对：最多等多久、多久查一次插件 status（秒）。环境变量给自测缩短用。
 PAIR_WAIT = float(os.environ.get("DROVER_PAIR_WAIT") or 300)
 PAIR_POLL = float(os.environ.get("DROVER_PAIR_POLL") or 3)
@@ -163,24 +163,49 @@ OPTIONAL_TOOLS = ["code-review-graph", "uv", "bun", "pnpm"]
 HOSTS = ["claude", "codex"]
 HERDR_TIMEOUT = 60
 
-# 缺依赖时的官方安装方式（出处）：
-# - herdr：https://herdr.dev/agent-guide.md、https://herdr.dev/tui/docs/install/ 。安装脚本装到 ${HERDR_INSTALL_DIR:-$HOME/.local/bin}，
-#   不用 sudo、不改 shell 的 rc 文件；目录不在 PATH 里时只打印一句提示。
-# - Claude Code：https://code.claude.com/docs/en/setup （原生安装，官方推荐）。
-# - Codex CLI：https://github.com/openai/codex 、https://learn.chatgpt.com/docs/codex/cli 。
-# install.py 只会替你装 herdr（用户目录、官方脚本、要你同意或带 --install-deps）；Claude Code / Codex 只给命令。
+# 往 ~/.drover 以外装的依赖：herdr、选定宿主缺的那个命令行（claude / codex）、接飞书时没有的 Node（nvm）。都用官方安装脚本、
+# 都装在家目录、都不用 sudo，共用一次同意（Ctx.deps_mode）：--install-deps 直接装；交互终端里一句 [Y/n] 问完这次要装的几样；
+# 非交互又没带 --install-deps 只给命令（drover update 重跑 install 就是这样）。只写 ~/.drover/tools 的（uv、Python、验收工具）
+# 算 drover 自己的安装，不在这次同意里。各脚本装到哪、改不改 shell 配置、要不要 sudo，按脚本原文核实过（2026-11）：
+# - herdr（https://herdr.dev/install.sh）：装到 ${HERDR_INSTALL_DIR:-$HOME/.local/bin}（第 6、112–114 行）；不改 shell 配置，
+#   目录不在 PATH 里时只打印一句提示（第 118–129 行）；全程没有 sudo。
+# - Claude Code（https://claude.ai/install.sh）：下载到 ~/.claude/downloads（第 39 行），再由 claude install 放启动器
+#   ~/.local/bin/claude（https://code.claude.com/docs/en/setup 的 Auto-updates 段）；在 sudo 下拒绝运行（第 14–36 行）；不改 PATH，
+#   ~/.local/bin 不在 PATH 里时只在 "Setup notes" 里提示（https://code.claude.com/docs/en/troubleshoot-install："It prints the fix
+#   with that note but doesn't change PATH itself"）。
+# - Codex（https://chatgpt.com/codex/install.sh）：装到 ${CODEX_INSTALL_DIR:-$HOME/.local/bin}/codex（第 16 行），程序本体在
+#   ${CODEX_HOME:-~/.codex}/packages/standalone（第 19–20 行）；没有 sudo；目录不在 PATH 里时往 shell 配置末尾追加一段带标记的
+#   PATH（add_to_path 第 598–633 行，文件按 pick_profile 第 576–596 行选），没有关掉它的开关。CODEX_NON_INTERACTIVE=1：不在
+#   /dev/tty 上问"Start Codex now?"（prompt_yes_no 第 1011–1042 行）。
+# - Node（只有接飞书 oncall、本机一个 node 都没有时）：nvm 官方脚本（钉 v0.40.8）装到 ~/.nvm，PROFILE=/dev/null 不改 shell 配置
+#   （nvm install.sh 第 466–468 行），再 nvm install 22。本机已有 node（哪怕版本低）不装：飞书插件的 bin/run-node.sh 先用缓存的
+#   node 路径和 PATH 上的 node，都没有才去 ~/.nvm 找（run-node.sh 第 53–63 行），装了也用不上；node_candidates 的顺序和它一样。
+# 测试和内网镜像可以用 *_INSTALLER 环境变量换掉安装命令（照样交给 sh -c 执行），平时不用设。
 HERDR_INSTALL_CMD = "curl -fsSL https://herdr.dev/install.sh | sh"
 HERDR_INSTALL_DOCS = "https://herdr.dev/tui/docs/install/"
 HERDR_BREW_CMD = "brew install herdr"
-# 测试和内网镜像用：设了就用它代替官方安装命令（照样交给 sh -c 执行）。平时不用设。
 HERDR_INSTALLER_ENV = "DROVER_HERDR_INSTALLER"
-HERDR_INSTALL_TIMEOUT = 600
+DEPS_NO_SUDO = "不用 sudo"
 AGENT_INSTALL = {
     "claude": {"name": "Claude Code", "cmd": "curl -fsSL https://claude.ai/install.sh | bash",
-               "alt": "brew install --cask claude-code", "docs": "https://code.claude.com/docs/en/setup"},
+               "alt": "brew install --cask claude-code", "docs": "https://code.claude.com/docs/en/setup",
+               "installer_env": "DROVER_CLAUDE_INSTALLER", "env": {},
+               "login": "第一次运行 claude 时按浏览器提示登录",
+               "remove": "rm -f ~/.local/bin/claude && rm -rf ~/.local/share/claude（官方的卸载步骤，见 "
+                         "https://code.claude.com/docs/en/setup#uninstall-claude-code）"},
     "codex": {"name": "Codex CLI", "cmd": "curl -fsSL https://chatgpt.com/codex/install.sh | sh",
-              "alt": "npm install -g @openai/codex 或 brew install --cask codex", "docs": "https://github.com/openai/codex"},
+              "alt": "npm install -g @openai/codex 或 brew install --cask codex", "docs": "https://github.com/openai/codex",
+              "installer_env": "DROVER_CODEX_INSTALLER", "env": {"CODEX_NON_INTERACTIVE": "1"},
+              "login": "先跑 codex login（浏览器登录），再启动",
+              "remove": "rm -f {dir}/codex {dir}/codex-code-mode-host && rm -rf ~/.codex/packages/standalone，再从 shell 配置里"
+                        "删掉 # >>> Codex installer >>> 到 # <<< Codex installer <<< 那一段（安装脚本加的 PATH）"},
 }
+NVM_DIR = HOME / ".nvm"
+NODE_INSTALL_VERSION = "22"
+NVM_INSTALL_CMD = "curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.8/install.sh | PROFILE=/dev/null bash"
+NVM_USE_CMD = f'. "$HOME/.nvm/nvm.sh" && nvm install {NODE_INSTALL_VERSION}'
+NODE_INSTALLER_ENV = "DROVER_NODE_INSTALLER"
+NODE_REMOVE = "rm -rf ~/.nvm（nvm 和它装的 Node 都在里面；drover 没改 shell 配置，不用再改别处）"
 GIT_HINT = {"Darwin": "xcode-select --install（或 brew install git）", "Linux": "sudo apt-get install git / sudo dnf install git"}
 
 # 验收工具：Robert C. Martin 的 crapper（圈复杂度）和 dryer（重复代码），都是 0BSD。条目验收跑 crapper（只算复杂度，不跑测试），
@@ -210,7 +235,7 @@ TOOLS_PYTHON_DIR = TOOLS_DIR / "python"
 TOOLS_UV = TOOLS_DIR / "bin" / "uv"
 UV_INSTALL_CMD = "curl -LsSf https://astral.sh/uv/install.sh | sh"
 UV_INSTALLER_ENV = "DROVER_UV_INSTALLER"  # 自测用：换成别的安装命令（照样交给 sh -c）
-TOOLS_TIMEOUT = 600  # 秒：clone、装 uv / Python、pip install 每一步的上限
+TOOLS_TIMEOUT = 600  # 秒：clone、装 uv / Python、pip install、外部依赖的安装命令，每一步的上限
 TOOLS_MANUAL = ("重跑 install（或 ~/.drover/bin/drover update）会按钉的版本补装；不要验收工具就在 ~/.drover/config.json 写 "
                 "\"quality_tools\": false。没装上时验收里 crapper、dryer 报\"测不了\"，drover 其余功能不受影响")
 
@@ -397,10 +422,15 @@ class Ctx:
     backups: list = field(default_factory=list)     # 本次做的备份
     herdr_status: Optional[dict] = None
     herdr_status_error: Optional[str] = None
-    # 缺 herdr 时怎么办：yes（--install-deps，直接装）、ask（交互终端，先问一句）、no（非交互，只给命令）。
+    # 往 ~/.drover 以外装依赖（herdr、宿主命令行、nvm + Node）怎么办：yes（--install-deps，直接装）、ask（交互终端，一句 [Y/n]
+    # 问完）、no（非交互，只给命令）。
     deps_mode: str = "no"
+    deps_planned: list = field(default_factory=list)  # 这次计划要装的外部依赖（ask 时一起问的那几行）
+    deps_consent: Optional[bool] = None  # ask 时用户的回答；还没问是 None
+    deps_installed: dict = field(default_factory=dict)  # 这次由 drover 装上的外部依赖：名字 → 路径（记进安装记录，卸载时列出来）
     herdr_planned: bool = False          # 计划里有"安装 herdr"这一项（后面要用 herdr 的项先计划好，等它装完再跑）
     herdr_installed: Optional[str] = None  # 这次装上的 herdr 路径
+    node_planned: bool = False           # 计划里有"用 nvm 装 Node"这一项（插件那一项等它装完再看 Node）
     oncall: bool = False                 # 接不接飞书 oncall（选装，make_ctx 里按 oncall_enabled 算）
     oncall_plugins: Optional[list] = None  # herdr plugin list --json 的插件列表（缓存）；查不了时是 None
     oncall_list_error: Optional[str] = None
@@ -471,31 +501,67 @@ def confirm(question: str) -> bool:
 
 
 def interactive(args: argparse.Namespace) -> bool:
-    """交互终端：stdin、stdout 都是终端，且不是 --json。缺 herdr 时问一句 [Y/n]、首次安装问主工作台，都按它判断。"""
+    """交互终端：stdin、stdout 都是终端，且不是 --json。缺依赖时问一句 [Y/n]、首次安装问主工作台，都按它判断。"""
     return not args.json and sys.stdin.isatty() and sys.stdout.isatty()
 
 
-def install_herdr(ctx: "Ctx") -> str:
-    """执行 herdr 的安装命令（默认是官方安装脚本），装完在 PATH 和官方安装目录里找到它。"""
-    cmd = herdr_install_cmd()
-    if ctx.deps_mode == "ask":
-        print(f"\n没装 herdr：drover 的编排者和 worker 都跑在 Herdr 里。官方安装命令（{HERDR_INSTALL_DOCS}）：\n  {cmd}")
-        if not confirm("现在执行它安装 herdr 吗？[Y/n] "):
-            raise RuntimeError(f"你选了不装。要装时手动执行 {cmd}，再重跑 install（或者加 --install-deps）")
-    print(f"安装 herdr：{cmd}", file=sys.stderr, flush=True)
+def script_blocker(installer_env: str) -> Optional[str]:
+    """官方安装脚本在这台机器上跑不了的原因（只支持 macOS / Linux、要 curl）；换了安装命令（*_INSTALLER）时不查。"""
+    if os.environ.get(installer_env):
+        return None
+    if platform.system() not in ("Darwin", "Linux"):
+        return "官方安装脚本只支持 macOS / Linux"
+    return None if shutil.which("curl") else "官方安装脚本要用 curl：先装 curl"
+
+
+def plan_dep(ctx: "Ctx", step: "Step", name: str, cmd: str, where: str, profile: str,
+             run: Callable[[], Optional[str]]) -> "Step":
+    """缺的外部依赖怎么装：动作里写清要跑的命令、装到哪、改不改 shell 配置、要不要 sudo。--install-deps / 交互终端：挂上 run，
+    记进这次要装的清单（交互终端里正式安装前一句 [Y/n] 问完）；非交互又没带 --install-deps：只给命令。"""
+    detail = f"{cmd}（装到 {where}；{profile}；{DEPS_NO_SUDO}）"
+    if ctx.deps_mode == "no":
+        step.action = f"没自动装（不是交互终端，也没加 --install-deps）：手动执行 {detail}，或者重跑时加 --install-deps"
+        return step
+    how = "直接执行（--install-deps）" if ctx.deps_mode == "yes" else "装之前问你一句（这次要装的几样一起问），同意就执行"
+    step.action, step.run, step.note = f"安装 {name}：{how} {detail}", run, ""  # 手动装法的提示用不着了
+    ctx.deps_planned.append(f"{name}：{detail}")
+    return step
+
+
+def ask_deps(ctx: "Ctx") -> None:
+    """交互终端里正式安装之前：这次要往 ~/.drover 以外装的几样，一句 [Y/n] 问完（直接回车算同意）。
+    Ctrl-C：还什么都没装，退出码 130。"""
+    if ctx.deps_mode != "ask" or ctx.dry_run or not ctx.deps_planned:
+        return
+    print("这次要往 ~/.drover 以外装这几样（官方安装脚本，都装在你的家目录）：")
+    for line in ctx.deps_planned:
+        print(f"  - {line}")
     try:
-        res = subprocess.run(["sh", "-c", cmd], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                             stderr=subprocess.STDOUT, text=True, timeout=HERDR_INSTALL_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"{cmd} 超过 {HERDR_INSTALL_TIMEOUT} 秒没跑完")
-    tail = "；".join(line.strip() for line in res.stdout.strip().splitlines()[-4:] if line.strip())
-    if res.returncode != 0:
-        raise RuntimeError(f"{cmd} 退出码 {res.returncode}：{tail[:300]}")
+        ctx.deps_consent = confirm("现在装吗？[Y/n] ")
+    except KeyboardInterrupt:
+        print()
+        raise InstallError("取消了：什么都没装。", rc=130)
+    print()
+
+
+def run_dep(ctx: "Ctx", cmd: str, env: Optional[dict] = None) -> str:
+    """执行一样外部依赖的安装命令（sh -c，复用装验收工具的 tool_cmd），返回最后几行输出。用户没同意、退出码不是 0、超时都抛
+    RuntimeError（调用方按这一项的规则算失败或警告）。env 里值是 None 的键从环境里去掉。"""
+    if ctx.deps_mode != "yes" and not ctx.deps_consent:
+        raise RuntimeError(f"你选了不装。要装时手动执行 {cmd}，再重跑 install（或者加 --install-deps）")
+    print(f"执行：{cmd}", file=sys.stderr, flush=True)
+    out = tool_cmd(["sh", "-c", cmd], cmd, env=env)
+    return "；".join(line.strip() for line in out.strip().splitlines()[-4:] if line.strip())
+
+
+def install_herdr(ctx: "Ctx") -> str:
+    """执行 herdr 的安装命令（默认是官方安装脚本），装完在 PATH 和官方安装目录里找到它。必需项：失败算这一项失败。"""
+    tail = run_dep(ctx, herdr_install_cmd())
     exe = herdr_bin()
     if not exe:
         raise RuntimeError(f"安装命令跑完了，但找不到 herdr（看过 PATH 和 {'、'.join(disp(d) for d in herdr_fallback_dirs())}）：{tail[:300]}")
     ctx.herdr_status, ctx.herdr_status_error = None, None  # 之前"找不到 herdr"的结果作废
-    ctx.herdr_installed = exe
+    ctx.herdr_installed = ctx.deps_installed["herdr"] = exe
     return f"装好了：{disp(exe)}" + ("" if shutil.which("herdr") else "（这个目录不在 PATH 里，见汇总里的提示）")
 
 
@@ -939,13 +1005,13 @@ def shell_dir(d: Path) -> str:
     return "$HOME" + s[len(h):] if s.startswith(h + os.sep) else s
 
 
-def path_note(d: Path) -> str:
-    return (f"herdr 装在 {disp(d)}，这个目录不在 PATH 里：drover CLI 按名字调用 herdr，不在 PATH 里会报找不到。"
+def path_note(d: Path, name: str = "herdr") -> str:
+    return (f"{name} 装在 {disp(d)}，这个目录不在 PATH 里：drover 按名字调用 {name}，不在 PATH 里会报找不到。"
             f"把 export PATH=\"{shell_dir(d)}:$PATH\" 加进 ~/.zshrc（bash 用 ~/.bashrc），开一个新终端再启动 herdr")
 
 
 def plan_herdr(ctx: Ctx) -> Step:
-    """herdr 是必需依赖。没装时按 ctx.deps_mode 决定：直接装、先问一句、还是只给命令。"""
+    """herdr 是必需依赖。没装时按 ctx.deps_mode 决定：直接装、先问一句、还是只给命令；装失败算这一项失败（退出码 1，其余照装）。"""
     key, label = "herdr", "herdr 命令"
     found = shutil.which("herdr")
     if found:
@@ -955,35 +1021,89 @@ def plan_herdr(ctx: Ctx) -> Step:
         return Step(key, label, disp(off), f"已装，但 {disp(off.parent)} 不在 PATH 里", level="warn",
                     note=path_note(off.parent))
     cmd = herdr_install_cmd()
-    state = "没装（PATH 和官方安装目录里都没有）"
-    target = disp(herdr_fallback_dirs()[0] / "herdr")
     alt = f"或者 {HERDR_BREW_CMD}，见 {HERDR_INSTALL_DOCS}"
-    if not os.environ.get(HERDR_INSTALLER_ENV):
-        if platform.system() not in ("Darwin", "Linux"):
-            return Step(key, label, target, state, action=f"官方安装脚本只支持 macOS / Linux，见 {HERDR_INSTALL_DOCS}",
-                        level="fail")
-        if not shutil.which("curl"):
-            return Step(key, label, target, state, action=f"官方安装脚本要用 curl：先装 curl，{alt}", level="fail")
-    if ctx.deps_mode == "no":
-        return Step(key, label, target, state,
-                    action=f"没自动装（不是交互终端，也没加 --install-deps）：手动执行 {cmd}，或者重跑时加 --install-deps",
-                    level="fail", note=f"缺 herdr：官方安装命令 {cmd}（{alt}）；装好后重跑 install")
-    ctx.herdr_planned = True
-    how = "先问你一句 [Y/n]，同意就执行" if ctx.deps_mode == "ask" else "直接执行（--install-deps）"
-    return Step(key, label, target, state, action=f"安装 herdr：{how} {cmd}", run=lambda: install_herdr(ctx),
-                level="fail")
+    target = herdr_fallback_dirs()[0] / "herdr"
+    step = Step(key, label, disp(target), "没装（PATH 和官方安装目录里都没有）", level="fail",
+                note=f"缺 herdr：官方安装命令 {cmd}（{alt}）；装好后重跑 install")
+    blocker = script_blocker(HERDR_INSTALLER_ENV)
+    if blocker:
+        step.action, step.note = f"{blocker}，{alt}", ""
+        return step
+    step = plan_dep(ctx, step, "herdr", cmd, disp(target), "不改 shell 配置（目录不在 PATH 里时只打印一句提示）",
+                    lambda: install_herdr(ctx))
+    ctx.herdr_planned = step.run is not None
+    return step
+
+
+def host_cli_dir(host: str) -> Path:
+    """宿主命令行的官方安装目录：都是 ~/.local/bin（Codex 设了 CODEX_INSTALL_DIR 时用它）。"""
+    custom = os.environ.get("CODEX_INSTALL_DIR") if host == "codex" else None
+    return Path(os.path.expanduser(custom)) if custom else HOME / ".local" / "bin"
+
+
+def host_cli_off_path(host: str) -> Optional[Path]:
+    """PATH 里没有、但官方安装目录里有时，返回那个可执行文件（刚装完、PATH 没刷新）。"""
+    exe = host_cli_dir(host) / host
+    return exe if not shutil.which(host) and exe.is_file() and os.access(str(exe), os.X_OK) else None
+
+
+def codex_profile_change() -> str:
+    """Codex 安装脚本会不会改 shell 配置、改哪个文件（照它的 add_to_path / pick_profile：安装目录已在 PATH 里不改；否则 macOS 的
+    zsh 是 ~/.zprofile、bash 是 ~/.bash_profile，Linux 的 zsh 是 ~/.zshrc、bash 是 ~/.bashrc，其他 ~/.profile）。"""
+    d = host_cli_dir("codex")
+    if str(d) in os.environ.get("PATH", "").split(os.pathsep):
+        return f"不改 shell 配置（{disp(d)} 已在 PATH 里）"
+    shell = os.path.basename(os.environ.get("SHELL", ""))
+    names = {("zsh", True): ".zprofile", ("bash", True): ".bash_profile", ("zsh", False): ".zshrc",
+             ("bash", False): ".bashrc"}
+    profile = HOME / names.get((shell, platform.system() == "Darwin"), ".profile")
+    return f"会往 {disp(profile)} 末尾追加一段带标记的 PATH（脚本没有关掉它的开关）"
+
+
+def host_install_cmd(host: str) -> str:
+    info = AGENT_INSTALL[host]
+    return os.environ.get(info["installer_env"]) or info["cmd"]
+
+
+def install_host_cli(ctx: Ctx, host: str) -> str:
+    """装选定宿主的命令行（官方安装脚本）。装不上只记警告：不挡 drover 本身，装好它之后不用重跑 install。登录留给用户。"""
+    info = AGENT_INSTALL[host]
+    try:
+        tail = run_dep(ctx, host_install_cmd(host), info["env"])
+        exe = shutil.which(host) or host_cli_off_path(host)
+        if not exe:
+            raise RuntimeError(f"安装命令跑完了，但找不到 {host}（看过 PATH 和 {disp(host_cli_dir(host))}）：{tail[:300]}")
+    except RuntimeError as exc:
+        raise StepWarning(f"{info['name']} 没装上：{exc}。drover 的入口照样装好了，装好 {host} 之后不用重跑 install")
+    ctx.deps_installed[host] = str(exe)
+    return (f"装好了：{disp(exe)}" + ("" if shutil.which(host) else "（这个目录不在 PATH 里，见汇总里的提示）")
+            + f"；登录要你自己来：{info['login']}")
 
 
 def plan_host_cli(ctx: Ctx, host: str) -> Step:
-    """宿主的命令行本身：没有时只提示官方安装命令，不替你装（装 drover 的入口不需要它）。"""
+    """选定宿主的命令行：没有时和 herdr 共用一次同意，用官方安装脚本装；装不上、不让装都只提示，drover 的入口照样装。"""
     info = AGENT_INSTALL[host]
     key, label = f"{host}-cli", f"{info['name']} 命令"
     found = shutil.which(host)
     if found:
         return Step(key, label, disp(found), "已装")
-    return Step(key, label, host, "PATH 里没有", action="只提示，不替你装", level="warn",
+    off = host_cli_off_path(host)
+    if off:
+        return Step(key, label, disp(off), f"已装，但 {disp(off.parent)} 不在 PATH 里", level="warn",
+                    note=path_note(off.parent, host))
+    target = host_cli_dir(host) / host
+    step = Step(key, label, disp(target), "没装（PATH 和官方安装目录里都没有）", level="warn",
                 note=f"没找到 {host} 命令：官方安装 {info['cmd']}（或 {info['alt']}，见 {info['docs']}）；"
-                     "drover 的入口照样装，装好它之后不用重跑 install")
+                     f"drover 的入口照样装，装好它之后不用重跑 install；{info['login']}")
+    blocker = script_blocker(info["installer_env"])
+    if blocker:
+        step.action = f"只提示：{blocker}"
+        return step
+    if host == "claude":
+        where, profile = f"{disp(target)}（程序在 ~/.local/share/claude）", "不改 shell 配置（目录不在 PATH 里时只提示）"
+    else:
+        where, profile = f"{disp(target)}（程序在 {disp(CODEX_HOME / 'packages' / 'standalone')}）", codex_profile_change()
+    return plan_dep(ctx, step, info["name"], host_install_cmd(host), where, profile, lambda: install_host_cli(ctx, host))
 
 
 # ---------------------------------------------------------------- 计划项：Claude Code
@@ -1346,7 +1466,7 @@ def node_candidates() -> list:
         cached = ""
     if cached:
         found.append(cached)
-    nvm = sorted((HOME / ".nvm" / "versions" / "node").glob("*/bin/node"), key=lambda p: version_tuple(p.parent.parent.name))
+    nvm = sorted((NVM_DIR / "versions" / "node").glob("*/bin/node"), key=lambda p: version_tuple(p.parent.parent.name))
     found += [str(p) for p in reversed(nvm)]
     return found
 
@@ -1379,15 +1499,51 @@ def node_problem(ctx: Ctx) -> Optional[str]:
     return None
 
 
+def node_install_cmd() -> str:
+    """没有 Node 时的安装命令：~/.nvm 里还没有 nvm 就先跑 nvm 的官方脚本（PROFILE=/dev/null），再 nvm install 22。"""
+    custom = os.environ.get(NODE_INSTALLER_ENV)
+    if custom:
+        return custom
+    return NVM_USE_CMD if (NVM_DIR / "nvm.sh").is_file() else f"{NVM_INSTALL_CMD} && {NVM_USE_CMD}"
+
+
+def install_node(ctx: Ctx) -> str:
+    """用 nvm 装 Node 22 到 ~/.nvm。NVM_DIR 定成 ~/.nvm、去掉 XDG_CONFIG_HOME：设了它 nvm 会装到 $XDG_CONFIG_HOME/nvm（nvm
+    install.sh 第 36 行），node_candidates 只找 ~/.nvm，插件的 run-node.sh 只找 ~/.nvm 和 ~/.config/nvm（第 58 行）。
+    装不上照现在的规则：这一项失败，插件那一项按 Node 判断。"""
+    fresh = not (NVM_DIR / "nvm.sh").is_file()
+    tail = run_dep(ctx, node_install_cmd(), {"NVM_DIR": str(NVM_DIR), "XDG_CONFIG_HOME": None})
+    ctx.node = None  # 之前"没找到 Node"的结果作废
+    exe, version = node_info(ctx)
+    problem = node_problem(ctx)
+    if problem:
+        raise RuntimeError(f"安装命令跑完了，但{problem}：{tail[:300]}")
+    ctx.deps_installed["nvm" if fresh else "node"] = exe
+    return f"装好了：Node {version}（{disp(exe)}）"
+
+
 def plan_oncall_node(ctx: Ctx) -> Step:
+    """接飞书时插件要的 Node。一个 node 都没有时和 herdr 共用一次同意，用 nvm 装；本机有 node 但版本低时只提示
+    （插件先用 PATH 上的 node，nvm 装的用不上，见 NVM_INSTALL_CMD 上面的注释）。--check 只查。"""
     key, label = "oncall-node", "Node（飞书 oncall 插件要用）"
     if not ctx.oncall:
         return Step(key, label, "node", f"{ONCALL_OFF}，不检查")
     exe, version = node_info(ctx)
     problem = node_problem(ctx)
     if problem:
-        return Step(key, label, disp(exe) if exe else "node", problem, action=f"只检查不安装：{NODE_INSTALL_HINT}，再重跑",
+        step = Step(key, label, disp(exe) if exe else "node", problem, action=f"只提示：{NODE_INSTALL_HINT}，再重跑",
                     level="fail", note=f"{problem}：插件跑不了。{NODE_INSTALL_HINT}；{ONCALL_SKIP_HINT}")
+        if exe or ctx.checking:
+            return step
+        blocker = script_blocker(NODE_INSTALLER_ENV)
+        if blocker:
+            step.action = f"只提示：{blocker}；{NODE_INSTALL_HINT}"
+            return step
+        step.path = disp(NVM_DIR)
+        step = plan_dep(ctx, step, f"Node {NODE_INSTALL_VERSION}（nvm）", node_install_cmd(), f"{disp(NVM_DIR)}（nvm 和 Node 都在里面）",
+                        "不改 shell 配置（PROFILE=/dev/null；飞书插件自己会去 ~/.nvm 找 Node）", lambda: install_node(ctx))
+        ctx.node_planned = step.run is not None
+        return step
     if version_tuple(version)[0] < ONCALL_NODE_REPLIES:
         return Step(key, label, disp(exe), f"Node {version}", level="warn",
                     note=f"Node {version} 能推送，但收不到飞书里的回复（要 {ONCALL_NODE_REPLIES}+）：{NODE_INSTALL_HINT}")
@@ -1527,6 +1683,9 @@ def plan_oncall_plugin(ctx: Ctx) -> Step:
     plugin = oncall_plugin(ctx)
     if plugin is None:
         problem = node_problem(ctx)
+        if problem and ctx.node_planned:
+            return Step(key, label, path, "没装", run=lambda: ensure_oncall_plugin(ctx), level="fail", note=legacy_note,
+                        action=f"装好 Node 后执行 {install_text}（从 GitHub 装，之后插件每几个小时自己跟 stable 更新）")
         if problem:
             return Step(key, label, path, "没装", action=f"没法装：{problem}", level="fail",
                         note=f"飞书 oncall 没装：{problem}。{NODE_INSTALL_HINT}，再重跑；{ONCALL_SKIP_HINT}")
@@ -1629,10 +1788,12 @@ def quality_tools_spec() -> dict:
 
 
 def tool_cmd(cmd: list, what: str, env: Optional[dict] = None, timeout: float = TOOLS_TIMEOUT) -> str:
-    """装工具的一步：成功返回输出；失败、超时、跑不起来都抛 RuntimeError（带最后几行输出）。"""
+    """装工具、装外部依赖的一步：成功返回输出；失败、超时、跑不起来都抛 RuntimeError（带最后几行输出）。env 里值是 None 的
+    键从环境里去掉。"""
+    full = {k: v for k, v in {**os.environ, "GIT_TERMINAL_PROMPT": "0", **(env or {})}.items() if v is not None}
     try:
         res = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                             timeout=timeout, env={**os.environ, "GIT_TERMINAL_PROMPT": "0", **(env or {})})
+                             timeout=timeout, env=full)
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"{what} 超过 {timeout} 秒没跑完")
     except OSError as exc:
@@ -1769,7 +1930,7 @@ def plan_tools_python(ctx: Ctx, needed: bool) -> Step:
         return Step(key, label, disp(TOOLS_PYTHON_DIR), "没找到 3.11+，也没有 uv、curl", level="warn",
                     action="只提示", note=f"验收工具要 Python 3.11+：装一个（brew install python@3.12，或 python.org）；{TOOLS_MANUAL}")
     first = "" if uv else (f"先装 uv：{uv_install_cmd()}（UV_INSTALL_DIR={disp(TOOLS_UV.parent)}、UV_NO_MODIFY_PATH=1："
-                           "drover 私有的一份，不改 shell 配置），再 ")
+                           "drover 私有的一份，不改 shell 配置，不用 sudo），再 ")
     return Step(key, label, disp(TOOLS_PYTHON_DIR), "没找到 3.11+（PATH 上的版本不够，uv 也没找到）",
                 action=f"{first}uv python install {TOOLS_PYTHON_VERSION} --install-dir {disp(TOOLS_PYTHON_DIR)} --no-bin"
                        "（只装进 drover 的目录，不改 PATH）；装不上只记警告",
@@ -1967,6 +2128,10 @@ def merged_state(ctx: Ctx) -> dict:
               "env": ctx.oncall_env_path or old_oncall.get("env")}
     if oncall["installed_by_drover"] or oncall["env"]:
         data["oncall"] = oncall
+    # drover 替你装过的外部依赖（herdr、claude / codex、nvm / Node）：--uninstall 不删，只列出来和手动删法。
+    deps = {**(old.get("deps_installed") or {}), **ctx.deps_installed}
+    if deps:
+        data["deps_installed"] = deps
     return data
 
 
@@ -2015,8 +2180,13 @@ def plan_workspace_location(ctx: Ctx) -> Step:
 
 
 def build_plan(ctx: Ctx) -> list:
-    # 依赖放最前面：缺 herdr 时先装（或问你），后面用到 herdr 的项等它装完再跑。--check 的依赖另外列。
+    # 依赖放最前面，按这个顺序：herdr → 选定宿主缺的命令行 → 验收工具要的 uv / Python 3.11+ → crapper、dryer → 接飞书时的 Node
+    # → drover 自己的各项。缺 herdr / Node 时先装（或问你），后面用到它们的项等它装完再跑。--check 不列 herdr 和宿主命令行
+    # （在"依赖"那一栏里）。
     steps = [] if ctx.checking else [plan_herdr(ctx), *[plan_host_cli(ctx, h) for h in ctx.hosts]]
+    # 验收工具（宿主无关）：装不上只记警告（StepWarning），不影响退出码。
+    steps += plan_quality_tools(ctx)
+    steps.append(plan_oncall_node(ctx))
     has_ws = bool(ctx.workspace)
     steps += [
         plan_pkg(ctx),
@@ -2053,9 +2223,7 @@ def build_plan(ctx: Ctx) -> list:
         ]
     # 飞书 oncall（宿主无关）：插件失败只记这一项失败，其余照装（和没装 herdr 时一样）。
     plugin_step = plan_oncall_plugin(ctx)
-    steps += [plan_oncall_node(ctx), plugin_step, plan_oncall_env(ctx, plugin_step)]
-    # 验收工具（宿主无关）：装不上只记警告（StepWarning），不影响退出码。
-    steps += plan_quality_tools(ctx)
+    steps += [plugin_step, plan_oncall_env(ctx, plugin_step)]
     steps.append(plan_routing(ctx) if has_ws else plan_no_workspace("routing", "主工作台路由区块", "AGENTS.md"))
     share_backups(steps)
     if ctx.checking:
@@ -2132,7 +2300,7 @@ def print_header(title: str, ctx: Ctx, host_why: str) -> None:
           f"团队 profile：{ctx.profile or '没配置'}    飞书 oncall：{'接' if ctx.oncall else '不接（要接加 --oncall）'}")
     print(f"  宿主：{host_why}")
     if ctx.dry_run and not ctx.checking:
-        print("  这是 dry-run：只打印计划，不写任何文件，不安装 herdr，不执行 herdr integration install、"
+        print("  这是 dry-run：只打印计划，不写任何文件，不安装 herdr / claude / codex / Node，不执行 herdr integration install、"
               "herdr plugin install / update。")
     print()
 
@@ -2166,26 +2334,33 @@ def summarize(ctx: Ctx, steps: list, ok: bool) -> None:
 
 
 def next_steps(ctx: Ctx) -> list:
-    """装好之后要做的事：drover 只能在 Herdr 的 pane 里用，所以第一件是在 Herdr 里开主会话。"""
-    lines = ["下一步："]
-    n = 1
+    """装好之后怎么开始用（新手照着做得下来）：drover 只能在 Herdr 的 pane 里用，主会话要在 Herdr 里开。"""
     off = herdr_off_path()
-    if off:
-        lines.append(f"  {n}. 把 herdr 所在目录加进 PATH：export PATH=\"{shell_dir(off.parent)}:$PATH\" 写进 ~/.zshrc"
-                     "（bash 用 ~/.bashrc），开一个新终端")
-        n += 1
-    agents = " 或 ".join({"claude": "claude", "codex": "codex -s danger-full-access"}[h] for h in ctx.hosts)
-    lines.append(f"  {n}. 在 Herdr 里开主会话：终端里运行 herdr，在它的 pane 里 cd {ctx.workspace}，再启动 {agents}"
-                 "（drover 只能在 Herdr 的 pane 里用）")
-    lines.append(f"  {n + 1}. python3 install.py --check（或 ./install.sh --check）检查安装状态和依赖")
+    off_dirs = []
+    for exe in [off, *[host_cli_off_path(h) for h in ctx.hosts]]:
+        if exe and exe.parent not in off_dirs:
+            off_dirs.append(exe.parent)
+    lines = ["下一步（开始用 drover）："]
+    lines.append(f"  1. 打开 Herdr：终端里运行 {disp(off) if off else 'herdr'}" + ("（herdr 不在 PATH 里，先用完整路径）" if off else ""))
+    if off_dirs:
+        fix = "、".join(f'export PATH="{shell_dir(d)}:$PATH"' for d in off_dirs)
+        lines.append(f"     再把 {fix} 写进 ~/.zshrc（bash 用 ~/.bashrc），开一个新终端：drover 在 Herdr 里按名字调用 herdr、"
+                     "claude / codex，不在 PATH 里会报找不到")
+    lines.append(f"  2. 在 Herdr 里开主会话：第一次启动会自动开一个 workspace，点一下 pane 就能输入，然后 cd {ctx.workspace}")
+    start = {"claude": "启动 claude，第一次按浏览器提示登录",
+             "codex": "用 Codex 的话先 codex login（浏览器登录），再 codex -s danger-full-access"}
+    lines.append(f"  3. {'；'.join(start[h] for h in ctx.hosts)}")
+    lines.append("  4. 第一次启动时把\"是否信任这个文件夹\"、MCP 之类的弹窗点掉（以后起编排者才不会卡在这里）")
+    lines.append("  5. 离开时按 ctrl+b 再按 q：agent 接着跑，下次再运行 herdr 就回来了；herdr server stop 才是全部停掉")
+    lines.append("  6. python3 install.py --check（或 ./install.sh --check）检查安装状态和依赖")
     if ctx.oncall and ctx.feishu == "paired":
-        lines.append(f"  {n + 2}. 飞书已配对：离开电脑时主会话需要你会推到飞书（~/.drover/bin/drover oncall test 可以发一条试试）")
+        lines.append("  7. 飞书已配对：离开电脑时主会话需要你会推到飞书（~/.drover/bin/drover oncall test 可以发一条试试）")
     elif ctx.oncall and ctx.feishu != "unpaired":  # unpaired：汇总之后当场问要不要配对
-        lines.append(f"  {n + 2}. 想离开电脑也能收到主会话的消息、在飞书里跟它说话：{PAIR_CMD} 扫码配对飞书"
+        lines.append(f"  7. 想离开电脑也能收到主会话的消息、在飞书里跟它说话：{PAIR_CMD} 扫码配对飞书"
                      "（Mac 桌面会弹二维码，没弹就用它给的链接），再 ~/.drover/bin/drover oncall test 发一条试试"
                      "（不配也行，macOS 上桌面面板照样提醒）")
     elif not ctx.oncall and oncall_choice(ctx) is None:  # 没选过（--no-oncall 过的不再提）
-        lines.append(f"  {n + 2}. 飞书 oncall 没装（选装）：想离开电脑时在飞书里收主会话的提问、给它下命令，重跑 install 加 "
+        lines.append("  7. 飞书 oncall 没装（选装）：想离开电脑时在飞书里收主会话的提问、给它下命令，重跑 install 加 "
                      f"--oncall（要 Node {ONCALL_NODE_MIN}+，见 README 4.9）")
     return lines
 
@@ -2201,7 +2376,8 @@ def emit_json(command: str, ctx: Optional[Ctx], steps: list, ok: bool, **extra) 
 
 
 def deps_mode_of(args: argparse.Namespace) -> str:
-    """缺 herdr 时：--install-deps 直接装；交互终端（stdin、stdout 都是终端，且不是 --json）先问；否则只给命令。"""
+    """缺外部依赖（herdr、选定宿主的命令行、接飞书时的 Node）时：--install-deps 直接装；交互终端（stdin、stdout 都是终端，
+    且不是 --json）一句 [Y/n] 问完；否则只给命令（drover update 重跑 install 就是这样）。"""
     if getattr(args, "install_deps", False):
         return "yes"
     return "ask" if interactive(args) else "no"
@@ -2231,8 +2407,8 @@ def pick_hosts(args: argparse.Namespace) -> tuple[list, str]:
     found, why = detect_hosts()
     if not found:
         raise InstallError("没检测到 Claude Code 或 Codex（PATH 里没有 claude / codex 命令，也没有 ~/.claude、~/.codex）。"
-                           f"先装其中一个（install 不替你装），官方安装命令——{agent_install_hint()}。"
-                           "装好后重跑；或者用 --host 指定先装好 drover 这边的入口")
+                           "用 --host claude|codex|both 说你要用哪个：install 会把它一起装上（交互终端里先问你一句，"
+                           f"或者加 --install-deps）。也可以先自己装，官方安装命令——{agent_install_hint()}")
     return found, f"自动判断（{why}）"
 
 
@@ -2250,12 +2426,13 @@ def cmd_install(args: argparse.Namespace) -> int:
     steps = build_plan(ctx)
     if not args.json:
         print_header("drover install" + (" --dry-run" if ctx.dry_run else ""), ctx, why)
+    ask_deps(ctx)
     ok = execute(ctx, steps, quiet=args.json)
     if args.json:
         emit_json("dry-run" if ctx.dry_run else "install", ctx, steps, ok,
                   backups=[disp(s.backup) for s in steps if s.run is not None and s.backup],
                   notes=[f"{s.label}：{s.note}" for s in steps if s.note],
-                  deps_mode=ctx.deps_mode, herdr_installed=ctx.herdr_installed,
+                  deps_mode=ctx.deps_mode, herdr_installed=ctx.herdr_installed, deps_installed=ctx.deps_installed,
                   next_steps=next_steps(ctx) if ok and not ctx.dry_run else [])
     else:
         if should_check_feishu(ctx, args, steps):
@@ -2269,8 +2446,9 @@ def cmd_install(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------- --check
 
 
-def check_deps() -> list:
-    """依赖一览。缺必需项时 hint 里是官方的安装方式（install.py 只会替你装 herdr）。"""
+def check_deps(hosts: list) -> list:
+    """依赖一览。缺的给出官方装法：herdr、选定宿主缺的命令行，重跑 install 加 --install-deps 会替你装；git、python3 要管理员
+    权限或弹系统框，只给命令。claude / codex 照旧至少有一个才算齐，选定的宿主缺了在那一行的装法里写出来。"""
     hints = {"herdr": f"{HERDR_INSTALL_CMD}（或 {HERDR_BREW_CMD}；重跑 install 加 --install-deps 会替你装）",
              "git": GIT_HINT.get(platform.system(), "用系统的包管理器装 git"),
              "python3": "xcode-select --install、brew install python，或 https://www.python.org/downloads/"}
@@ -2282,8 +2460,13 @@ def check_deps() -> list:
             row["hint"] = path_note(off.parent) if off else hints[t]
         rows.append(row)
     agents = [f"{t}（{shutil.which(t)}）" for t in HOSTS if shutil.which(t)]
+    missing = []
+    for h in [h for h in hosts if not shutil.which(h)]:
+        off, info = host_cli_off_path(h), AGENT_INSTALL[h]
+        missing.append(path_note(off.parent, h) if off else
+                       f"选定的宿主 {h} 没装：{info['cmd']}（或 {info['alt']}；重跑 install 加 --install-deps 会替你装）")
     rows.append({"name": "claude / codex（至少一个）", "required": True, "path": "，".join(agents) or None,
-                 "hint": None if agents else agent_install_hint()})
+                 "hint": "；".join(missing) or (None if agents else agent_install_hint())})
     rows += [{"name": t, "required": False, "path": shutil.which(t), "hint": None} for t in OPTIONAL_TOOLS]
     return rows
 
@@ -2305,7 +2488,7 @@ def cmd_check(args: argparse.Namespace) -> int:
     mode = args.mode or state.get("mode") or ("copy" if (INSTALL_ROOT / COPY_MARKER).is_file() else "link")
     ctx = make_ctx(args, hosts, mode, checking=True)
     steps = build_plan(ctx)
-    deps = check_deps()
+    deps = check_deps(hosts)
     marks = {"ok": "✓", "warn": "!", "fail": "✗"}
     verdicts = [verdict_of(s) for s in steps]
     deps_ok = all(d["path"] for d in deps if d["required"])
@@ -2630,6 +2813,22 @@ def pruned_state(state: dict, hosts: list) -> dict:
     return out
 
 
+def deps_kept(state: dict) -> list:
+    """drover 替你装过、--uninstall 不删的外部依赖（你也可能单独用它们；删 herdr 还会断掉正在跑的会话）：名字、路径、手动删法。"""
+    out = []
+    for name, path in (state.get("deps_installed") or {}).items():
+        if name == "herdr":
+            how = f"先 herdr server stop（会结束所有正在跑的会话），再 rm {disp(path)}"
+        elif name in AGENT_INSTALL:
+            how = AGENT_INSTALL[name]["remove"].format(dir=disp(Path(path).parent))
+        elif name == "nvm":
+            how = NODE_REMOVE
+        else:  # node：nvm 原来就有，drover 只往里装了一个 Node
+            how = f". ~/.nvm/nvm.sh && nvm uninstall {NODE_INSTALL_VERSION}（nvm 原来就有，只删 drover 装的这个 Node）"
+        out.append({"name": name, "path": disp(path), "remove": how})
+    return out
+
+
 def cmd_uninstall(args: argparse.Namespace) -> int:
     state = load_state()
     installed = [h for h in HOSTS if h in (state.get("hosts") or [])] or list(HOSTS)
@@ -2692,12 +2891,17 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     kept = [disp(CONFIG_FILE), f"任务记录 {disp(STATE_HOME)}/<slug>/", "worktree ~/.herdr/worktrees/",
             "herdr 的 agent 状态 hook（herdr integration）", "herdr-oncall 插件的 .env（飞书配对）",
             f"飞书发来的图片 {disp(STATE_HOME)}/oncall-images/"]
+    kept_deps = deps_kept(state) if not remaining else []
     if args.json:
         emit_json("uninstall-dry-run" if args.dry_run else "uninstall", ctx, steps, ok,
-                  backups=[disp(b) for b in backups], kept=kept)
+                  backups=[disp(b) for b in backups], kept=kept, kept_deps=kept_deps)
         return 0 if ok else 1
     print()
     print("保留不动：" + "、".join(kept))
+    if kept_deps:
+        print("drover 替你装过、没删的工具（你也可能单独用它们；删 herdr 还会断掉正在跑的会话）。不要了就手动删：")
+        for d in kept_deps:
+            print(f"  {d['name']}（{d['path']}）：{d['remove']}")
     if backups:
         print("备份（不自动还原；要还原就自己挪回原名）：")
         for b in backups:
@@ -2724,17 +2928,30 @@ EPILOG = """\
   <workspace>/.claude/settings.local.json 也会落进 ~/.claude/。--workspace、已有 config.json 是这样时安装和 --dry-run
   都拒绝（退出码 2，什么都不写），交互输入这样的目录时说明原因再问；--check 只提示（!）；--uninstall 照常撤。
 
-缺依赖时：
-  herdr                没装时计划的第一项是"安装 herdr"，用官方安装脚本 curl -fsSL https://herdr.dev/install.sh | sh
-                       （装到 ~/.local/bin，或 $HERDR_INSTALL_DIR；不用 sudo、不改 shell 配置）。交互终端里先问一句 [Y/n]；
-                       加 --install-deps 不问直接装；非交互（管道、CI、--json）不装，只给出命令，退出码 1。
-                       装完在同一次运行里接着生成 herdr 技能、装状态 hook。装好的目录不在 PATH 里时会提示怎么加。
-                       也可以自己装：brew install herdr，见 https://herdr.dev/tui/docs/install/
-                       （测试或内网镜像可以用环境变量 DROVER_HERDR_INSTALLER 换成别的安装命令）
-  claude / codex       不替你装，只给官方命令：Claude Code  curl -fsSL https://claude.ai/install.sh | bash；
-                       Codex  curl -fsSL https://chatgpt.com/codex/install.sh | sh（或 npm install -g @openai/codex）。
-                       两个都没检测到、又没传 --host 时退出码 2；传了 --host 但命令没装时只提示，入口照样装。
-  git / python3        install.sh 检查并给出装法；--check 也会列出来。
+系统：这一版完整支持 macOS；Linux 能装，但没有实测；Windows 暂不支持（原生 Windows 上 drover 起不来：用到了只有 Unix 才有的
+  文件锁和终端控制），想先试的可以在 WSL2 的 Ubuntu 里按 Linux 的方式装（未实测）。
+
+缺依赖时（一次装齐）：往 ~/.drover 以外装的几样——herdr、选定宿主缺的那个命令行（claude / codex）、接飞书（--oncall）时
+  没有的 Node——共用一次同意：交互终端里正式安装前一句 [Y/n] 问完（列出这次要装的几样，直接回车算同意；答 n 只给命令）；
+  加 --install-deps 不问直接装；非交互（agent 的 shell、管道、CI、--json，drover update 重跑 install 也是）不装、只给命令。
+  都是官方安装脚本、都装在家目录、都不用 sudo；dry-run 里每一样写清要跑的命令、装到哪、改不改 shell 配置。
+  测试或内网镜像可以用环境变量换掉安装命令：DROVER_HERDR_INSTALLER、DROVER_CLAUDE_INSTALLER、DROVER_CODEX_INSTALLER、
+  DROVER_NODE_INSTALLER（照样交给 sh -c 执行）。
+  herdr                计划的第一项。官方脚本 curl -fsSL https://herdr.dev/install.sh | sh：装到 ~/.local/bin（或 $HERDR_INSTALL_DIR），
+                       不改 shell 配置。装完在同一次运行里接着生成 herdr 技能、装状态 hook；目录不在 PATH 里时会提示怎么加。
+                       必需项：没装上（或没让装）算这一项失败，其余照装，退出码 1。也可以自己装：brew install herdr
+  claude / codex       只装 --host 选的、又没装的那个。Claude Code：curl -fsSL https://claude.ai/install.sh | bash（启动器
+                       ~/.local/bin/claude，不改 shell 配置）；Codex：curl -fsSL https://chatgpt.com/codex/install.sh | sh
+                       （~/.local/bin/codex；~/.local/bin 不在 PATH 里时脚本会往 shell 配置末尾追加一段带标记的 PATH，
+                       关不掉，dry-run 里写明是哪个文件；带 CODEX_NON_INTERACTIVE=1，不在终端里问要不要马上启动）。
+                       装不上只提示，drover 的入口照样装，退出码不变。登录要你自己来：claude 第一次运行时按浏览器提示登录，
+                       codex 先 codex login。两个都没检测到、又没传 --host 时退出码 2（提示用 --host 说要哪个）。
+  Node                 只在接飞书、本机一个 node 都没有时：nvm 官方脚本（v0.40.8，PROFILE=/dev/null 不改 shell 配置）装到
+                       ~/.nvm，再 nvm install 22。本机有 node 但低于 18 时只提示升级（插件先用 PATH 上的 node，nvm 装的用不上）。
+                       没装上照现在的规则：Node 这一项和插件那一项失败，其余照装，退出码 1
+  git / python3        install.sh 检查并给出装法后停下（要管理员权限或弹系统框，不替你装）；--check 也会列出来。
+  装完之后：在 Herdr 里开主会话，"下一步"里有编号步骤（打开 herdr → cd 到主工作台 → 启动 claude / codex 并登录 →
+  点掉信任框 → ctrl+b q 离开）。
   装完之后：在 Herdr 里开主会话（终端里运行 herdr，在 pane 里 cd 到主工作台，再启动 claude 或 codex），drover 才能用。
 
 安装布局（link / copy 只有第一项不同）：
@@ -2743,7 +2960,8 @@ EPILOG = """\
   ~/.drover/config.json                  workspace、repo_dirs、profile、oncall（--oncall 记 true、--no-oncall 记 false）。首次安装时写入（workspace 见上文）；已有时
                                          不覆盖，除非显式传 --workspace / --repo-dir / --profile / --oncall / --no-oncall（只改传了的那个键，
                                          改之前备份）
-  ~/.drover/drover-install.json          安装记录（装了哪些宿主、新建的文件、加的规则和 hook、备份；--uninstall 按它撤）
+  ~/.drover/drover-install.json          安装记录（装了哪些宿主、新建的文件、加的规则和 hook、备份、drover 替你装过的外部依赖；
+                                         --uninstall 按它撤）
   ~/.drover/<slug>/                      每个任务一个目录（drover CLI 写，install 不碰）；baselines/、locks/ 同理
   Claude Code（--host 含 claude）：
     ~/.claude/commands/drover.md         软链到 ~/.drover/pkg/flow/dispatch.md（/drover 命令）
@@ -2779,7 +2997,8 @@ EPILOG = """\
                                          有内容但没有标记时追加到末尾，并提示检查重复
   飞书 oncall（drover 内置的 herdr-oncall 插件，选装：--oncall 装并记进 config.json，--no-oncall 不装（已装的插件不卸）；
   都没传过时，已经接上的照旧（安装记录里有 oncall、或者 herdr 里装着插件：drover update 照旧保留、照旧更新），其余不装）：
-    Node                                 只检查：没有或低于 18 插件跑不了（算失败），18～21 收不到飞书回复（提示）
+    Node                                 一个 node 都没有：用 nvm 装 Node 22 到 ~/.nvm（见上文"缺依赖时"）；低于 18 插件跑不了
+                                         （算失败，只提示升级），18～21 收不到飞书回复（提示）
     herdr plugin com.codreamer.herdr.oncall
                                          没装：herdr plugin install fulanto/herdr-oncall --ref stable --yes（从 GitHub 装，
                                          之后插件自己跟 stable 更新）；GitHub 装的低于 0.7.0：herdr plugin update
@@ -2819,11 +3038,12 @@ EPILOG = """\
   例外：~/.codex/skills 下的备份放到 ~/.drover/backups/codex-skills/（Codex 会递归扫描 skills 目录，
   放在原地会多出一个同名的 drover 技能）。
 
---dry-run：只打印每一项的路径、现状、要做什么、会不会备份；不写文件、不安装 herdr、不执行 herdr integration install、
+--dry-run：只打印每一项的路径、现状、要做什么、会不会备份；缺的外部依赖写清要跑的命令、装到哪、改不改 shell 配置、要不要 sudo。
+  不写文件、不安装 herdr / claude / codex / Node、不执行 herdr integration install、
   herdr plugin install / update（会执行只读的 herdr integration status、herdr plugin list；插件没装时不调会建目录的
   herdr plugin config-dir）。可以和 --uninstall 一起用。
---check：检查每一项装没装对，以及依赖（必需 herdr、git、python3，claude / codex 至少一个；可选 code-review-graph、
-  uv、bun、pnpm）、herdr integration 状态、codex sandbox_mode、配置的 profile 能不能解析到目录（解析不到算没装对：
+--check：检查每一项装没装对，以及依赖（必需 herdr、git、python3，claude / codex 至少一个，选定的宿主没装时写出装法；可选
+  code-review-graph、uv、bun、pnpm）、herdr integration 状态、codex sandbox_mode、配置的 profile 能不能解析到目录（解析不到算没装对：
   团队规则会丢）、cd+git 拦截 hook、主会话登记 hook、读新规则 hook（没有、命令指向不对、脚本不在都算没装对）、飞书 oncall（接了的才查：没有
   Node、插件没装、drover.env 不在算没装对；Node 低于 22、插件版本低、被禁用、开关关着、drover.env 过期只提示；没接的不查、不算失败）、
   验收工具（没装、版本不对、.venv 坏了、没有 Python 3.11+ 只提示）。
@@ -2837,6 +3057,8 @@ EPILOG = """\
   herdr plugin uninstall，原来就有的不动；插件的 .env（飞书配对）不删。验收工具：删整个 ~/.drover/tools。
   主工作台按安装记录和 config.json 找，都没有时不碰任何主工作台。保留：~/.drover/config.json、
   任务记录 ~/.drover/<slug>/、worktree、herdr 的 agent 状态 hook。.bak-drover-* 备份不自动还原，只列出来。
+  drover 替你装过的 herdr、claude / codex、nvm / Node 不删（你也可能单独用它们，删 herdr 还会断掉正在跑的会话），
+  只列出来、给出手动删法（--json 时在 kept_deps 里）。
   带 --host 时只撤那个宿主的项；另一个宿主还装着时，共用的包、CLI 入口、路由区块保留。
 """
 
@@ -2858,7 +3080,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--profile", metavar="NAME|DIR",
                    help="团队 profile：名字用包里的 profiles/<名>/，路径用那个目录；none 去掉。不传时不动已有配置")
     p.add_argument("--install-deps", action="store_true",
-                   help="缺 herdr 时不问、直接用官方安装脚本装（只对安装有效；claude / codex 不替你装）")
+                   help="缺的外部依赖（herdr、选定宿主的 claude / codex 命令、接飞书时的 Node）不问、直接用官方安装脚本装；"
+                        "只对安装有效。不带时交互终端里一句 [Y/n] 问完，非交互只给命令")
     oncall = p.add_mutually_exclusive_group()
     oncall.add_argument("--oncall", action="store_true",
                         help="接飞书 oncall（选装）：从 GitHub 装 herdr-oncall 插件（要 Node 18+）、写 drover.env，终端里装完引导扫码"

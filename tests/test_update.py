@@ -260,6 +260,27 @@ class UpdateLinkTests(UpdateTestBase):
         self.assertNotIn("integration install codex", self.herdr_calls())
         self.assertEqual(self.load(self.state)["hosts"], ["claude"])
 
+    def test_update_does_not_install_external_deps(self) -> None:
+        """drover update 重跑 install 是非交互、不带 --install-deps：宿主命令行没了也只提示，外部依赖的安装命令一次都不跑
+        （基类把 herdr / claude / codex / Node 的安装命令都换成了"禁止安装"，跑了用例就报错）"""
+        self.clone_install("--host", "claude")
+        (self.fakebin / "claude").unlink()
+        other = self.tmp / "other-bin"
+        other.mkdir()
+        (other / "codex").write_text("#!/bin/sh\nexit 0\n")  # claude / codex 至少有一个：--check 不因为这个算缺依赖
+        (other / "codex").chmod(0o755)
+        dirs = [d for d in self.env["PATH"].split(os.pathsep)
+                if d and not any(os.path.exists(os.path.join(d, n)) for n in ("claude", "codex"))]
+        self.env["PATH"] = os.pathsep.join([str(other), *dirs])
+        self.assertIsNone(shutil.which("claude", path=self.env["PATH"]))
+        self.push_change("flow/routing.md", MARK_LINE, "routing：加一条规则")
+        out = self.update_json()
+        self.assertTrue(out["ok"], dump(out))
+        self.assertNotIn("--install-deps", out["install"]["command"])
+        self.assertEqual(out["install"]["failed"], [])
+        self.assertTrue(any("没找到 claude 命令" in n for n in out["install"]["notes"]), dump(out))
+        self.assertFalse((self.home / ".local" / "bin" / "claude").exists())
+
     def test_text_output_is_short(self) -> None:
         """默认文字输出：第一行"已更新"，标题最多 5 条加"…等 N 条"，总共不超过 10 行"""
         self.clone_install("--host", "claude")

@@ -12,6 +12,7 @@ import atexit
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import signal
@@ -28,6 +29,8 @@ INSTALL_SH = PKG / "install.sh"
 ROUTING = PKG / "flow" / "routing.md"
 INSTALLER_ENV = "DROVER_HERDR_INSTALLER"
 UV_INSTALLER_ENV = "DROVER_UV_INSTALLER"
+# 其余外部依赖（选定宿主的命令行、接飞书时的 Node）的安装命令：和 herdr 一样能用环境变量换掉。
+DEP_INSTALLER_ENVS = {"claude": "DROVER_CLAUDE_INSTALLER", "codex": "DROVER_CODEX_INSTALLER", "node": "DROVER_NODE_INSTALLER"}
 QUALITY_SOURCE_ENV = "DROVER_QUALITY_TOOLS_SOURCE"
 QUALITY_SWITCH_ENV = "DROVER_QUALITY_TOOLS"
 HERDR_OFFICIAL = "curl -fsSL https://herdr.dev/install.sh | sh"
@@ -216,13 +219,16 @@ class InstallTestBase(unittest.TestCase):
         self.env = {k: v for k, v in os.environ.items()
                     if k not in ("CODEX_HOME", "CLAUDE_CONFIG_DIR", "HERDR_INSTALL_DIR", INSTALLER_ENV,
                                  "XDG_STATE_HOME", "XDG_CONFIG_HOME", "DROVER_STATE_DIR", QUALITY_SOURCE_ENV,
-                                 UV_INSTALLER_ENV)}
+                                 UV_INSTALLER_ENV, "CODEX_INSTALL_DIR", "NVM_DIR", *DEP_INSTALLER_ENVS.values())}
         self.env.update(HOME=str(self.home), PATH=f"{self.fakebin}{os.pathsep}{os.environ.get('PATH', '')}",
                         PYTHONDONTWRITEBYTECODE="1")
-        # 保险：默认把 herdr、uv 的安装命令换成"禁止安装"，哪个用例意外触发安装都会记下来、用例报错，绝不联网。
+        # 保险：默认把 herdr、uv、claude / codex、Node 的安装命令换成"禁止安装"，哪个用例意外触发安装都会记下来、用例报错，
+        # 绝不联网。
         self.forbidden_log = self.tmp / "forbidden-installer.log"
         self.env[INSTALLER_ENV] = f"echo forbidden >> '{self.forbidden_log}'; exit 97"
         self.env[UV_INSTALLER_ENV] = f"echo forbidden-uv >> '{self.forbidden_log}'; exit 97"
+        for name, var in DEP_INSTALLER_ENVS.items():
+            self.env[var] = f"echo forbidden-{name} >> '{self.forbidden_log}'; exit 97"
         # 验收工具（crapper、dryer）默认不装：要从 GitHub clone、建 .venv。测它们的用例（QualityToolsTests）自己打开，
         # 工具源换成本地仓库、python 换成假的。
         self.env[QUALITY_SWITCH_ENV] = "0"
@@ -248,7 +254,7 @@ class InstallTestBase(unittest.TestCase):
     # ---- 工具
 
     def assert_no_forbidden_install(self) -> None:
-        self.assertFalse(self.forbidden_log.exists(), "有用例意外执行了 herdr / uv 的安装命令")
+        self.assertFalse(self.forbidden_log.exists(), "有用例意外执行了 herdr / uv / claude / codex / Node 的安装命令")
 
     def set_herdr(self, **states) -> None:
         """改假 herdr 的状态（合并进已有的状态：插件列表等不会被冲掉）。"""
@@ -1317,7 +1323,7 @@ class MissingHerdrTests(InstallTestBase):
         self.nobin.mkdir()
         self.curl_log = self.tmp / "curl.log"
         self.installer_log = self.tmp / "installer.log"
-        for name, body in (("claude", "#!/bin/sh\nexit 0\n"),
+        for name, body in (("claude", "#!/bin/sh\nexit 0\n"), ("codex", "#!/bin/sh\nexit 0\n"),
                            ("curl", f"#!/bin/sh\necho \"curl $*\" >> '{self.curl_log}'\nexit 97\n")):
             (self.nobin / name).write_text(body)
             (self.nobin / name).chmod(0o755)
@@ -1440,7 +1446,9 @@ class MissingHerdrTests(InstallTestBase):
         env = self.env_with_installer()
         rc, text = self.run_pty(["--host", "claude", *self.ws_args()], "n", env)
         self.assertEqual(rc, 1)
-        self.assertIn("现在执行它安装 herdr 吗？[Y/n]", text)
+        self.assertIn("这次要往 ~/.drover 以外装这几样", text)
+        self.assertIn("  - herdr：sh '", text)  # 列出要跑的命令（这里是换掉的假安装器）
+        self.assertIn("现在装吗？[Y/n]", text)
         self.assertIn("你选了不装", text)
         self.assertFalse(self.installer_log.exists())
         rc, text = self.run_pty(["--host", "claude", *self.ws_args()], "", env)  # 直接回车 = 同意
@@ -1476,8 +1484,231 @@ class MissingAgentCliTests(InstallTestBase):
         p = self.run_install("--dry-run", rc=2, env=env)
         self.assertIn(CLAUDE_OFFICIAL, p.stderr)
         self.assertIn(CODEX_OFFICIAL, p.stderr)
-        self.assertIn("install 不替你装", p.stderr)
+        self.assertIn("--host claude|codex|both", p.stderr)  # 选了哪个，install 就把它一起装上
         self.assertFalse(self.state_home.exists())
+
+
+# ---------------------------------------------------------------- 外部依赖一次装齐：herdr、选定宿主的命令行、Node（nvm）
+
+
+# 假的 claude / codex / Node 安装器：照官方脚本的行为把可执行文件放进家目录（claude、codex 到 ~/.local/bin，codex 认
+# CODEX_INSTALL_DIR；Node 到 $NVM_DIR/versions/node/v22.11.0/bin），不联网。调用和收到的环境变量记进 {log}。
+FAKE_DEP_INSTALLER = '''#!/bin/sh
+echo "fake-{name} CODEX_NON_INTERACTIVE=${CODEX_NON_INTERACTIVE:-} NVM_DIR=${NVM_DIR:-} XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-unset}" >> "{log}"
+[ "{fail}" = 1 ] && { echo "download failed (fake {name})"; exit 4; }
+case "{name}" in
+  node) dir="$NVM_DIR/versions/node/v22.11.0/bin"; mkdir -p "$dir"; printf '#!/bin/sh\\necho v22.11.0\\n' > "$dir/node"; chmod +x "$dir/node" ;;
+  codex) dir="${CODEX_INSTALL_DIR:-$HOME/.local/bin}"; mkdir -p "$dir"; printf '#!/bin/sh\\nexit 0\\n' > "$dir/codex"; chmod +x "$dir/codex" ;;
+  *) dir="$HOME/.local/bin"; mkdir -p "$dir"; printf '#!/bin/sh\\nexit 0\\n' > "$dir/{name}"; chmod +x "$dir/{name}" ;;
+esac
+echo "installed {name} (fake)"
+'''
+NVM_OFFICIAL = "curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.8/install.sh | PROFILE=/dev/null bash"
+
+
+class ExternalDepsTests(InstallTestBase):
+    """全新机器：PATH 里没有 herdr、claude、codex、node（只有一个只记日志的假 curl），安装命令都换成假的安装器。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        nobin = self.tmp / "nobin"
+        nobin.mkdir()
+        self.curl_log = self.tmp / "curl.log"
+        (nobin / "curl").write_text(f"#!/bin/sh\necho \"curl $*\" >> '{self.curl_log}'\nexit 97\n")
+        (nobin / "curl").chmod(0o755)
+        dirs = [d for d in os.environ.get("PATH", "").split(os.pathsep)
+                if d and not any(os.path.exists(os.path.join(d, n)) for n in ("herdr", "claude", "codex", "node"))]
+        self.bare_env = dict(self.env, PATH=os.pathsep.join([str(nobin), *dirs]), SHELL="/bin/zsh")
+        for tool in ("herdr", "claude", "codex", "node"):
+            self.assertIsNone(shutil.which(tool, path=self.bare_env["PATH"]), tool)
+        self.dep_log = self.tmp / "deps-installer.log"
+        self.local_bin = self.home / ".local" / "bin"
+        self.nvm_node = self.home / ".nvm" / "versions" / "node" / "v22.11.0" / "bin" / "node"
+        self.addCleanup(lambda: self.assertFalse(self.curl_log.exists(), "不能调用 curl（不联网）"))
+
+    def env_with(self, fail: tuple = (), **extra: str) -> dict:
+        """四样的安装命令都换成假安装器；fail 里列的那几样装失败。"""
+        env = dict(self.bare_env, **extra)
+        herdr = self.tmp / "fake-herdr-installer.sh"
+        herdr.write_text(FAKE_INSTALLER.replace("{log}", str(self.dep_log)).replace("{herdr}", str(self.fakebin / "herdr"))
+                         .replace("{fail}", "1" if "herdr" in fail else "0"))
+        env[INSTALLER_ENV] = f"sh '{herdr}'"
+        for name, var in DEP_INSTALLER_ENVS.items():
+            script = self.tmp / f"fake-{name}-installer.sh"
+            script.write_text(FAKE_DEP_INSTALLER.replace("{name}", name).replace("{log}", str(self.dep_log))
+                              .replace("{fail}", "1" if name in fail else "0"))
+            env[var] = f"sh '{script}'"
+        return env
+
+    def official_env(self) -> dict:
+        """不换安装命令：计划里显示的是官方命令。只在不会执行安装的场景（dry-run、非交互不带 --install-deps）用。"""
+        return {k: v for k, v in self.bare_env.items() if k not in (INSTALLER_ENV, *DEP_INSTALLER_ENVS.values())}
+
+    def installed(self) -> list:
+        """按顺序：哪几个假安装器跑过（herdr 的假安装器记的是 fake-installer）。"""
+        lines = self.dep_log.read_text().splitlines() if self.dep_log.exists() else []
+        return [line.split()[0].replace("fake-installer", "herdr").replace("fake-", "") for line in lines]
+
+    def test_dry_run_lists_command_location_profile_sudo(self) -> None:
+        """dry-run：每样外部依赖写清要跑的官方命令、装到哪、改不改 shell 配置、不用 sudo；什么都不装、不写"""
+        before = self.snapshot()
+        out = self.install_json("--dry-run", "--install-deps", "--host", "both", "--oncall", *self.ws_args(),
+                                env=self.official_env())
+        self.assertTrue(out["ok"], json.dumps(out, ensure_ascii=False, indent=1))
+        self.assertEqual([s["key"] for s in out["steps"]][:3], ["herdr", "claude-cli", "codex-cli"])
+        profile = "~/.zprofile" if platform.system() == "Darwin" else "~/.zshrc"
+        expect = {"herdr": (HERDR_OFFICIAL, "装到 ~/.local/bin/herdr", "不改 shell 配置"),
+                  "claude-cli": (CLAUDE_OFFICIAL, "装到 ~/.local/bin/claude", "不改 shell 配置"),
+                  "codex-cli": (CODEX_OFFICIAL, "装到 ~/.local/bin/codex", f"会往 {profile} 末尾追加一段带标记的 PATH"),
+                  "oncall-node": (NVM_OFFICIAL, "装到 ~/.nvm", "不改 shell 配置（PROFILE=/dev/null")}
+        for key, parts in expect.items():
+            step = self.step(out, key)
+            self.assertTrue(step["changes"], key)
+            self.assertIn("直接执行（--install-deps）", step["action"])
+            for part in (*parts, "不用 sudo"):
+                self.assertIn(part, step["action"], key)
+        self.assertIn("nvm install 22", self.step(out, "oncall-node")["action"])
+        keys = [s["key"] for s in out["steps"]]
+        self.assertLess(keys.index("oncall-node"), keys.index("oncall-plugin"))  # Node 先装，插件等它
+        self.assertIn("装好 herdr 后", self.step(out, "oncall-plugin")["action"])
+        self.assertEqual(self.snapshot(), before)
+        self.assertFalse(self.dep_log.exists())
+
+    def test_non_interactive_without_flag_only_gives_commands(self) -> None:
+        """非交互、不带 --install-deps（agent 的 shell、drover update）：一样都不装，只给命令；herdr 和 Node 照旧算失败
+        （退出码 1，和以前一样），宿主命令行只提示"""
+        out = self.install_json("--host", "both", "--oncall", *self.ws_args(), rc=1, env=self.official_env())
+        self.assertEqual(out["deps_mode"], "no")
+        for key, cmd, level in (("herdr", HERDR_OFFICIAL, "fail"), ("claude-cli", CLAUDE_OFFICIAL, "warn"),
+                                ("codex-cli", CODEX_OFFICIAL, "warn"), ("oncall-node", NVM_OFFICIAL, "fail")):
+            step = self.step(out, key)
+            self.assertEqual((step["changes"], step["level"]), (False, level), key)
+            self.assertIn(cmd, step["action"], key)
+            self.assertIn("--install-deps", step["action"], key)
+        self.assertEqual(out["deps_installed"], {})
+        self.assertFalse(self.local_bin.exists())
+        self.assertFalse((self.home / ".nvm").exists())
+        self.assertTrue(self.pkg_dir.is_symlink())  # drover 自己的各项照装
+
+    def test_install_deps_installs_all_then_skips(self) -> None:
+        """--install-deps（非交互）：按顺序装 herdr → claude → codex → Node，插件等 Node 装好再装；装过的记进安装记录。
+        重跑：装过的都跳过（不在 PATH 里只提示）"""
+        env = self.env_with(XDG_CONFIG_HOME=str(self.tmp / "xdg"))
+        out = self.install_json("--install-deps", "--host", "both", "--oncall", *self.ws_args(), env=env)
+        self.assertTrue(out["ok"], json.dumps(out, ensure_ascii=False, indent=1))
+        self.assertEqual(self.installed(), ["herdr", "claude", "codex", "node"])
+        log = self.dep_log.read_text()
+        self.assertIn("fake-codex CODEX_NON_INTERACTIVE=1", log)  # 不在终端里问要不要马上启动 Codex
+        self.assertIn(f"fake-node CODEX_NON_INTERACTIVE= NVM_DIR={self.home / '.nvm'} XDG_CONFIG_HOME=unset", log)
+        self.assertIn("Node 22.11.0", self.step(out, "oncall-node")["result"])
+        self.assertTrue(self.step(out, "oncall-plugin")["result"].startswith("完成"))
+        self.assertEqual(self.plugin_calls(), [ONCALL_INSTALL])
+        self.assertIn("登录要你自己来", self.step(out, "codex-cli")["result"])
+        want = {"herdr": str(self.local_bin / "herdr"), "claude": str(self.local_bin / "claude"),
+                "codex": str(self.local_bin / "codex"), "nvm": str(self.nvm_node)}
+        self.assertEqual(out["deps_installed"], want)
+        self.assertEqual(self.load(self.state)["deps_installed"], want)
+        joined = "\n".join(out["next_steps"])
+        self.assertIn("终端里运行 ~/.local/bin/herdr", joined)  # herdr 不在 PATH 上：给完整路径
+        self.assertIn('export PATH="$HOME/.local/bin:$PATH"', joined)
+        self.assertIn("先 codex login", joined)
+        self.assertIn("ctrl+b 再按 q", joined)
+        again = self.install_json("--install-deps", "--host", "both", "--oncall", env=env)
+        self.assertTrue(again["ok"])
+        self.assertEqual(len(self.installed()), 4)  # 一样都没重装
+        for key in ("herdr", "claude-cli", "codex-cli"):
+            self.assertEqual((self.step(again, key)["changes"], self.step(again, key)["level"]), (False, "warn"), key)
+            self.assertIn("不在 PATH 里", self.step(again, key)["state"])
+        self.assertEqual(self.step(again, "oncall-node")["level"], "ok")
+        self.assertEqual(self.load(self.state)["deps_installed"], want)
+
+    def run_pty(self, answer: str) -> tuple:
+        env = self.env_with()
+        rc, text, answered = self.pty_run([sys.executable, str(INSTALL), "--host", "both", *self.ws_args()], env,
+                                          [(b"[Y/n]", answer)])
+        self.assertTrue(answered, f"没看到提问：{text[-500:]}")
+        self.assertEqual(text.count("[Y/n]"), 1, text[-2000:])  # 一句问完
+        for line in ("  - herdr：sh '", "  - Claude Code：sh '", "  - Codex CLI：sh '"):
+            self.assertIn(line, text)
+        return rc, text
+
+    def test_interactive_one_question_no(self) -> None:
+        """交互终端里答 n：一样都不装，只给命令；herdr 算失败（退出码 1），宿主命令行只提示"""
+        rc, text = self.run_pty("n")
+        self.assertEqual(rc, 1, text[-1500:])
+        self.assertEqual(self.installed(), [])
+        self.assertIn("你选了不装", text)
+        self.assertIn("警告：没做成", text)  # claude / codex：只记警告
+        self.assertFalse(self.local_bin.exists())
+
+    def test_interactive_one_question_yes(self) -> None:
+        """交互终端里直接回车：三样一起装上，只问这一次"""
+        rc, text = self.run_pty("")
+        self.assertEqual(rc, 0, text[-1500:])
+        self.assertEqual(self.installed(), ["herdr", "claude", "codex"])
+        self.assertIn("在 Herdr 里开主会话", text)
+
+    def test_only_selected_host_cli(self) -> None:
+        """--host claude：claude、codex 都没装，只装 claude"""
+        out = self.install_json("--install-deps", "--host", "claude", *self.ws_args(), env=self.env_with())
+        self.assertTrue(out["ok"])
+        self.assertEqual(self.installed(), ["herdr", "claude"])
+        self.assertNotIn("codex-cli", [s["key"] for s in out["steps"]])
+        self.assertFalse((self.local_bin / "codex").exists())
+
+    def test_node_only_with_oncall_and_no_node(self) -> None:
+        """Node 只在接飞书、本机一个 node 都没有时装：不接飞书不装；本机有旧 node 不装（只提示升级，退出码 1）"""
+        env = self.env_with()
+        out = self.install_json("--install-deps", "--host", "claude", *self.ws_args(), env=env)
+        self.assertNotIn("node", self.installed())
+        self.assertIn("不检查", self.step(out, "oncall-node")["state"])
+        old = self.tmp / "old-node"
+        old.mkdir()
+        (old / "node").write_text("#!/bin/sh\necho v16.20.0\n")
+        (old / "node").chmod(0o755)
+        env_old = dict(env, PATH=os.pathsep.join([str(old), env["PATH"]]))
+        out = self.install_json("--install-deps", "--host", "claude", "--oncall", rc=1, env=env_old)
+        step = self.step(out, "oncall-node")
+        self.assertEqual((step["changes"], step["level"]), (False, "fail"))
+        self.assertIn("Node 16.20.0 太旧", step["state"])
+        self.assertNotIn("node", self.installed())
+        out = self.install_json("--install-deps", "--host", "claude", "--oncall", env=env)  # 一个 node 都没有：装
+        self.assertTrue(out["ok"], json.dumps(out, ensure_ascii=False, indent=1))
+        self.assertEqual(self.installed().count("node"), 1)
+
+    def test_failures(self) -> None:
+        """herdr 装失败：这一项失败、退出码 1，其余照装（claude 照样装上）；宿主命令行装失败只记警告，退出码 0"""
+        out = self.install_json("--install-deps", "--host", "claude", *self.ws_args(), rc=1, env=self.env_with(fail=("herdr",)))
+        self.assertTrue(self.step(out, "herdr")["result"].startswith("失败"))
+        self.assertIn("download failed", self.step(out, "herdr")["result"])
+        self.assertTrue(self.step(out, "claude-cli")["result"].startswith("完成"))
+        self.assertTrue(self.step(out, "routing")["result"].startswith("完成"))
+        self.dep_log.unlink()
+        shutil.rmtree(self.local_bin)
+        out = self.install_json("--install-deps", "--host", "claude", rc=0, env=self.env_with(fail=("claude",)))
+        step = self.step(out, "claude-cli")
+        self.assertTrue(step["result"].startswith("警告"), step)
+        self.assertIn("download failed (fake claude)", step["note"])
+        self.assertIn("不用重跑 install", step["note"])
+        self.assertTrue(self.step(out, "herdr")["result"].startswith("完成"))
+        self.assertNotIn("claude", out["deps_installed"])
+
+    def test_uninstall_keeps_deps_and_lists_how_to_remove(self) -> None:
+        """--uninstall 不删 drover 装过的 herdr、claude、codex、nvm，只列出来和手动删法"""
+        self.install_json("--install-deps", "--host", "both", "--oncall", *self.ws_args(), env=self.env_with())
+        text = self.run_install("--uninstall", "--dry-run", env=self.bare_env).stdout
+        self.assertIn("drover 替你装过、没删的工具", text)
+        self.assertIn("herdr（~/.local/bin/herdr）：先 herdr server stop", text)
+        out = self.install_json("--uninstall", env=self.bare_env)
+        self.assertTrue(out["ok"])
+        kept = {d["name"]: d["remove"] for d in out["kept_deps"]}
+        self.assertEqual(sorted(kept), ["claude", "codex", "herdr", "nvm"])
+        self.assertIn("rm -rf ~/.local/share/claude", kept["claude"])
+        self.assertIn("# >>> Codex installer >>>", kept["codex"])
+        self.assertIn("rm -rf ~/.nvm", kept["nvm"])
+        for path in (self.local_bin / "herdr", self.local_bin / "claude", self.local_bin / "codex", self.nvm_node):
+            self.assertTrue(os.path.lexists(path), path)
+        self.assertFalse(self.state.exists())
 
 
 # ---------------------------------------------------------------- 首次安装：主工作台没有默认值，不能是家目录
@@ -1697,6 +1928,7 @@ class InstallShTests(InstallTestBase):
     def test_linux_hints(self) -> None:
         p = self.run_sh(path=str(self.minimal_bin(uname="Linux")))
         self.assertEqual(p.returncode, 1)
+        self.assertIn("Linux 上能装，但这一版没有实测过", p.stderr)
         self.assertIn("sudo apt-get install git", p.stderr)
         self.assertIn("sudo dnf install python3", p.stderr)
         self.assertNotIn("xcode-select", p.stderr)
@@ -1704,7 +1936,9 @@ class InstallShTests(InstallTestBase):
     def test_unsupported_os(self) -> None:
         p = self.run_sh(path=str(self.minimal_bin(uname="MINGW64_NT-10.0")))
         self.assertEqual(p.returncode, 1)
-        self.assertIn("只支持 macOS 和 Linux", p.stderr)
+        self.assertIn("只支持 macOS（Linux 能装，但未实测），当前系统是 MINGW64_NT-10.0。", p.stderr)
+        self.assertIn("Windows 暂不支持", p.stderr)
+        self.assertIn("WSL2 的 Ubuntu", p.stderr)
 
     def test_python_too_old(self) -> None:
         d = self.minimal_bin(link=("git",))

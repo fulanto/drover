@@ -1,9 +1,10 @@
 #!/bin/sh
 # drover 一键安装入口：clone 之后在包根目录跑 ./install.sh [install.py 的参数...]
 #
-# 先检查系统（macOS / Linux）和 install.py 自己要的 git、python3（3.9 及以上）：缺了就给出官方的安装命令并停下，
-# 不替你装（要管理员权限或弹系统对话框）。都在就把参数原样交给 install.py，后面的事（缺 herdr 时问你要不要装、
-# 装 Claude Code / Codex 两套入口）都由它做。只用 POSIX sh。
+# 先检查系统（这一版完整支持 macOS；Linux 能装、未实测；Windows 暂不支持）和 install.py 自己要的 git、python3（3.9 及以上）：
+# 缺了就给出官方的安装命令并停下，不替你装（要管理员权限或弹系统对话框）。都在就把参数原样交给 install.py，后面的事
+# （缺 herdr、选定宿主的 claude / codex、飞书要的 Node 时一句话问你要不要一起装，装 Claude Code / Codex 两套入口）都由它做。
+# 只用 POSIX sh。
 
 set -u
 
@@ -14,10 +15,15 @@ say() { printf '%s\n' "$*" >&2; }
 os=$(uname -s 2>/dev/null || echo unknown)
 case "$os" in
   Darwin) os_name=macOS ;;
-  Linux) os_name=Linux ;;
+  Linux)
+    os_name=Linux
+    say "install.sh：Linux 上能装，但这一版没有实测过（只在 macOS 上完整测过），遇到问题欢迎反馈。"
+    ;;
   *)
     # 变量后面紧跟中文标点时要写 ${os}：macOS 的 /bin/sh（bash 3.2）会把后面的字节也当成变量名。
-    say "install.sh：只支持 macOS 和 Linux（当前系统：${os}）。Windows 上请在 WSL 里装。"
+    say "install.sh：drover 这一版只支持 macOS（Linux 能装，但未实测），当前系统是 ${os}。"
+    say "Windows 暂不支持：原生 Windows 上 drover 起不来（用到了只有 Unix 才有的文件锁和终端控制），herdr 的插件在 Windows 上也还是预览。"
+    say "想先试的，可以在 WSL2 的 Ubuntu 里按 Linux 的方式装（未实测，出了问题欢迎反馈），见 README 第 1 节。"
     exit 1
     ;;
 esac
