@@ -197,8 +197,8 @@ AGENT_INSTALL = {
               "alt": "npm install -g @openai/codex 或 brew install --cask codex", "docs": "https://github.com/openai/codex",
               "installer_env": "DROVER_CODEX_INSTALLER", "env": {"CODEX_NON_INTERACTIVE": "1"},
               "login": "先跑 codex login（浏览器登录），再启动",
-              "remove": "rm -f {dir}/codex {dir}/codex-code-mode-host && rm -rf ~/.codex/packages/standalone，再从 shell 配置里"
-                        "删掉 # >>> Codex installer >>> 到 # <<< Codex installer <<< 那一段（安装脚本加的 PATH）"},
+              "remove": "rm -f {dir}/codex {dir}/codex-code-mode-host && rm -rf ~/.codex/packages/standalone；shell 配置里要是有"
+                        " # >>> Codex installer >>> 到 # <<< Codex installer <<< 那一段（它的安装脚本加的 PATH），一并删掉"},
 }
 NVM_DIR = HOME / ".nvm"
 NODE_INSTALL_VERSION = "22"
@@ -206,6 +206,12 @@ NVM_INSTALL_CMD = "curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.8
 NVM_USE_CMD = f'. "$HOME/.nvm/nvm.sh" && nvm install {NODE_INSTALL_VERSION}'
 NODE_INSTALLER_ENV = "DROVER_NODE_INSTALLER"
 NODE_REMOVE = "rm -rf ~/.nvm（nvm 和它装的 Node 都在里面；drover 没改 shell 配置，不用再改别处）"
+# 装依赖的目录（~/.local/bin，或 HERDR_INSTALL_DIR / CODEX_INSTALL_DIR）不在 PATH 里时，在同一次同意里往 shell 启动文件末尾加一段
+# 带标记的块（写哪个文件见 shell_rc），块里先判断目录已在 PATH 里就不加；--uninstall 按安装记录只删这一段。
+PATH_BLOCK_BEGIN = "# >>> drover PATH >>>"
+PATH_BLOCK_NOTE = "# drover 的 install.py 加的：herdr、claude / codex 装在下面的目录。python3 install.py --uninstall 会删掉这一段。"
+PATH_BLOCK_END = "# <<< drover PATH <<<"
+PATH_BY_DROVER = "目录不在 PATH 里时，由\"把装依赖的目录加进 PATH\"那一项处理"
 GIT_HINT = {"Darwin": "xcode-select --install（或 brew install git）", "Linux": "sudo apt-get install git / sudo dnf install git"}
 
 # 验收工具：Robert C. Martin 的 crapper（圈复杂度）和 dryer（重复代码），都是 0BSD。条目验收跑 crapper（只算复杂度，不跑测试），
@@ -425,9 +431,11 @@ class Ctx:
     # 往 ~/.drover 以外装依赖（herdr、宿主命令行、nvm + Node）怎么办：yes（--install-deps，直接装）、ask（交互终端，一句 [Y/n]
     # 问完）、no（非交互，只给命令）。
     deps_mode: str = "no"
-    deps_planned: list = field(default_factory=list)  # 这次计划要装的外部依赖（ask 时一起问的那几行）
+    deps_planned: list = field(default_factory=list)  # 这次计划要装的外部依赖：(ask 时一起问的那一行, 计划项)
     deps_consent: Optional[bool] = None  # ask 时用户的回答；还没问是 None
     deps_installed: dict = field(default_factory=dict)  # 这次由 drover 装上的外部依赖：名字 → 路径（记进安装记录，卸载时列出来）
+    path_dirs: list = field(default_factory=list)  # shell 配置里 drover 那段 PATH 管的目录（加好了或早就加过）：后面的安装命令 PATH 里带上
+    path_block: Optional[str] = None     # 这次往哪个 shell 启动文件加了 PATH 那一段（记进安装记录，--uninstall 按它删）
     herdr_planned: bool = False          # 计划里有"安装 herdr"这一项（后面要用 herdr 的项先计划好，等它装完再跑）
     herdr_installed: Optional[str] = None  # 这次装上的 herdr 路径
     node_planned: bool = False           # 计划里有"用 nvm 装 Node"这一项（插件那一项等它装完再看 Node）
@@ -524,31 +532,43 @@ def plan_dep(ctx: "Ctx", step: "Step", name: str, cmd: str, where: str, profile:
         return step
     how = "直接执行（--install-deps）" if ctx.deps_mode == "yes" else "装之前问你一句（这次要装的几样一起问），同意就执行"
     step.action, step.run, step.note = f"安装 {name}：{how} {detail}", run, ""  # 手动装法的提示用不着了
-    ctx.deps_planned.append(f"{name}：{detail}")
+    ctx.deps_planned.append((f"{name}：{detail}", step))
     return step
 
 
+def deps_allowed(ctx: "Ctx") -> bool:
+    """往 ~/.drover 以外改东西得到同意没有：--install-deps，或者交互终端里答了 y。"""
+    return ctx.deps_mode == "yes" or bool(ctx.deps_consent)
+
+
 def ask_deps(ctx: "Ctx") -> None:
-    """交互终端里正式安装之前：这次要往 ~/.drover 以外装的几样，一句 [Y/n] 问完（直接回车算同意）。
-    Ctrl-C：还什么都没装，退出码 130。"""
+    """交互终端里正式安装之前：这次要往 ~/.drover 以外装的几样，一句 [Y/n] 问完（直接回车算同意）。答 n：这几项都不做，
+    也不先备份。Ctrl-C：还什么都没装，退出码 130。"""
     if ctx.deps_mode != "ask" or ctx.dry_run or not ctx.deps_planned:
         return
     print("这次要往 ~/.drover 以外装这几样（官方安装脚本，都装在你的家目录）：")
-    for line in ctx.deps_planned:
+    for line, _ in ctx.deps_planned:
         print(f"  - {line}")
     try:
         ctx.deps_consent = confirm("现在装吗？[Y/n] ")
     except KeyboardInterrupt:
         print()
         raise InstallError("取消了：什么都没装。", rc=130)
+    if not ctx.deps_consent:
+        for _, st in ctx.deps_planned:
+            st.backup = None
     print()
 
 
 def run_dep(ctx: "Ctx", cmd: str, env: Optional[dict] = None) -> str:
     """执行一样外部依赖的安装命令（sh -c，复用装验收工具的 tool_cmd），返回最后几行输出。用户没同意、退出码不是 0、超时都抛
-    RuntimeError（调用方按这一项的规则算失败或警告）。env 里值是 None 的键从环境里去掉。"""
-    if ctx.deps_mode != "yes" and not ctx.deps_consent:
+    RuntimeError（调用方按这一项的规则算失败或警告）。env 里值是 None 的键从环境里去掉。drover 在 shell 配置里加了 PATH 的
+    目录也放进这条命令的 PATH：Codex 的安装脚本看到目录已在 PATH 里，就不再往 profile 加它自己那段（install.sh 第 602–607 行
+    比的是脚本进程的 $PATH）。"""
+    if not deps_allowed(ctx):
         raise RuntimeError(f"你选了不装。要装时手动执行 {cmd}，再重跑 install（或者加 --install-deps）")
+    if ctx.path_dirs:
+        env = {**(env or {}), "PATH": os.pathsep.join([*map(str, ctx.path_dirs), os.environ.get("PATH", "")])}
     print(f"执行：{cmd}", file=sys.stderr, flush=True)
     out = tool_cmd(["sh", "-c", cmd], cmd, env=env)
     return "；".join(line.strip() for line in out.strip().splitlines()[-4:] if line.strip())
@@ -562,7 +582,8 @@ def install_herdr(ctx: "Ctx") -> str:
         raise RuntimeError(f"安装命令跑完了，但找不到 herdr（看过 PATH 和 {'、'.join(disp(d) for d in herdr_fallback_dirs())}）：{tail[:300]}")
     ctx.herdr_status, ctx.herdr_status_error = None, None  # 之前"找不到 herdr"的结果作废
     ctx.herdr_installed = ctx.deps_installed["herdr"] = exe
-    return f"装好了：{disp(exe)}" + ("" if shutil.which("herdr") else "（这个目录不在 PATH 里，见汇总里的提示）")
+    on_path = shutil.which("herdr") or Path(exe).parent in ctx.path_dirs
+    return f"装好了：{disp(exe)}" + ("" if on_path else "（这个目录不在 PATH 里，见汇总里的提示）")
 
 
 def herdr_integration_status(ctx: Ctx) -> Optional[dict]:
@@ -1006,8 +1027,19 @@ def shell_dir(d: Path) -> str:
 
 
 def path_note(d: Path, name: str = "herdr") -> str:
+    """--check 里 herdr / 宿主命令行不在 PATH 上时的提示：drover 已经加进 shell 配置的，说开一个新终端就好。"""
+    rc = rc_with_path(d)
+    if rc:
+        return f"{name} 装在 {disp(d)}：drover 已把这个目录加进 {disp(rc)}，这个终端还没生效，开一个新终端就好"
     return (f"{name} 装在 {disp(d)}，这个目录不在 PATH 里：drover 按名字调用 {name}，不在 PATH 里会报找不到。"
-            f"把 export PATH=\"{shell_dir(d)}:$PATH\" 加进 ~/.zshrc（bash 用 ~/.bashrc），开一个新终端再启动 herdr")
+            "重跑 install 加 --install-deps 会替你往 shell 配置里加；也可以自己把 "
+            f"export PATH=\"{shell_dir(d)}:$PATH\" 加进 ~/.zshrc（bash 用 ~/.bashrc），开一个新终端再启动 herdr")
+
+
+def off_path_step(key: str, label: str, exe: Path) -> Step:
+    """herdr / 宿主命令行装了、但目录不在 PATH 上：PATH 怎么办统一由"把装依赖的目录加进 PATH"那一项说。"""
+    return Step(key, label, disp(exe), f"已装，但 {disp(exe.parent)} 不在 PATH 里", level="warn",
+                note=f"{disp(exe.parent)} 不在 PATH 里：见\"把装依赖的目录加进 PATH\"那一项")
 
 
 def plan_herdr(ctx: Ctx) -> Step:
@@ -1018,8 +1050,7 @@ def plan_herdr(ctx: Ctx) -> Step:
         return Step(key, label, disp(found), "已装")
     off = herdr_off_path()
     if off:
-        return Step(key, label, disp(off), f"已装，但 {disp(off.parent)} 不在 PATH 里", level="warn",
-                    note=path_note(off.parent))
+        return off_path_step(key, label, off)
     cmd = herdr_install_cmd()
     alt = f"或者 {HERDR_BREW_CMD}，见 {HERDR_INSTALL_DOCS}"
     target = herdr_fallback_dirs()[0] / "herdr"
@@ -1029,7 +1060,7 @@ def plan_herdr(ctx: Ctx) -> Step:
     if blocker:
         step.action, step.note = f"{blocker}，{alt}", ""
         return step
-    step = plan_dep(ctx, step, "herdr", cmd, disp(target), "不改 shell 配置（目录不在 PATH 里时只打印一句提示）",
+    step = plan_dep(ctx, step, "herdr", cmd, disp(target), f"脚本不改 shell 配置（{PATH_BY_DROVER}）",
                     lambda: install_herdr(ctx))
     ctx.herdr_planned = step.run is not None
     return step
@@ -1047,12 +1078,17 @@ def host_cli_off_path(host: str) -> Optional[Path]:
     return exe if not shutil.which(host) and exe.is_file() and os.access(str(exe), os.X_OK) else None
 
 
-def codex_profile_change() -> str:
-    """Codex 安装脚本会不会改 shell 配置、改哪个文件（照它的 add_to_path / pick_profile：安装目录已在 PATH 里不改；否则 macOS 的
-    zsh 是 ~/.zprofile、bash 是 ~/.bash_profile，Linux 的 zsh 是 ~/.zshrc、bash 是 ~/.bashrc，其他 ~/.profile）。"""
+def codex_profile_change(ctx: Ctx) -> str:
+    """Codex 安装脚本会不会改 shell 配置、改哪个文件。它的 add_to_path 看脚本进程的 $PATH 里有没有安装目录，有就不改
+    （install.sh 第 602–607 行）；没有就往 profile 追加，macOS 的 zsh 是 ~/.zprofile、bash 是 ~/.bash_profile，Linux 的 zsh 是
+    ~/.zshrc、bash 是 ~/.bashrc，其他 ~/.profile（pick_profile 第 576–596 行）。drover 会在同一次同意里先加 PATH 时，跑它的时候
+    目录已经在 PATH 里了（run_dep），它就不改。"""
     d = host_cli_dir("codex")
     if str(d) in os.environ.get("PATH", "").split(os.pathsep):
         return f"不改 shell 配置（{disp(d)} 已在 PATH 里）"
+    if ctx.deps_mode != "no" and shell_rc() is not None:
+        return (f"脚本不改 shell 配置：drover 先把 {disp(d)} 加进 PATH，跑脚本时它已在 PATH 里，脚本就不再往 profile 加"
+                "它自己那段")
     shell = os.path.basename(os.environ.get("SHELL", ""))
     names = {("zsh", True): ".zprofile", ("bash", True): ".bash_profile", ("zsh", False): ".zshrc",
              ("bash", False): ".bashrc"}
@@ -1076,7 +1112,8 @@ def install_host_cli(ctx: Ctx, host: str) -> str:
     except RuntimeError as exc:
         raise StepWarning(f"{info['name']} 没装上：{exc}。drover 的入口照样装好了，装好 {host} 之后不用重跑 install")
     ctx.deps_installed[host] = str(exe)
-    return (f"装好了：{disp(exe)}" + ("" if shutil.which(host) else "（这个目录不在 PATH 里，见汇总里的提示）")
+    on_path = shutil.which(host) or exe.parent in ctx.path_dirs
+    return (f"装好了：{disp(exe)}" + ("" if on_path else "（这个目录不在 PATH 里，见汇总里的提示）")
             + f"；登录要你自己来：{info['login']}")
 
 
@@ -1089,8 +1126,7 @@ def plan_host_cli(ctx: Ctx, host: str) -> Step:
         return Step(key, label, disp(found), "已装")
     off = host_cli_off_path(host)
     if off:
-        return Step(key, label, disp(off), f"已装，但 {disp(off.parent)} 不在 PATH 里", level="warn",
-                    note=path_note(off.parent, host))
+        return off_path_step(key, label, off)
     target = host_cli_dir(host) / host
     step = Step(key, label, disp(target), "没装（PATH 和官方安装目录里都没有）", level="warn",
                 note=f"没找到 {host} 命令：官方安装 {info['cmd']}（或 {info['alt']}，见 {info['docs']}）；"
@@ -1100,10 +1136,169 @@ def plan_host_cli(ctx: Ctx, host: str) -> Step:
         step.action = f"只提示：{blocker}"
         return step
     if host == "claude":
-        where, profile = f"{disp(target)}（程序在 ~/.local/share/claude）", "不改 shell 配置（目录不在 PATH 里时只提示）"
+        where, profile = f"{disp(target)}（程序在 ~/.local/share/claude）", f"脚本不改 shell 配置（{PATH_BY_DROVER}）"
     else:
-        where, profile = f"{disp(target)}（程序在 {disp(CODEX_HOME / 'packages' / 'standalone')}）", codex_profile_change()
+        where, profile = f"{disp(target)}（程序在 {disp(CODEX_HOME / 'packages' / 'standalone')}）", codex_profile_change(ctx)
     return plan_dep(ctx, step, info["name"], host_install_cmd(host), where, profile, lambda: install_host_cli(ctx, host))
+
+
+# ---------------------------------------------------------------- 计划项：把装依赖的目录加进 PATH（shell 配置）
+
+
+def shell_rc() -> Optional[Path]:
+    """往哪个 shell 启动文件加 PATH：要让"新开的终端"和"herdr 的 pane"两边都读得到。
+    - herdr 的 pane：shell 是 [terminal] default_shell，没配就是 $SHELL（herdr v0.9.5 src/pane.rs 第 1826–1847 行）；
+      shell_mode 默认 auto（docs config-reference.json terminal.shell_mode），auto 在 macOS 上起 login shell、其他 Unix 上起
+      非 login 的交互 shell（pane.rs 第 2023–2032 行；login 走 portable-pty 的 new_default_prog，argv0 前面加 "-"，
+      pane.rs 第 2132–2137 行、vendor/portable-pty/src/cmdbuilder.rs 第 562–568 行）。
+    - 新开的终端：macOS 的终端 App 起 login shell（code.claude.com/docs/en/troubleshoot-install："Terminal on macOS starts
+      Bash as a login shell"），Linux 的桌面终端一般起非 login 的交互 shell。
+    zsh：交互 shell 不管 login 与否都读 $ZDOTDIR/.zshrc（没设 ZDOTDIR 就是 ~，zsh 手册 5.1 Startup/Shutdown Files）→ 写它，
+    两边都读得到。bash：login 只读 ~/.bash_profile、~/.bash_login、~/.profile 里第一个存在的，非 login 的交互 shell 只读
+    ~/.bashrc（bash 手册 6.2 Bash Startup Files）→ macOS 两边都是 login，写 login 的那个；Linux 两边都是非 login，写 ~/.bashrc。
+    其他 shell（fish 等）认不出启动文件，返回 None，只提示。"""
+    shell = os.path.basename(os.environ.get("SHELL", ""))
+    if shell == "zsh":
+        return Path(os.path.expanduser(os.environ.get("ZDOTDIR") or str(HOME))) / ".zshrc"
+    if shell != "bash":
+        return None
+    if platform.system() != "Darwin":
+        return HOME / ".bashrc"
+    return next((HOME / n for n in (".bash_profile", ".bash_login", ".profile") if (HOME / n).exists()),
+                HOME / ".bash_profile")
+
+
+def path_block(dirs: list) -> str:
+    """shell 配置里 drover 那一段：每个目录一行，已在 PATH 里就不加（同一个文件被 source 两次也不会叠加）。sh / bash / zsh 都认。"""
+    lines = [PATH_BLOCK_BEGIN, PATH_BLOCK_NOTE]
+    for d in dirs:
+        lines.append(f'case ":$PATH:" in *":{shell_dir(d)}:"*) ;; *) export PATH="{shell_dir(d)}:$PATH" ;; esac')
+    return "\n".join(lines + [PATH_BLOCK_END])
+
+
+def path_block_span(text: str) -> Optional[tuple]:
+    """drover 那一段的 [起点, 终点)：从开始标记到结束标记那一行的换行（含）。没有返回 None。"""
+    start = text.find(PATH_BLOCK_BEGIN)
+    end = text.find(PATH_BLOCK_END, start) if start >= 0 else -1
+    if start < 0 or end < 0:
+        return None
+    end += len(PATH_BLOCK_END)
+    return start, end + 1 if text[end:end + 1] == "\n" else end
+
+
+def merge_path_block(text: str, block: str) -> str:
+    """已有 drover 那一段就原地整段换掉；没有就空一行追加到末尾。其余内容一个字节都不动。"""
+    span = path_block_span(text)
+    if span:
+        return text[:span[0]] + block + "\n" + text[span[1]:]
+    return text + ("" if not text else "\n" if text.endswith("\n") else "\n\n") + block + "\n"
+
+
+def strip_path_block(text: str) -> str:
+    """去掉 drover 那一段和追加时空出来的那一行：追加前的内容原样还回来。"""
+    span = path_block_span(text)
+    if span is None:
+        return text
+    before = text[:span[0]]
+    return (before[:-1] if before.endswith("\n\n") else before) + text[span[1]:]
+
+
+PATH_LINE_RE = re.compile(r'export PATH="([^"]+):\$PATH"')
+
+
+def block_dirs(text: str) -> list:
+    """shell 配置里 drover 那一段已经管着的目录（$HOME/… 换回绝对路径）。"""
+    span = path_block_span(text)
+    if span is None:
+        return []
+    return [Path(str(HOME) + m.group(1)[len("$HOME"):] if m.group(1).startswith("$HOME") else m.group(1))
+            for m in PATH_LINE_RE.finditer(text[span[0]:span[1]])]
+
+
+def rc_with_path(d: Path) -> Optional[Path]:
+    """drover 已经把 d 加进 shell 配置（那一段在、管着 d）时返回那个文件。"""
+    rc = shell_rc()
+    try:
+        text = rc.read_text() if rc and rc.is_file() else ""
+    except OSError:
+        return None
+    return rc if d in block_dirs(text) else None
+
+
+def path_dirs_needed(ctx: Ctx) -> list:
+    """要加进 PATH 的目录：herdr、选定宿主的命令行要装进去的（还没装，不管这次是 drover 装还是你照提示自己装），或者已经
+    装在里面、但不在 PATH 里的。"""
+    found = []
+    for name, off, target in [("herdr", herdr_off_path(), herdr_fallback_dirs()[0] / "herdr"),
+                              *[(h, host_cli_off_path(h), host_cli_dir(h) / h) for h in ctx.hosts]]:
+        if off or not shutil.which(name):
+            found.append((off or target).parent)
+    on_path = os.environ.get("PATH", "").split(os.pathsep)
+    out = []
+    for d in found:
+        if str(d) not in on_path and d not in out:
+            out.append(d)
+    return out
+
+
+def add_path_block(ctx: Ctx, rc: Path, dirs: list, manual: str) -> str:
+    """把 drover 那一段写进 rc（先备份由 run_step 做），之后这次运行里的安装命令 PATH 里也带上这些目录（run_dep）。"""
+    if not deps_allowed(ctx):
+        raise StepWarning(f"你选了不加。{manual}")
+    existed = rc.exists()
+    try:
+        text = rc.read_text() if existed else ""
+        rc.parent.mkdir(parents=True, exist_ok=True)
+        rc.write_text(merge_path_block(text, path_block(dirs)))
+    except OSError as exc:
+        raise StepWarning(f"没写成 {disp(rc)}：{exc}。{manual}")
+    if not existed:
+        ctx.created.append(str(rc))
+    ctx.path_block, ctx.path_dirs = str(rc), list(dirs)
+    return f"加好了：{disp(rc)}（新开的终端、herdr 的 pane 里就有 {'、'.join(disp(d) for d in dirs)}）"
+
+
+def plan_shell_path(ctx: Ctx) -> Step:
+    """装依赖的目录不在 PATH 里：和装依赖共用一次同意，往 shell 启动文件末尾加 drover 那一段（改之前备份）。没同意、非交互、
+    认不出 shell 时只提示。已经加过（PATH 还没刷新）的不重复写。"""
+    key, label = "shell-path", "把装依赖的目录加进 PATH"
+    dirs = path_dirs_needed(ctx)
+    if not dirs:
+        return Step(key, label, "PATH", "不用加（herdr、claude / codex 所在的目录都在 PATH 里）")
+    shown = "、".join(disp(d) for d in dirs)
+    exports = "、".join(f'export PATH="{shell_dir(d)}:$PATH"' for d in dirs)
+    note = (f"{shown} 不在 PATH 里：新开的终端里找不到 herdr、claude / codex，drover 在 Herdr 里按名字调用它们也会报找不到。"
+            f"要自己加：把 {exports} 加进 shell 的启动文件，开一个新终端")
+    rc = shell_rc()
+    if rc is None:
+        return Step(key, label, "PATH", f"{shown} 不在 PATH 里", level="warn", note=note,
+                    action=f"只提示：认不出你的 shell（SHELL={os.environ.get('SHELL') or '没设'}）读哪个启动文件")
+    try:
+        current = rc.read_text() if rc.exists() else ""
+    except OSError as exc:
+        return Step(key, label, disp(rc), f"读不了：{exc}", level="warn", note=note, action="只提示")
+    have = block_dirs(current)
+    if all(d in have for d in dirs):
+        ctx.path_dirs = have
+        return Step(key, label, disp(rc), f"drover 加过这一段（{shown}），这个终端还没生效，开一个新终端就好")
+    want = have + [d for d in dirs if d not in have]  # 以前那一段管的目录留着，只补新的
+    block = path_block(want)
+    detail = (f"往 {disp(rc)} 末尾加一段带 drover 标记的 PATH，这几行：{' ⏎ '.join(block.splitlines())}"
+              "（目录已在 PATH 里就不加；--uninstall 会删掉这一段）")
+    step = Step(key, label, disp(rc), f"{shown} 不在 PATH 里", level="warn", note=note)
+    if ctx.deps_mode == "no":
+        step.action = f"没自动加（不是交互终端，也没加 --install-deps）：重跑时加 --install-deps 会{detail}"
+        return step
+    how = "直接加（--install-deps）" if ctx.deps_mode == "yes" else "加之前问你一句（和要装的几样一起问），同意就加"
+    step.action, step.run, step.note = f"{how}：{detail}", (lambda: add_path_block(ctx, rc, want, note)), ""
+    step.fs, step.backup, step.backup_how = rc, backup_target(rc) if rc.exists() else None, "copy"
+    ctx.deps_planned.append((f"PATH：{detail}", step))
+    return step
+
+
+def plan_deps(ctx: Ctx) -> list:
+    """依赖那几项：加 PATH 排在最前面（后面的安装命令就带上它），再 herdr、选定宿主的命令行；一次同意里列的顺序也是这样。"""
+    return [plan_shell_path(ctx), plan_herdr(ctx), *[plan_host_cli(ctx, h) for h in ctx.hosts]]
 
 
 # ---------------------------------------------------------------- 计划项：Claude Code
@@ -2132,6 +2327,9 @@ def merged_state(ctx: Ctx) -> dict:
     deps = {**(old.get("deps_installed") or {}), **ctx.deps_installed}
     if deps:
         data["deps_installed"] = deps
+    # drover 往哪个 shell 启动文件加过 PATH 那一段：--uninstall 只删这一段。
+    if ctx.path_block or old.get("path_block"):
+        data["path_block"] = ctx.path_block or old.get("path_block")
     return data
 
 
@@ -2180,10 +2378,10 @@ def plan_workspace_location(ctx: Ctx) -> Step:
 
 
 def build_plan(ctx: Ctx) -> list:
-    # 依赖放最前面，按这个顺序：herdr → 选定宿主缺的命令行 → 验收工具要的 uv / Python 3.11+ → crapper、dryer → 接飞书时的 Node
-    # → drover 自己的各项。缺 herdr / Node 时先装（或问你），后面用到它们的项等它装完再跑。--check 不列 herdr 和宿主命令行
-    # （在"依赖"那一栏里）。
-    steps = [] if ctx.checking else [plan_herdr(ctx), *[plan_host_cli(ctx, h) for h in ctx.hosts]]
+    # 依赖放最前面，按这个顺序：（装依赖的目录不在 PATH 里时）把它加进 shell 配置 → herdr → 选定宿主缺的命令行 → 验收工具要的
+    # uv / Python 3.11+ → crapper、dryer → 接飞书时的 Node → drover 自己的各项。缺 herdr / Node 时先装（或问你），后面用到它们的
+    # 项等它装完再跑。--check 不列 PATH、herdr 和宿主命令行（在"依赖"那一栏里）。
+    steps = [] if ctx.checking else plan_deps(ctx)
     # 验收工具（宿主无关）：装不上只记警告（StepWarning），不影响退出码。
     steps += plan_quality_tools(ctx)
     steps.append(plan_oncall_node(ctx))
@@ -2338,10 +2536,15 @@ def next_steps(ctx: Ctx) -> list:
     off = herdr_off_path()
     off_dirs = []
     for exe in [off, *[host_cli_off_path(h) for h in ctx.hosts]]:
-        if exe and exe.parent not in off_dirs:
+        if exe and exe.parent not in off_dirs and exe.parent not in ctx.path_dirs:
             off_dirs.append(exe.parent)
     lines = ["下一步（开始用 drover）："]
-    lines.append(f"  1. 打开 Herdr：终端里运行 {disp(off) if off else 'herdr'}" + ("（herdr 不在 PATH 里，先用完整路径）" if off else ""))
+    if ctx.path_dirs:  # drover 刚把目录加进 shell 配置（或早就加过），当前这个终端的 PATH 还是旧的
+        lines.append(f"  1. 开一个新终端（让 PATH 生效：drover 把 {'、'.join(disp(d) for d in ctx.path_dirs)} 加进了 "
+                     f"{disp(ctx.path_block or shell_rc() or '')}），运行 herdr")
+    else:
+        lines.append(f"  1. 打开 Herdr：终端里运行 {disp(off) if off else 'herdr'}"
+                     + ("（herdr 不在 PATH 里，先用完整路径）" if off else ""))
     if off_dirs:
         fix = "、".join(f'export PATH="{shell_dir(d)}:$PATH"' for d in off_dirs)
         lines.append(f"     再把 {fix} 写进 ~/.zshrc（bash 用 ~/.bashrc），开一个新终端：drover 在 Herdr 里按名字调用 herdr、"
@@ -2783,6 +2986,8 @@ def find_backups(state: dict, workspaces: list) -> list:
             STATE_HOME / "bin", BACKUP_DIR / "codex-skills", CODEX_SKILLS]
     for ws in workspaces:
         dirs += [ws, ws / ".claude"]
+    if state.get("path_block"):
+        dirs.append(Path(state["path_block"]).parent)
     found = {Path(p) for p in (state.get("backups") or []) if Path(p).exists() or Path(p).is_symlink()}
     for d in dirs:
         if d.is_dir():
@@ -2829,6 +3034,28 @@ def deps_kept(state: dict) -> list:
     return out
 
 
+def unplan_path_block(state: dict) -> Step:
+    """shell 配置里 drover 加的 PATH 那一段：按安装记录只删这一段，其余内容不动（改之前备份）；文件是 install 新建的、删完
+    只剩空的就整个删掉。"""
+    key, label = "shell-path", "drover 加进 shell 配置的 PATH"
+    recorded = state.get("path_block")
+    if not recorded:
+        return Step(key, label, "shell 配置", "安装记录里没有（drover 没加过）")
+    path = Path(recorded)
+    try:
+        text = path.read_text() if path.is_file() else ""
+    except OSError as exc:
+        return Step(key, label, disp(path), f"读不了：{exc}", action="不动", level="warn")
+    new = strip_path_block(text)
+    if new == text:
+        return Step(key, label, disp(path), "没有 drover 加的那一段")
+    if str(path) in (state.get("created") or []) and not new.strip():
+        return Step(key, label, disp(path), "有 drover 加的那一段；文件是 install 新建的", action="删掉这一段后文件是空的，一并删除",
+                    run=path.unlink)
+    return Step(key, label, disp(path), "有 drover 加的那一段", action="删掉这一段（其余内容不动）",
+                run=lambda: path.write_text(new), fs=path, backup=backup_target(path), backup_how="copy")
+
+
 def cmd_uninstall(args: argparse.Namespace) -> int:
     state = load_state()
     installed = [h for h in HOSTS if h in (state.get("hosts") or [])] or list(HOSTS)
@@ -2867,6 +3094,7 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     if not remaining:
         steps += [unplan_routing(ws, state) for ws in workspaces]
         steps += [unplan_oncall_env(ctx, state), unplan_oncall_plugin(ctx, state)]
+        steps.append(unplan_path_block(state))
         steps.append(unplan_tools())
         steps.append(unplan_bin(state))
         steps.append(unplan_pkg(state))
@@ -2902,6 +3130,9 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
         print("drover 替你装过、没删的工具（你也可能单独用它们；删 herdr 还会断掉正在跑的会话）。不要了就手动删：")
         for d in kept_deps:
             print(f"  {d['name']}（{d['path']}）：{d['remove']}")
+        if state.get("path_block"):
+            print(f"  （drover 加进 shell 配置的 PATH 那一段{'会删掉' if args.dry_run else '已经删了'}：还要在新终端里直接用它们，"
+                  "就自己把目录加回 PATH）")
     if backups:
         print("备份（不自动还原；要还原就自己挪回原名）：")
         for b in backups:
@@ -2937,22 +3168,31 @@ EPILOG = """\
   都是官方安装脚本、都装在家目录、都不用 sudo；dry-run 里每一样写清要跑的命令、装到哪、改不改 shell 配置。
   测试或内网镜像可以用环境变量换掉安装命令：DROVER_HERDR_INSTALLER、DROVER_CLAUDE_INSTALLER、DROVER_CODEX_INSTALLER、
   DROVER_NODE_INSTALLER（照样交给 sh -c 执行）。
-  herdr                计划的第一项。官方脚本 curl -fsSL https://herdr.dev/install.sh | sh：装到 ~/.local/bin（或 $HERDR_INSTALL_DIR），
-                       不改 shell 配置。装完在同一次运行里接着生成 herdr 技能、装状态 hook；目录不在 PATH 里时会提示怎么加。
+  PATH                 装依赖的目录（~/.local/bin，或 $HERDR_INSTALL_DIR、$CODEX_INSTALL_DIR）不在 PATH 里、这次要往里装东西或者
+                       里面已经有 herdr / claude / codex 时，计划的第一项：在同一次同意里往 shell 启动文件末尾加一段带
+                       "# >>> drover PATH >>>" 标记的块（目录已在 PATH 里就不加，source 两次不叠加；改之前备份；dry-run 写清
+                       文件和这几行），装完开一个新终端，herdr 和 herdr pane 里的 claude / codex 都能按名字找到。写哪个文件：
+                       zsh 是 $ZDOTDIR/.zshrc（默认 ~/.zshrc，login 和非 login 的交互 shell 都读）；bash 在 macOS 上是
+                       ~/.bash_profile（或已有的 ~/.bash_login、~/.profile：终端 App 和 herdr 的 pane 在 macOS 上都起 login
+                       shell），Linux 上是 ~/.bashrc（两边都是非 login 的交互 shell）；别的 shell 只提示。同一次运行里后面的安装
+                       命令 PATH 里也带上这些目录，Codex 的安装脚本就不再往 profile 加它自己那段。--uninstall 只删这一段。
+                       没同意、非交互（含 drover update）不加，只提示
+  herdr                官方脚本 curl -fsSL https://herdr.dev/install.sh | sh：装到 ~/.local/bin（或 $HERDR_INSTALL_DIR），
+                       脚本本身不改 shell 配置（PATH 见上一条）。装完在同一次运行里接着生成 herdr 技能、装状态 hook。
                        必需项：没装上（或没让装）算这一项失败，其余照装，退出码 1。也可以自己装：brew install herdr
   claude / codex       只装 --host 选的、又没装的那个。Claude Code：curl -fsSL https://claude.ai/install.sh | bash（启动器
-                       ~/.local/bin/claude，不改 shell 配置）；Codex：curl -fsSL https://chatgpt.com/codex/install.sh | sh
-                       （~/.local/bin/codex；~/.local/bin 不在 PATH 里时脚本会往 shell 配置末尾追加一段带标记的 PATH，
-                       关不掉，dry-run 里写明是哪个文件；带 CODEX_NON_INTERACTIVE=1，不在终端里问要不要马上启动）。
+                       ~/.local/bin/claude，脚本本身不改 shell 配置）；Codex：curl -fsSL https://chatgpt.com/codex/install.sh | sh
+                       （~/.local/bin/codex；脚本进程的 PATH 里没有 ~/.local/bin 时它会往 shell 配置末尾追加一段带标记的 PATH，
+                       关不掉——drover 先加了 PATH 时它看到已在 PATH 里就不加；带 CODEX_NON_INTERACTIVE=1，不在终端里问要不要
+                       马上启动）。
                        装不上只提示，drover 的入口照样装，退出码不变。登录要你自己来：claude 第一次运行时按浏览器提示登录，
                        codex 先 codex login。两个都没检测到、又没传 --host 时退出码 2（提示用 --host 说要哪个）。
   Node                 只在接飞书、本机一个 node 都没有时：nvm 官方脚本（v0.40.8，PROFILE=/dev/null 不改 shell 配置）装到
                        ~/.nvm，再 nvm install 22。本机有 node 但低于 18 时只提示升级（插件先用 PATH 上的 node，nvm 装的用不上）。
                        没装上照现在的规则：Node 这一项和插件那一项失败，其余照装，退出码 1
   git / python3        install.sh 检查并给出装法后停下（要管理员权限或弹系统框，不替你装）；--check 也会列出来。
-  装完之后：在 Herdr 里开主会话，"下一步"里有编号步骤（打开 herdr → cd 到主工作台 → 启动 claude / codex 并登录 →
-  点掉信任框 → ctrl+b q 离开）。
-  装完之后：在 Herdr 里开主会话（终端里运行 herdr，在 pane 里 cd 到主工作台，再启动 claude 或 codex），drover 才能用。
+  装完之后：在 Herdr 里开主会话，"下一步"里有编号步骤（开一个新终端运行 herdr → cd 到主工作台 → 启动 claude / codex
+  并登录 → 点掉信任框 → ctrl+b q 离开）。
 
 安装布局（link / copy 只有第一项不同）：
   ~/.drover/pkg                          包根目录。link：软链到这份 clone；copy：复制一份（排除 .git、__pycache__ 等）
@@ -2960,8 +3200,8 @@ EPILOG = """\
   ~/.drover/config.json                  workspace、repo_dirs、profile、oncall（--oncall 记 true、--no-oncall 记 false）。首次安装时写入（workspace 见上文）；已有时
                                          不覆盖，除非显式传 --workspace / --repo-dir / --profile / --oncall / --no-oncall（只改传了的那个键，
                                          改之前备份）
-  ~/.drover/drover-install.json          安装记录（装了哪些宿主、新建的文件、加的规则和 hook、备份、drover 替你装过的外部依赖；
-                                         --uninstall 按它撤）
+  ~/.drover/drover-install.json          安装记录（装了哪些宿主、新建的文件、加的规则和 hook、备份、drover 替你装过的外部依赖、
+                                         往哪个 shell 启动文件加过 PATH；--uninstall 按它撤）
   ~/.drover/<slug>/                      每个任务一个目录（drover CLI 写，install 不碰）；baselines/、locks/ 同理
   Claude Code（--host 含 claude）：
     ~/.claude/commands/drover.md         软链到 ~/.drover/pkg/flow/dispatch.md（/drover 命令）
@@ -3058,7 +3298,8 @@ EPILOG = """\
   主工作台按安装记录和 config.json 找，都没有时不碰任何主工作台。保留：~/.drover/config.json、
   任务记录 ~/.drover/<slug>/、worktree、herdr 的 agent 状态 hook。.bak-drover-* 备份不自动还原，只列出来。
   drover 替你装过的 herdr、claude / codex、nvm / Node 不删（你也可能单独用它们，删 herdr 还会断掉正在跑的会话），
-  只列出来、给出手动删法（--json 时在 kept_deps 里）。
+  只列出来、给出手动删法（--json 时在 kept_deps 里）。drover 加进 shell 配置的 PATH 那一段按安装记录删掉（先备份，
+  其余内容不动；文件是 install 新建的、删完是空的就整个删）。
   带 --host 时只撤那个宿主的项；另一个宿主还装着时，共用的包、CLI 入口、路由区块保留。
 """
 

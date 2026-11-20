@@ -95,7 +95,7 @@ drover 是一套多 agent 派发体系，跑在 [Herdr](https://herdr.dev) 上�
 |---|---|---|
 | herdr | `curl -fsSL https://herdr.dev/install.sh \| sh`（装到 `~/.local/bin`，可用 `HERDR_INSTALL_DIR` 改；不用 sudo，不改 shell 配置）；或 `brew install herdr` | [herdr.dev/tui/docs/install](https://herdr.dev/tui/docs/install/) |
 | Claude Code | `curl -fsSL https://claude.ai/install.sh \| bash`（官方推荐的原生安装；启动器在 `~/.local/bin/claude`，不用 sudo，不改 shell 配置）；或 `brew install --cask claude-code` | [code.claude.com/docs/en/setup](https://code.claude.com/docs/en/setup) |
-| Codex CLI | `curl -fsSL https://chatgpt.com/codex/install.sh \| sh`（装到 `~/.local/bin/codex`，不用 sudo；`~/.local/bin` 不在 PATH 里时会往 shell 配置末尾追加一段带标记的 PATH，脚本没有关掉它的开关）；或 `npm install -g @openai/codex`、`brew install --cask codex` | [github.com/openai/codex](https://github.com/openai/codex) |
+| Codex CLI | `curl -fsSL https://chatgpt.com/codex/install.sh \| sh`（装到 `~/.local/bin/codex`，不用 sudo；`~/.local/bin` 不在它进程的 PATH 里时会往 shell 配置末尾追加一段带标记的 PATH，脚本没有关掉它的开关。install 替你装时先把这个目录加进 PATH，它就不加了）；或 `npm install -g @openai/codex`、`brew install --cask codex` | [github.com/openai/codex](https://github.com/openai/codex) |
 | git | macOS：`xcode-select --install`（Apple 命令行工具）或 `brew install git`；Linux：`sudo apt-get install git` / `sudo dnf install git` 等 | [git-scm.com/install](https://git-scm.com/install/) |
 | python3 | macOS：命令行工具自带，或 python.org 的安装包、`brew install python`；Linux：多数发行版自带 | [docs.python.org/3/using](https://docs.python.org/3/using/mac.html) |
 | Node（22+） | `brew install node`，或官网安装包；用 nvm / fnm / mise 管理的也认。install 替你装时用 nvm：`curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.8/install.sh \| PROFILE=/dev/null bash`，再 `nvm install 22` | [nodejs.org](https://nodejs.org/)、[github.com/nvm-sh/nvm](https://github.com/nvm-sh/nvm) |
@@ -131,7 +131,7 @@ cd ~/.drover/src
 2. 检查 `git`、`python3`（3.9 及以上）能不能用。缺了就打印上表里的装法，**停下、不替你装**（要管理员权限或弹系统对话框）：macOS 上点一下命令行工具的安装框（`xcode-select --install`）两样就都有了；Linux 上照它给的 sudo 命令自己装。装好后重跑。macOS 上没装命令行工具时，`/usr/bin/git`、`/usr/bin/python3` 只是占位程序，install.sh 会真的跑一下来判断，不会被骗过去。
 3. 都在就执行 `python3 install.py <你给的参数>`，参数原样透传。所以下面所有 `python3 install.py …` 的写法都可以换成 `./install.sh …`。
 
-**缺依赖时一次装齐**：往 `~/.drover` 以外装的几样——herdr、你选的宿主（`--host`）缺的那个命令行（claude / codex）、接飞书（`--oncall`）时一个都没有的 Node——放在计划的最前面，按 herdr → claude / codex →（验收工具要的 uv、Python）→ crapper、dryer → Node 的顺序装，再装 drover 自己的各项。都用官方安装脚本、都装在你的家目录、都不用 sudo；dry-run 里每一样写清要跑的命令、装到哪、改不改 shell 配置。
+**缺依赖时一次装齐**：往 `~/.drover` 以外装的几样——herdr、你选的宿主（`--host`）缺的那个命令行（claude / codex）、接飞书（`--oncall`）时一个都没有的 Node——放在计划的最前面：装依赖的目录（`~/.local/bin`）不在 PATH 里时，先把它加进 shell 配置，再按 herdr → claude / codex →（验收工具要的 uv、Python）→ crapper、dryer → Node 的顺序装，最后装 drover 自己的各项。都用官方安装脚本、都装在你的家目录、都不用 sudo；dry-run 里每一样写清要跑的命令、装到哪、改不改 shell 配置。
 
 | 怎么跑的 | 会怎样 |
 |---|---|
@@ -142,13 +142,22 @@ cd ~/.drover/src
 
 | 依赖 | 装到哪 | 改不改 shell 配置 | 没装上（或你没让装）时 |
 |---|---|---|---|
-| herdr | `~/.local/bin/herdr`（设了 `HERDR_INSTALL_DIR` 就装到那里） | 不改，目录不在 PATH 里时只提示 | 必需项：这一项失败（退出码 1），用到 herdr 的几项（herdr 技能、状态 hook）跟着失败，其余照装 |
-| Claude Code | `~/.local/bin/claude`（程序在 `~/.local/share/claude`） | 不改，目录不在 PATH 里时只提示 | 只提示，drover 的入口照样装，退出码不变；装好它之后不用重跑 install |
-| Codex CLI | `~/.local/bin/codex`（程序在 `~/.codex/packages/standalone`） | `~/.local/bin` 不在 PATH 里时，它的安装脚本会往 shell 配置末尾加一段带标记的 PATH（zsh：macOS 是 `~/.zprofile`，Linux 是 `~/.zshrc`），关不掉；dry-run 里写明是哪个文件 | 同上，只提示 |
+| herdr | `~/.local/bin/herdr`（设了 `HERDR_INSTALL_DIR` 就装到那里） | 安装脚本本身不改；目录不在 PATH 里时，install 会在你同意后往 shell 启动文件加一段带标记的 PATH（见表下，`--uninstall` 会删掉） | 必需项：这一项失败（退出码 1），用到 herdr 的几项（herdr 技能、状态 hook）跟着失败，其余照装 |
+| Claude Code | `~/.local/bin/claude`（程序在 `~/.local/share/claude`） | 同上 | 只提示，drover 的入口照样装，退出码不变；装好它之后不用重跑 install |
+| Codex CLI | `~/.local/bin/codex`（程序在 `~/.codex/packages/standalone`） | 同上。它的安装脚本看自己进程的 PATH 里有没有 `~/.local/bin`，没有就往 profile 末尾加它自己那段（关不掉）；install 先加了 PATH、跑它时目录已在 PATH 里，它就不加了 | 同上，只提示 |
 | Node 22（nvm） | `~/.nvm` | 不改（`PROFILE=/dev/null`）；飞书插件自己会去 `~/.nvm` 找 Node，终端里要用 node 时自己 `. ~/.nvm/nvm.sh` | Node 这一项和插件那一项失败（和以前没有 Node 时一样），其余照装 |
 
+**PATH 也一起弄好**：herdr、claude、codex 的官方脚本都装到 `~/.local/bin`，全新的 Mac 上这个目录不在 PATH 里，新开的终端里 `herdr` 找不到，herdr 的 pane 里 `claude` 也找不到（drover 在 Herdr 里也是按名字调它们）。所以要往这个目录里装东西、或者里面已经有它们但不在 PATH 里时，计划的第一项是"把装依赖的目录加进 PATH"，和上面几样在同一次同意里：
+
+- 往 shell 启动文件末尾加一段带 `# >>> drover PATH >>>` / `# <<< drover PATH <<<` 标记的块，块里先判断目录已在 PATH 里就不加（同一个文件 source 两次也不会叠加）；改之前备份；重跑 install 不重复写；dry-run 写清改哪个文件、加的是哪几行。
+- 写哪个文件，要让"新开的终端"和"herdr 的 pane"两边都读得到：herdr 的 pane 用 `$SHELL`，macOS 上起 login shell、Linux 上起非 login 的交互 shell（herdr 的 `terminal.shell_mode` 默认 `auto`）；macOS 的终端 App 也起 login shell。所以 zsh 写 `~/.zshrc`（设了 `ZDOTDIR` 就是 `$ZDOTDIR/.zshrc`；zsh 的交互 shell 不管 login 与否都读它）；bash 在 macOS 上写 `~/.bash_profile`（已有 `~/.bash_login` 或 `~/.profile` 时写那个，login shell 只读其中第一个），在 Linux 上写 `~/.bashrc`；别的 shell（fish 等）只提示，你自己加。
+- 同一次运行里，后面的安装命令 PATH 里也带上这个目录。
+- 加好了，汇总的"下一步"第 1 条就是"开一个新终端（让 PATH 生效），运行 herdr"。没让加的（答了 n、非交互没带 `--install-deps`、`drover update`）只提示：照提示把 `export PATH="$HOME/.local/bin:$PATH"` 加进 shell 配置，再开新终端。
+- `--uninstall` 只删这一段（先备份，文件其余内容不动）。
+
+其余：
+
 - 装完在同一次运行里接着生成 herdr 技能、装 agent 状态 hook、装飞书插件，不用重跑。PATH 没刷新也找得到刚装的 herdr。
-- `~/.local/bin` 不在 PATH 里时，汇总会提示把 `export PATH="$HOME/.local/bin:$PATH"` 加进 `~/.zshrc`（bash 用 `~/.bashrc`）再开新终端：drover 在 Herdr 里是按名字调用 herdr、claude 的，不在 PATH 里会报找不到。
 - 已经装了的跳过（PATH 上有，或者在官方安装目录里，只是不在 PATH 上）；不想用脚本装，也可以先自己 `brew install herdr` 之类，再跑 `./install.sh`。
 - 登录要你自己来：claude 第一次运行时按浏览器提示登录；codex 先 `codex login`。
 - 本机有 Node 但低于 18：不替你换，只提示升级（`brew install node` 或 nodejs.org）。
@@ -160,7 +169,7 @@ cd ~/.drover/src
 
 **验收工具**：install 默认还会装两个工具 crapper、dryer 到 `~/.drover/tools`（每个约 18MB，十几秒），要从 GitHub clone、从 PyPI 装依赖，要 Python 3.11+（本机没有时自动用 uv 装一份进同一个目录）。装不上（没网、pip 失败）只记警告，不影响 drover 本身，也不改 install 的退出码；不想要就在 `~/.drover/config.json` 写 `"quality_tools": false`。详见 2.8。
 
-**装完之后**，汇总的"下一步"按编号写好了怎么开始用（第 4.1 节一样）：打开 herdr（不在 PATH 里时给出 `~/.local/bin/herdr` 的完整路径）→ 在自动开好的 workspace 里点一下 pane、`cd` 到主工作台 → 启动 `claude`（第一次按浏览器提示登录；Codex 先 `codex login`，再 `codex -s danger-full-access`）→ 把信任框、MCP 弹窗点掉 → 离开时 `ctrl+b` 再 `q`。drover 只能在 Herdr 的 pane 里用。
+**装完之后**，汇总的"下一步"按编号写好了怎么开始用（第 4.1 节一样）：开一个新终端运行 herdr（install 刚把 `~/.local/bin` 加进 shell 配置时，新终端里才生效；没让加的，给出 `~/.local/bin/herdr` 的完整路径和手动加 PATH 的写法）→ 在自动开好的 workspace 里点一下 pane、`cd` 到主工作台 → 启动 `claude`（第一次按浏览器提示登录；Codex 先 `codex login`，再 `codex -s danger-full-access`）→ 把信任框、MCP 弹窗点掉 → 离开时 `ctrl+b` 再 `q`。drover 只能在 Herdr 的 pane 里用。
 
 **配飞书**（选装）：飞书 oncall 默认不装。要的话安装时加 `--oncall`（要 Node 18+，见 4.9；记进 `config.json`，以后重跑、`drover update` 都照旧）；以前已经装上的（安装记录里有、或者 herdr 里装着插件）不用加，重跑 install、`drover update` 照旧保留、照旧更新。没装又没选过的，汇总的"下一步"里会提一句可以加 `--oncall`。带 `--oncall` 在终端里直接跑 `./install.sh` 的，汇总之后会问一句"现在用飞书扫码配对吗？[Y/n]"，回车就是配：终端里打印配对链接（装了 `qrencode` 还会画二维码），Mac 桌面也会弹二维码，用手机飞书扫码、点确认，配上后自动发一条测试消息（见 4.9）。已经配对过的只提一句"飞书已配对"。不在交互终端里跑（agent 帮装、管道、`--json`）时不问，"下一步"里提示 `~/.drover/bin/drover oncall pair`。
 
@@ -232,7 +241,7 @@ python3 install.py --workspace ~/work --repo-dir ~/work/company --repo-dir ~/wor
 
 **两边共用**
 
-- 缺的外部依赖，你同意（或带了 `--install-deps`）时用官方安装脚本装：herdr 到 `~/.local/bin/herdr`，你选的宿主缺的那个命令行到 `~/.local/bin/claude` 或 `~/.local/bin/codex`，接飞书又一个 node 都没有时 nvm 和 Node 22 到 `~/.nvm`（见 2.1）。这几样是 install 往 `~/.drover` 以外装的全部东西；都在家目录、都不用 sudo，只有 Codex 的安装脚本会往 shell 配置里加一段 PATH（dry-run 里写明）。装过哪几样记在安装记录里，`--uninstall` 不删、只列出来
+- 缺的外部依赖，你同意（或带了 `--install-deps`）时用官方安装脚本装：herdr 到 `~/.local/bin/herdr`，你选的宿主缺的那个命令行到 `~/.local/bin/claude` 或 `~/.local/bin/codex`，接飞书又一个 node 都没有时 nvm 和 Node 22 到 `~/.nvm`（见 2.1）。这几样是 install 往 `~/.drover` 以外装的全部东西；都在家目录、都不用 sudo。目录不在 PATH 里时，同一次同意里还会往 shell 启动文件（zsh：`~/.zshrc`；bash：macOS 是 `~/.bash_profile`，Linux 是 `~/.bashrc`）末尾加一段带 `# >>> drover PATH >>>` 标记的 PATH（改之前备份，见 2.1）。装过哪几样、PATH 加在哪个文件都记在安装记录里；`--uninstall` 不删这几样、只列出来，PATH 那一段会删掉
 - `~/.drover/tools/`：验收工具 crapper、dryer（钉提交，各自一个 `.venv`），本机没有 Python 3.11+ 时还有 uv 装的 `python/`（没有 uv 时还有 drover 私有的 `bin/uv`），第一次分析某种语言时下载的 tree-sitter 语法包 `grammars/`。装不上只记警告（见 2.8）；`"quality_tools": false` 时不装
 - `~/.drover/pkg` → 包根目录（link：软链；copy：副本）
 - `~/.drover/bin/drover` → `~/.drover/pkg/bin/drover`（所有文档和权限规则里写的都是这个路径）
@@ -341,9 +350,10 @@ python3 install.py --uninstall --host codex # 只撤 Codex 那一套
   - install 加的 cd+git 拦截 hook、主会话登记 hook、读新规则 hook（只撤安装记录里的这几项，别的 hook 不动；`PreToolUse`、`SessionStart`、`UserPromptSubmit`、`hooks` 撤空了就去掉）；
   - 飞书 oncall 的 `drover.env`；插件本身只在安装记录里记着"是 drover 装的"时才 `herdr plugin uninstall`，你原来就装着的不动；
   - `~/.drover/tools` 整个目录（验收工具、它们用的 Python / uv、语法包）；
+  - shell 配置里 drover 加的 PATH 那一段（按安装记录找文件，只删这一段，改之前备份；文件是 install 新建的、删完是空的就整个删）；
   - 安装记录本身。
 - **保留**：`config.json`（重装时沿用，不要了可以手动删）、任务记录 `~/.drover/<slug>/`、worktree、herdr 的 agent 状态 hook、插件配置目录里的 `.env`（飞书配对还在，以后重装不用重新扫码）。
-- **drover 替你装过的 herdr、claude / codex、nvm / Node 不删**：你也可能单独用它们，删 herdr 还会断掉正在跑的会话。卸载的输出里列出这几样（安装记录里记着哪些是 drover 装的）和手动删法，比如 herdr 是先 `herdr server stop` 再删 `~/.local/bin/herdr`，Claude Code 照官方步骤删 `~/.local/bin/claude` 和 `~/.local/share/claude`，nvm 删 `~/.nvm`。
+- **drover 替你装过的 herdr、claude / codex、nvm / Node 不删**：你也可能单独用它们，删 herdr 还会断掉正在跑的会话。卸载的输出里列出这几样（安装记录里记着哪些是 drover 装的）和手动删法，比如 herdr 是先 `herdr server stop` 再删 `~/.local/bin/herdr`，Claude Code 照官方步骤删 `~/.local/bin/claude` 和 `~/.local/share/claude`，nvm 删 `~/.nvm`。shell 配置里 drover 加的 PATH 那一段会删掉，还要在新终端里直接用它们，就自己把 `~/.local/bin` 加回 PATH。
 - **带 `--host`** 时只撤那个宿主的项。另一个宿主还装着的话，共用的包、脚本入口、路由区块、飞书 oncall 都保留。
 - `.bak-drover-*` 备份**不会自动还原**，只列出来让你自己决定（见第 8 节"想回滚"）。
 
@@ -563,7 +573,7 @@ drover 记着主会话"载入时"的规则（`~/.drover/main-rules.json`：会�
 
 主会话要开在 Herdr 的 pane 里。第一次这样做（install 汇总的"下一步"也是这几步）：
 
-1. **打开 Herdr**：终端里运行 `herdr`。herdr 不在 PATH 里时用完整路径 `~/.local/bin/herdr`，并把 `export PATH="$HOME/.local/bin:$PATH"` 加进 `~/.zshrc`（bash 用 `~/.bashrc`）、开一个新终端：drover 在 Herdr 里按名字调用 herdr、claude，不加会报找不到。
+1. **打开 Herdr**：开一个新终端，运行 `herdr`。install 在你同意后把 `~/.local/bin` 加进了 shell 配置（2.1），新开的终端里才生效，所以要新开一个。没让 install 加的（答了 n、非交互）：herdr 不在 PATH 里时用完整路径 `~/.local/bin/herdr`，并把 `export PATH="$HOME/.local/bin:$PATH"` 加进 `~/.zshrc`（bash 用 `~/.bashrc`）、再开一个新终端：drover 在 Herdr 里按名字调用 herdr、claude，不加会报找不到。
 2. **进主工作台**：第一次启动会自动开一个 workspace，点一下 pane 就能输入，然后 `cd <主工作台>`（install 时定的 `--workspace`，比如 `~/code`）。
 3. **启动 agent**：`claude`，第一次按浏览器提示登录；用 Codex 的话先 `codex login`（浏览器登录），再 `codex -s danger-full-access`（原因见第 7 节）。
 4. **点掉弹窗**：第一次会弹"是否信任这个文件夹"、MCP server 批准之类的框，点掉；以后起编排者才不会卡在这里（第 8 节"启动卡在信任 / MCP 弹窗"）。
@@ -1012,7 +1022,7 @@ curl -fsSL https://herdr.dev/install.sh | sh     # 官方安装脚本，装到 ~
 brew install herdr                               # 或者 Homebrew
 ```
 
-- 装完提示 `~/.local/bin` 不在 PATH 里：把 `export PATH="$HOME/.local/bin:$PATH"` 加进 `~/.zshrc`（bash 用 `~/.bashrc`），开一个新终端。drover CLI 按名字调用 herdr，不在 PATH 里会报"找不到 herdr 命令"。
+- 装完 `~/.local/bin` 不在 PATH 里：你同意过的，install 已经往 shell 配置里加了 drover 那一段，开一个新终端就好；没让加的（答了 n、非交互），重跑 `./install.sh --install-deps` 会加，或者自己把 `export PATH="$HOME/.local/bin:$PATH"` 加进 `~/.zshrc`（bash 用 `~/.bashrc`）再开新终端。drover CLI 按名字调用 herdr，不在 PATH 里会报"找不到 herdr 命令"。
 - 安装脚本失败（报 `curl` 退出码、下载超时、校验和不对）：多半是网络，换个网络或用 `brew install herdr`。官方脚本要 `curl`、`awk` 和一个算 sha256 的工具，没有 `curl` 时 install 会直接提示你先装 `curl` 或改用 Homebrew。
 - 内网有 herdr 的镜像时，可以设环境变量 `DROVER_HERDR_INSTALLER="<你的安装命令>"`，install 会用它代替官方命令（照样要你同意或带 `--install-deps`）。claude、codex、Node 同理（见 2.1）。
 - 装好 herdr 之后还要在 Herdr 里开主会话，见下一条和第 4.1 节。
@@ -1197,7 +1207,7 @@ python3 tests/test_update.py                   # drover update：快进后按原
 python3 tests/test_cd_git_guard.py             # cd+git 拦截 hook 的判定、改写建议、出错放行（不到 1 秒）
 ```
 
-`tests/test_install.py` 也不碰真实状态、不联网：临时 HOME；验收工具默认关着（`DROVER_QUALITY_TOOLS=0`），uv、claude / codex、Node 的安装命令和 herdr 一样换成"禁止安装"；测验收工具的用例（`QualityToolsTests`）自己打开，工具源换成本地仓库（`DROVER_QUALITY_TOOLS_SOURCE`），PATH 最前面放假的 python3.14…python3（版本可设、`-m venv` 建假 `.venv`），覆盖装成功 / 重跑不动 / `--check` / 卸载删掉、pip 失败只记警告且退出码 0（半截 `.venv` 删掉，修好后重跑装上）、没有 3.11+ 时装私有 uv（`UV_INSTALL_DIR`、`UV_NO_MODIFY_PATH=1`）再装 Python、装 uv 也失败只记警告、`--dry-run` 和 `quality_tools: false`；PATH 最前面是假 herdr（`plugin list / install / update / uninstall / config-dir` 也是假的，只改它自己的状态文件）和假 `node`；"没装 herdr"的用例会把 PATH 里所有含 herdr 的目录去掉，安装命令换成假的安装器（照官方脚本的行为把假 herdr 放进临时 HOME 的 `~/.local/bin`），PATH 里还放了一个只记日志的假 `curl`；"全新机器"的用例（`ExternalDepsTests`）把 PATH 里含 herdr、claude、codex、node 的目录都去掉，四样的安装命令都换成假安装器（claude、codex 放进 `~/.local/bin`，Node 放进 `~/.nvm/versions/node/…`，记下收到的 `CODEX_NON_INTERACTIVE`、`NVM_DIR`），覆盖 dry-run 里每样写清命令 / 装到哪 / 改不改 shell 配置 / 不用 sudo、交互终端一句 [Y/n]（答 Y 全装、答 n 只给命令）、`--install-deps` 非交互全装、非交互不带它只给命令、装过的跳过、Node 只在接飞书且一个 node 都没有时装、只装选定宿主的命令行、herdr 装失败退出码 1 其余照装、宿主命令行装失败只提示、`--uninstall` 不删只列出删法；`tests/test_update.py` 里有一条核对 `drover update` 重跑 install 不装外部依赖；其余用例的安装命令一律换成"禁止安装"，谁意外触发了安装，用例就报错。"没有 Node"的用例同样把 PATH 里含 node 的目录去掉。交互终端里"先问一句"的分支（缺依赖时一句问完要不要装、装完问要不要配对飞书）用伪终端测；配对用例里假插件的 status 脚本按假 herdr 的状态报飞书配没配，假 `qrencode` 只打印一行。`tests/test_update.py` 同样用临时 HOME，远端是本地的 bare 仓库，不联网、不碰真实状态；`--auto` 的用例覆盖快进成功（连着两次没报的并成一次）、已是最新（不重跑 install）、有改动 / 分叉被挡住、远端没了、`DROVER_AUTO_UPDATE=0`、锁被占着，每种都核对 `auto-update.json`；无人值守那条把远端换成 `ssh://`、PATH 里放假 `ssh`（记参数，报连不上或一直挂着），核对 `BatchMode=yes`、`GIT_TERMINAL_PROMPT=0`、只试 1 次、用户自己的 `core.sshCommand` 不覆盖，挂着的那条在进程里把 60 秒超时换成 2 秒（只核对报错里的"命令超时（2 秒）"和只试 1 次，不数假 ssh 被调了几次、不量墙钟：机器忙时 2 秒内 git 可能还没起到假 ssh）；要等的另外两条也在进程里跑：远端没了那条把重试前的 sleep 换成只记下来（仓库不存在不会自己好：核对只试 1 次、一次都不等），锁被占着那条把等锁上限从 5 秒改成 0.3 秒。手动 `update` 换了版本也写 `auto-update.json` 的 update（source manual、announced true，上一次自动检查的 result / last_attempt / finished / error 原样）；之前有一次自动更新还没报的并成一次、announced 保持 false；没有新提交、`--dry-run`、被挡住、update_run 抛错都不写；上一次已经报过的不并；copy 模式 install 复制副本失败（clone 新了、副本标记还是旧的）不记、看板第二行没有"已更新"，接着重跑成功（clone 已是新的，副本换成新的）记旧副本版本→新版本、标题按这一段现算。
+`tests/test_install.py` 也不碰真实状态、不联网：临时 HOME；验收工具默认关着（`DROVER_QUALITY_TOOLS=0`），uv、claude / codex、Node 的安装命令和 herdr 一样换成"禁止安装"；测验收工具的用例（`QualityToolsTests`）自己打开，工具源换成本地仓库（`DROVER_QUALITY_TOOLS_SOURCE`），PATH 最前面放假的 python3.14…python3（版本可设、`-m venv` 建假 `.venv`），覆盖装成功 / 重跑不动 / `--check` / 卸载删掉、pip 失败只记警告且退出码 0（半截 `.venv` 删掉，修好后重跑装上）、没有 3.11+ 时装私有 uv（`UV_INSTALL_DIR`、`UV_NO_MODIFY_PATH=1`）再装 Python、装 uv 也失败只记警告、`--dry-run` 和 `quality_tools: false`；PATH 最前面是假 herdr（`plugin list / install / update / uninstall / config-dir` 也是假的，只改它自己的状态文件）和假 `node`；"没装 herdr"的用例会把 PATH 里所有含 herdr 的目录去掉，安装命令换成假的安装器（照官方脚本的行为把假 herdr 放进临时 HOME 的 `~/.local/bin`），PATH 里还放了一个只记日志的假 `curl`；"全新机器"的用例（`ExternalDepsTests`）把 PATH 里含 herdr、claude、codex、node 的目录都去掉，四样的安装命令都换成假安装器（claude、codex 放进 `~/.local/bin`，Node 放进 `~/.nvm/versions/node/…`，记下收到的 `CODEX_NON_INTERACTIVE`、`NVM_DIR`），覆盖 dry-run 里每样写清命令 / 装到哪 / 改不改 shell 配置 / 不用 sudo、交互终端一句 [Y/n]（答 Y 全装、答 n 只给命令）、`--install-deps` 非交互全装、非交互不带它只给命令、装过的跳过、Node 只在接飞书且一个 node 都没有时装、只装选定宿主的命令行、herdr 装失败退出码 1 其余照装、宿主命令行装失败只提示、`--uninstall` 不删只列出删法；PATH 那几条用 `SHELL=/bin/zsh`、临时 HOME 的 `~/.zshrc`：不在 PATH 时写一次带标记的块（写前备份）、重跑不重复、答 n / 非交互不写只提示（也不先备份）、已在 PATH 不写、`--uninstall` 只删这一段且原内容一字不差、同一次运行里后面的安装命令 PATH 里有这个目录（假 codex 安装器照它 `add_to_path` 的判断，不再写 `~/.zprofile`）、块被 sh / zsh / bash 连着 source 两次只加一次、bash 和认不出的 shell 选哪个文件；`tests/test_update.py` 里有一条核对 `drover update` 重跑 install 不装外部依赖；其余用例的安装命令一律换成"禁止安装"，谁意外触发了安装，用例就报错。"没有 Node"的用例同样把 PATH 里含 node 的目录去掉。交互终端里"先问一句"的分支（缺依赖时一句问完要不要装、装完问要不要配对飞书）用伪终端测；配对用例里假插件的 status 脚本按假 herdr 的状态报飞书配没配，假 `qrencode` 只打印一行。`tests/test_update.py` 同样用临时 HOME，远端是本地的 bare 仓库，不联网、不碰真实状态；`--auto` 的用例覆盖快进成功（连着两次没报的并成一次）、已是最新（不重跑 install）、有改动 / 分叉被挡住、远端没了、`DROVER_AUTO_UPDATE=0`、锁被占着，每种都核对 `auto-update.json`；无人值守那条把远端换成 `ssh://`、PATH 里放假 `ssh`（记参数，报连不上或一直挂着），核对 `BatchMode=yes`、`GIT_TERMINAL_PROMPT=0`、只试 1 次、用户自己的 `core.sshCommand` 不覆盖，挂着的那条在进程里把 60 秒超时换成 2 秒（只核对报错里的"命令超时（2 秒）"和只试 1 次，不数假 ssh 被调了几次、不量墙钟：机器忙时 2 秒内 git 可能还没起到假 ssh）；要等的另外两条也在进程里跑：远端没了那条把重试前的 sleep 换成只记下来（仓库不存在不会自己好：核对只试 1 次、一次都不等），锁被占着那条把等锁上限从 5 秒改成 0.3 秒。手动 `update` 换了版本也写 `auto-update.json` 的 update（source manual、announced true，上一次自动检查的 result / last_attempt / finished / error 原样）；之前有一次自动更新还没报的并成一次、announced 保持 false；没有新提交、`--dry-run`、被挡住、update_run 抛错都不写；上一次已经报过的不并；copy 模式 install 复制副本失败（clone 新了、副本标记还是旧的）不记、看板第二行没有"已更新"，接着重跑成功（clone 已是新的，副本换成新的）记旧副本版本→新版本、标题按这一段现算。
 
 只跑一个文件：`python3 selftest/run.py test_push`，或者 `python3 -m unittest discover -s selftest -p test_push.py -v`。只用标准库，不用装包。`selftest/` 下没有 `__init__.py`，入口就是上面这条，不要加 `-t .`；公共工具在 `selftest_support.py`（临时环境、执行 / 加载 `bin/drover`、假时钟和在进程里跑命令）、`selftest_fakes.py`（假 herdr、假测试工具，测联网重试的用例按需装的假 ssh）、`selftest_repos.py`（integrate / push 用的仓库布局）、`selftest_screens.py`（watch 用例的真实屏幕：确认弹框、正文引用、后台子 agent 的确认框；启动弹窗用例的信任框）。
 

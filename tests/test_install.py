@@ -219,9 +219,10 @@ class InstallTestBase(unittest.TestCase):
         self.env = {k: v for k, v in os.environ.items()
                     if k not in ("CODEX_HOME", "CLAUDE_CONFIG_DIR", "HERDR_INSTALL_DIR", INSTALLER_ENV,
                                  "XDG_STATE_HOME", "XDG_CONFIG_HOME", "DROVER_STATE_DIR", QUALITY_SOURCE_ENV,
-                                 UV_INSTALLER_ENV, "CODEX_INSTALL_DIR", "NVM_DIR", *DEP_INSTALLER_ENVS.values())}
+                                 UV_INSTALLER_ENV, "CODEX_INSTALL_DIR", "NVM_DIR", "ZDOTDIR", *DEP_INSTALLER_ENVS.values())}
+        # SHELL 定成 zsh：install 按它选往哪个 shell 启动文件加 PATH（临时 HOME 下的 ~/.zshrc），不随跑测试的机器变。
         self.env.update(HOME=str(self.home), PATH=f"{self.fakebin}{os.pathsep}{os.environ.get('PATH', '')}",
-                        PYTHONDONTWRITEBYTECODE="1")
+                        PYTHONDONTWRITEBYTECODE="1", SHELL="/bin/zsh")
         # 保险：默认把 herdr、uv、claude / codex、Node 的安装命令换成"禁止安装"，哪个用例意外触发安装都会记下来、用例报错，
         # 绝不联网。
         self.forbidden_log = self.tmp / "forbidden-installer.log"
@@ -1352,7 +1353,7 @@ class MissingHerdrTests(InstallTestBase):
         out = self.install_json("--dry-run", "--install-deps", "--host", "claude", *self.ws_args(),
                                 env=self.official_env())
         herdr = self.step(out, "herdr")
-        self.assertEqual(out["steps"][0]["key"], "herdr")  # 依赖放在计划的第一项
+        self.assertEqual([s["key"] for s in out["steps"]][:2], ["shell-path", "herdr"])  # 依赖放在计划的最前面
         self.assertTrue(herdr["changes"])
         self.assertIn(f"安装 herdr：直接执行（--install-deps） {HERDR_OFFICIAL}", herdr["action"])
         for key in ("claude-herdr-skill", "claude-integration"):  # 后面要用 herdr 的项先排上，等装完再跑
@@ -1391,8 +1392,9 @@ class MissingHerdrTests(InstallTestBase):
         self.assertEqual(self.claude_skill.read_text(), FAKE_SKILL)
         self.assert_link(self.codex / "skills" / "herdr", self.claude / "skills" / "herdr")
         joined = "\n".join(out["next_steps"])
-        self.assertIn('export PATH="$HOME/.local/bin:$PATH"', joined)  # ~/.local/bin 不在 PATH 里
+        self.assertIn("开一个新终端（让 PATH 生效", joined)  # ~/.local/bin 不在 PATH 里：drover 加进了 ~/.zshrc
         self.assertIn("在 Herdr 里开主会话", joined)
+        self.assertEqual((self.home / ".zshrc").read_text().count("# >>> drover PATH >>>"), 1)
         # 再跑一次：herdr 已经在官方安装目录里，不再装
         again = self.install_json("--host", "both", *self.ws_args(), env=self.env_with_installer())
         self.assertEqual(self.step(again, "herdr")["level"], "warn")  # 只提示 PATH
@@ -1494,11 +1496,13 @@ class MissingAgentCliTests(InstallTestBase):
 # 假的 claude / codex / Node 安装器：照官方脚本的行为把可执行文件放进家目录（claude、codex 到 ~/.local/bin，codex 认
 # CODEX_INSTALL_DIR；Node 到 $NVM_DIR/versions/node/v22.11.0/bin），不联网。调用和收到的环境变量记进 {log}。
 FAKE_DEP_INSTALLER = '''#!/bin/sh
-echo "fake-{name} CODEX_NON_INTERACTIVE=${CODEX_NON_INTERACTIVE:-} NVM_DIR=${NVM_DIR:-} XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-unset}" >> "{log}"
+echo "fake-{name} CODEX_NON_INTERACTIVE=${CODEX_NON_INTERACTIVE:-} NVM_DIR=${NVM_DIR:-} XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-unset} PATH=$PATH" >> "{log}"
 [ "{fail}" = 1 ] && { echo "download failed (fake {name})"; exit 4; }
 case "{name}" in
   node) dir="$NVM_DIR/versions/node/v22.11.0/bin"; mkdir -p "$dir"; printf '#!/bin/sh\\necho v22.11.0\\n' > "$dir/node"; chmod +x "$dir/node" ;;
-  codex) dir="${CODEX_INSTALL_DIR:-$HOME/.local/bin}"; mkdir -p "$dir"; printf '#!/bin/sh\\nexit 0\\n' > "$dir/codex"; chmod +x "$dir/codex" ;;
+  codex) dir="${CODEX_INSTALL_DIR:-$HOME/.local/bin}"; mkdir -p "$dir"; printf '#!/bin/sh\\nexit 0\\n' > "$dir/codex"; chmod +x "$dir/codex"
+    # 照 codex install.sh 的 add_to_path（第 602–607 行）：进程 PATH 里没有安装目录，就往 profile 加它自己那段
+    case ":$PATH:" in *":$dir:"*) ;; *) echo "# >>> Codex installer >>>" >> "$HOME/.zprofile" ;; esac ;;
   *) dir="$HOME/.local/bin"; mkdir -p "$dir"; printf '#!/bin/sh\\nexit 0\\n' > "$dir/{name}"; chmod +x "$dir/{name}" ;;
 esac
 echo "installed {name} (fake)"
@@ -1524,6 +1528,7 @@ class ExternalDepsTests(InstallTestBase):
         self.dep_log = self.tmp / "deps-installer.log"
         self.local_bin = self.home / ".local" / "bin"
         self.nvm_node = self.home / ".nvm" / "versions" / "node" / "v22.11.0" / "bin" / "node"
+        self.zshrc = self.home / ".zshrc"
         self.addCleanup(lambda: self.assertFalse(self.curl_log.exists(), "不能调用 curl（不联网）"))
 
     def env_with(self, fail: tuple = (), **extra: str) -> dict:
@@ -1555,11 +1560,11 @@ class ExternalDepsTests(InstallTestBase):
         out = self.install_json("--dry-run", "--install-deps", "--host", "both", "--oncall", *self.ws_args(),
                                 env=self.official_env())
         self.assertTrue(out["ok"], json.dumps(out, ensure_ascii=False, indent=1))
-        self.assertEqual([s["key"] for s in out["steps"]][:3], ["herdr", "claude-cli", "codex-cli"])
-        profile = "~/.zprofile" if platform.system() == "Darwin" else "~/.zshrc"
-        expect = {"herdr": (HERDR_OFFICIAL, "装到 ~/.local/bin/herdr", "不改 shell 配置"),
-                  "claude-cli": (CLAUDE_OFFICIAL, "装到 ~/.local/bin/claude", "不改 shell 配置"),
-                  "codex-cli": (CODEX_OFFICIAL, "装到 ~/.local/bin/codex", f"会往 {profile} 末尾追加一段带标记的 PATH"),
+        self.assertEqual([s["key"] for s in out["steps"]][:4], ["shell-path", "herdr", "claude-cli", "codex-cli"])
+        expect = {"herdr": (HERDR_OFFICIAL, "装到 ~/.local/bin/herdr", "脚本不改 shell 配置"),
+                  "claude-cli": (CLAUDE_OFFICIAL, "装到 ~/.local/bin/claude", "脚本不改 shell 配置"),
+                  # drover 先把 ~/.local/bin 加进 PATH，Codex 的脚本看到已在 PATH 里就不改 profile
+                  "codex-cli": (CODEX_OFFICIAL, "装到 ~/.local/bin/codex", "drover 先把 ~/.local/bin 加进 PATH"),
                   "oncall-node": (NVM_OFFICIAL, "装到 ~/.nvm", "不改 shell 配置（PROFILE=/dev/null")}
         for key, parts in expect.items():
             step = self.step(out, key)
@@ -1567,6 +1572,12 @@ class ExternalDepsTests(InstallTestBase):
             self.assertIn("直接执行（--install-deps）", step["action"])
             for part in (*parts, "不用 sudo"):
                 self.assertIn(part, step["action"], key)
+        path_step = self.step(out, "shell-path")  # 改哪个文件、加哪几行都写清
+        self.assertEqual((path_step["path"], path_step["changes"]), ("~/.zshrc", True))
+        for part in ("往 ~/.zshrc 末尾加一段带 drover 标记的 PATH", "# >>> drover PATH >>>", "# <<< drover PATH <<<",
+                     'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac',
+                     "--uninstall 会删掉这一段"):
+            self.assertIn(part, path_step["action"])
         self.assertIn("nvm install 22", self.step(out, "oncall-node")["action"])
         keys = [s["key"] for s in out["steps"]]
         self.assertLess(keys.index("oncall-node"), keys.index("oncall-plugin"))  # Node 先装，插件等它
@@ -1585,6 +1596,11 @@ class ExternalDepsTests(InstallTestBase):
             self.assertEqual((step["changes"], step["level"]), (False, level), key)
             self.assertIn(cmd, step["action"], key)
             self.assertIn("--install-deps", step["action"], key)
+        path_step = self.step(out, "shell-path")  # PATH 也只提示（照提示自己装的 herdr 会进 ~/.local/bin），不写 shell 配置
+        self.assertEqual((path_step["changes"], path_step["level"]), (False, "warn"))
+        self.assertIn("重跑时加 --install-deps 会往 ~/.zshrc 末尾加", path_step["action"])
+        self.assertIn('export PATH="$HOME/.local/bin:$PATH"', path_step["note"])
+        self.assertFalse(self.zshrc.exists())
         self.assertEqual(out["deps_installed"], {})
         self.assertFalse(self.local_bin.exists())
         self.assertFalse((self.home / ".nvm").exists())
@@ -1608,9 +1624,11 @@ class ExternalDepsTests(InstallTestBase):
                 "codex": str(self.local_bin / "codex"), "nvm": str(self.nvm_node)}
         self.assertEqual(out["deps_installed"], want)
         self.assertEqual(self.load(self.state)["deps_installed"], want)
+        self.assertEqual(self.load(self.state)["path_block"], str(self.zshrc))
+        self.assertEqual(self.zshrc.read_text().count("# >>> drover PATH >>>"), 1)
         joined = "\n".join(out["next_steps"])
-        self.assertIn("终端里运行 ~/.local/bin/herdr", joined)  # herdr 不在 PATH 上：给完整路径
-        self.assertIn('export PATH="$HOME/.local/bin:$PATH"', joined)
+        self.assertIn("1. 开一个新终端（让 PATH 生效：drover 把 ~/.local/bin 加进了 ~/.zshrc），运行 herdr", joined)
+        self.assertNotIn("export PATH=", joined)  # 不用新手自己改 shell 配置
         self.assertIn("先 codex login", joined)
         self.assertIn("ctrl+b 再按 q", joined)
         again = self.install_json("--install-deps", "--host", "both", "--oncall", env=env)
@@ -1619,6 +1637,8 @@ class ExternalDepsTests(InstallTestBase):
         for key in ("herdr", "claude-cli", "codex-cli"):
             self.assertEqual((self.step(again, key)["changes"], self.step(again, key)["level"]), (False, "warn"), key)
             self.assertIn("不在 PATH 里", self.step(again, key)["state"])
+        self.assertIn("drover 加过这一段", self.step(again, "shell-path")["state"])  # 这个终端的 PATH 还是旧的：不重复写
+        self.assertEqual(self.zshrc.read_text().count("# >>> drover PATH >>>"), 1)
         self.assertEqual(self.step(again, "oncall-node")["level"], "ok")
         self.assertEqual(self.load(self.state)["deps_installed"], want)
 
@@ -1628,24 +1648,32 @@ class ExternalDepsTests(InstallTestBase):
                                           [(b"[Y/n]", answer)])
         self.assertTrue(answered, f"没看到提问：{text[-500:]}")
         self.assertEqual(text.count("[Y/n]"), 1, text[-2000:])  # 一句问完
-        for line in ("  - herdr：sh '", "  - Claude Code：sh '", "  - Codex CLI：sh '"):
+        for line in ("  - PATH：往 ~/.zshrc 末尾加一段带 drover 标记的 PATH", "  - herdr：sh '", "  - Claude Code：sh '",
+                     "  - Codex CLI：sh '"):
             self.assertIn(line, text)
+        self.assertLess(text.index("  - PATH："), text.index("  - herdr："))  # 列的顺序跟着计划走
         return rc, text
 
     def test_interactive_one_question_no(self) -> None:
-        """交互终端里答 n：一样都不装，只给命令；herdr 算失败（退出码 1），宿主命令行只提示"""
+        """交互终端里答 n：一样都不装，只给命令；herdr 算失败（退出码 1），宿主命令行只提示；PATH 不写、也不先备份"""
+        self.zshrc.write_text("# 原来的\n")
         rc, text = self.run_pty("n")
         self.assertEqual(rc, 1, text[-1500:])
         self.assertEqual(self.installed(), [])
         self.assertIn("你选了不装", text)
-        self.assertIn("警告：没做成", text)  # claude / codex：只记警告
+        self.assertIn("你选了不加", text)
+        self.assertIn("警告：没做成", text)  # claude / codex、PATH：只记警告
         self.assertFalse(self.local_bin.exists())
+        self.assertEqual(self.zshrc.read_text(), "# 原来的\n")
+        self.assertEqual(self.backups(self.home, ".zshrc"), [])
 
     def test_interactive_one_question_yes(self) -> None:
-        """交互终端里直接回车：三样一起装上，只问这一次"""
+        """交互终端里直接回车：PATH 和三样一起做，只问这一次"""
         rc, text = self.run_pty("")
         self.assertEqual(rc, 0, text[-1500:])
         self.assertEqual(self.installed(), ["herdr", "claude", "codex"])
+        self.assertIn("# >>> drover PATH >>>", self.zshrc.read_text())
+        self.assertIn("开一个新终端（让 PATH 生效", text)
         self.assertIn("在 Herdr 里开主会话", text)
 
     def test_only_selected_host_cli(self) -> None:
@@ -1708,7 +1736,96 @@ class ExternalDepsTests(InstallTestBase):
         self.assertIn("rm -rf ~/.nvm", kept["nvm"])
         for path in (self.local_bin / "herdr", self.local_bin / "claude", self.local_bin / "codex", self.nvm_node):
             self.assertTrue(os.path.lexists(path), path)
+        self.assertFalse(self.zshrc.exists())  # ~/.zshrc 是 install 新建的：删掉 drover 那一段后是空的，一并删掉
         self.assertFalse(self.state.exists())
+
+    # ---- PATH：装依赖的目录加进 shell 配置
+
+    def test_path_block_once_with_backup_and_uninstall_restores(self) -> None:
+        """~/.local/bin 不在 PATH：写一次带标记的块（写前备份原文件）；重跑不重复、不再备份；--uninstall 只删这一段，
+        原来的内容一个字节不差，之后追加的内容也留着"""
+        original = "# 我的 zshrc\nalias ll='ls -l'\n"
+        self.zshrc.write_text(original)
+        env = self.env_with()
+        self.install_json("--install-deps", "--host", "claude", *self.ws_args(), env=env)
+        text = self.zshrc.read_text()
+        self.assertTrue(text.startswith(original + "\n# >>> drover PATH >>>\n"), text)
+        self.assertEqual(text.count("# >>> drover PATH >>>"), 1)
+        backups = self.backups(self.home, ".zshrc")
+        self.assertEqual([b.read_text() for b in backups], [original])
+        again = self.install_json("--install-deps", "--host", "claude", env=env)
+        self.assertFalse(self.step(again, "shell-path")["changes"])
+        self.assertEqual(self.zshrc.read_text(), text)
+        self.assertEqual(len(self.backups(self.home, ".zshrc")), 1)
+        self.zshrc.write_text(text + "export EDITOR=vim\n")  # 装完以后用户自己又加了一行
+        self.install_json("--uninstall", env=self.bare_env)
+        self.assertEqual(self.zshrc.read_text(), original + "export EDITOR=vim\n")
+
+    def test_path_already_on_path_not_written(self) -> None:
+        """~/.local/bin 已在 PATH 里：不写 shell 配置，"下一步"直接运行 herdr"""
+        env = self.env_with()
+        env["PATH"] = os.pathsep.join([str(self.local_bin), env["PATH"]])
+        out = self.install_json("--install-deps", "--host", "claude", *self.ws_args(), env=env)
+        self.assertTrue(out["ok"])
+        self.assertIn("不用加", self.step(out, "shell-path")["state"])
+        self.assertFalse(self.zshrc.exists())
+        self.assertIn("1. 打开 Herdr：终端里运行 herdr", "\n".join(out["next_steps"]))
+        self.assertNotIn("path_block", self.load(self.state))
+
+    def test_later_installers_see_dir_on_path(self) -> None:
+        """同一次运行里，加完 PATH 后面的安装命令 PATH 里就有 ~/.local/bin：Codex 的脚本看到它已在 PATH 里，不再往
+        ~/.zprofile 加自己那段（假安装器照 install.sh 第 602–607 行的判断）"""
+        self.install_json("--install-deps", "--host", "both", *self.ws_args(), env=self.env_with())
+        for line in self.dep_log.read_text().splitlines():
+            if line.startswith(("fake-claude", "fake-codex")):
+                self.assertIn(f"PATH={self.local_bin}{os.pathsep}", line)
+        self.assertFalse((self.home / ".zprofile").exists())
+
+    def test_existing_tools_off_path_only_need_path(self) -> None:
+        """herdr、claude 早就在 ~/.local/bin、只是不在 PATH 里：不重装，只加 PATH（同一次同意）"""
+        self.local_bin.mkdir(parents=True)
+        os.symlink(self.fakebin / "herdr", self.local_bin / "herdr")
+        (self.local_bin / "claude").write_text("#!/bin/sh\nexit 0\n")
+        (self.local_bin / "claude").chmod(0o755)
+        out = self.install_json("--host", "claude", *self.ws_args(), env=self.env_with())  # 非交互、不带 flag：只提示
+        step = self.step(out, "shell-path")
+        self.assertEqual((step["changes"], step["level"]), (False, "warn"))
+        self.assertIn("重跑时加 --install-deps 会往 ~/.zshrc 末尾加", step["action"])
+        self.assertIn('export PATH="$HOME/.local/bin:$PATH"', step["note"])
+        self.assertFalse(self.zshrc.exists())
+        self.assertIn("终端里运行 ~/.local/bin/herdr", "\n".join(out["next_steps"]))  # 没加：照旧给完整路径和手动写法
+        out = self.install_json("--install-deps", "--host", "claude", env=self.env_with())
+        self.assertEqual(self.installed(), [])
+        self.assertTrue(self.step(out, "shell-path")["result"].startswith("完成"))
+        self.assertIn('export PATH="$HOME/.local/bin:$PATH"', self.zshrc.read_text())
+
+    def test_block_sourced_twice_adds_dir_once(self) -> None:
+        """块里先判断目录在不在 PATH：同一个文件 source 两次也只加一次（sh、zsh、bash 都照这个写法）"""
+        self.install_json("--install-deps", "--host", "claude", *self.ws_args(), env=self.env_with())
+        for shell in ("/bin/sh", "/bin/zsh", "/bin/bash"):
+            if not os.path.exists(shell):
+                continue
+            p = subprocess.run([shell, "-c", f". '{self.zshrc}'; . '{self.zshrc}'; printf %s \"$PATH\""],
+                               env={"HOME": str(self.home), "PATH": "/usr/bin:/bin"}, capture_output=True, text=True,
+                               timeout=30)
+            self.assertEqual(p.stdout.split(":").count(str(self.local_bin)), 1, (shell, p.stdout, p.stderr))
+
+    def test_which_rc_file(self) -> None:
+        """写哪个文件：zsh 是 $ZDOTDIR/.zshrc（默认 ~/.zshrc）；bash 在 macOS 上是 login 读的那个（已有的 ~/.profile 优先于
+        新建 ~/.bash_profile），Linux 上是 ~/.bashrc；认不出的 shell 只提示"""
+        def path_step(**extra: str) -> dict:
+            return self.step(self.install_json("--dry-run", "--install-deps", "--host", "claude", *self.ws_args(),
+                                               env=self.env_with(**extra)), "shell-path")
+        zdot = self.tmp / "zdot"
+        self.assertEqual(path_step(ZDOTDIR=str(zdot))["path"], str(zdot / ".zshrc"))
+        mac = platform.system() == "Darwin"
+        self.assertEqual(path_step(SHELL="/bin/bash")["path"], "~/.bash_profile" if mac else "~/.bashrc")
+        if mac:
+            (self.home / ".profile").write_text("# 已有的\n")
+            self.assertEqual(path_step(SHELL="/bin/bash")["path"], "~/.profile")
+        fish = path_step(SHELL="/opt/homebrew/bin/fish")
+        self.assertEqual((fish["changes"], fish["level"]), (False, "warn"))
+        self.assertIn("认不出你的 shell", fish["action"])
 
 
 # ---------------------------------------------------------------- 首次安装：主工作台没有默认值，不能是家目录

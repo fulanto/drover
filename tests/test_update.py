@@ -280,6 +280,14 @@ class UpdateLinkTests(UpdateTestBase):
         self.assertEqual(out["install"]["failed"], [])
         self.assertTrue(any("没找到 claude 命令" in n for n in out["install"]["notes"]), dump(out))
         self.assertFalse((self.home / ".local" / "bin" / "claude").exists())
+        # claude 其实装在 ~/.local/bin、只是不在 PATH 里：update 也不往 shell 配置里加 PATH，只提示
+        local_bin = self.home / ".local" / "bin"
+        local_bin.mkdir(parents=True)
+        (local_bin / "claude").write_text("#!/bin/sh\nexit 0\n")
+        (local_bin / "claude").chmod(0o755)
+        out = self.update_json()
+        self.assertTrue(any("export PATH=" in n for n in out["install"]["notes"]), dump(out))
+        self.assertFalse((self.home / ".zshrc").exists())
 
     def test_text_output_is_short(self) -> None:
         """默认文字输出：第一行"已更新"，标题最多 5 条加"…等 N 条"，总共不超过 10 行"""

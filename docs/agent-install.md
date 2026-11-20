@@ -117,7 +117,8 @@
 
   ```
   上面是演练，什么都还没改。正式装会改这几处：
-  - 你电脑上缺的 herdr、Claude Code（要飞书时还有 Node）会用它们官方的安装脚本装上：herdr、claude 放在 ~/.local/bin，Node 放在 ~/.nvm，都在你自己的家目录，不用管理员密码，也不改你的 shell 配置（装的是 Codex 的话，它的安装脚本会往 ~/.zprofile 末尾加一段 PATH，上面写明了）；
+  - 你电脑上缺的 herdr、Claude Code（要飞书时还有 Node）会用它们官方的安装脚本装上：herdr、claude 放在 ~/.local/bin，Node 放在 ~/.nvm，都在你自己的家目录，不用管理员密码；
+  - ~/.local/bin 现在不在你的 PATH 里，所以会在 ~/.zshrc 末尾加一段带 drover 标记的 PATH（改之前先备份），这样新开的终端里能直接输 herdr、claude；卸载时会把这一段删掉；
   - ~/.drover/ 下放 drover 的入口和配置，这是 drover 自己的文件夹；
   - 给 Claude Code 加几条权限和一个小检查（hook），让它派任务时少弹确认：那个 hook 会挡住"先 cd 再跑 git"这种每次都要你点确认的写法，让 agent 自己换成不用确认的写法（都在 ~/.claude/settings.json，只加不删，改之前先备份）；
   - ~/code 里放两个说明文件（AGENTS.md、CLAUDE.md）和一个权限设置文件，以后在 ~/code 打开的 agent 就知道怎么分派任务；
@@ -158,7 +159,7 @@
 跑 `./install.sh --check`，结果给用户。`✓` 装对，`!` 只是提示，`✗` 没装对（README 2.6）。
 
 - `!` codex 的 `sandbox_mode` 不是 `danger-full-access`：告诉用户原因（README 第 7 节），不要改 `~/.codex/config.toml`。
-- herdr 不在 PATH：告诉用户把 `export PATH="$HOME/.local/bin:$PATH"` 加进 `~/.zshrc`（bash 用 `~/.bashrc`），再开新终端。用户让你改，你才改。
+- herdr、claude 不在 PATH：汇总里"把装依赖的目录加进 PATH"那一项完成了的，告诉用户开一个新终端就好（install 已经把 `~/.local/bin` 加进了那一项写的 shell 启动文件）。那一项只是提示的（用户的 shell 认不出等），告诉用户把 `export PATH="$HOME/.local/bin:$PATH"` 加进自己 shell 的启动文件，再开新终端；用户让你改，你才改。
 - `!` Node 低于 22：告诉用户能收到飞书推送，但飞书里的回复送不回来，升级 Node 就好。
 - `!` 验收工具没装上、或者没有 Python 3.11+：只是提示，处理办法同第 6 步"只记警告"那一条。
 
@@ -176,7 +177,7 @@
 最后照附 B 用大白话交代：以后去哪个文件夹开 agent、怎么提需求、怎么看进度、出问题怎么卸载、备份在哪。给你的要点：
 
 - 开主会话（新手照着做得下来，附 B 第 1 条就是这几步；README 4.1）：
-  1. 打开 Herdr：终端里运行 `herdr`。herdr 不在 PATH 里时用完整路径 `~/.local/bin/herdr`，并请用户把 `export PATH="$HOME/.local/bin:$PATH"` 加进 `~/.zshrc`、开一个新终端（drover 在 Herdr 里按名字调用 herdr、claude，不加会报找不到；用户让你改，你才改）。
+  1. 打开 Herdr：开一个新终端，运行 `herdr`（install 把 `~/.local/bin` 加进了 shell 配置，新开的终端里才生效）。那一项没做成的，用完整路径 `~/.local/bin/herdr`，并请用户把 `export PATH="$HOME/.local/bin:$PATH"` 加进 shell 的启动文件、再开一个新终端（drover 在 Herdr 里按名字调用 herdr、claude，不加会报找不到；用户让你改，你才改）。
   2. 第一次启动会自动开一个 workspace：点一下 pane 就能输入，然后 `cd <主工作台>`。
   3. 启动 `claude`，第一次按浏览器提示登录；Codex 先跑 `codex login`，再 `codex -s danger-full-access`（README 第 7 节）。
   4. 把信任框、MCP 弹窗点掉（README 第 8 节"启动卡在信任 / MCP 弹窗"），以后起编排者（orchestrator，drover 给每个任务起的会话）才不会卡住。
@@ -194,7 +195,7 @@
 - 不跳过 dry-run，不在用户确认之前正式安装，不把"按你推荐的来"当安装确认。
 - 主工作台不给默认值，不用家目录；dry-run 的计划里出现意外（第 5 步列的几种），停下问。
 - 任何一步失败，都不要自己"修"用户的配置，把输出给用户看。
-- 不替用户回答 install 的提问；不改 `~/.codex/config.toml` 和 shell 配置（除非用户明确让你改）。
+- 不替用户回答 install 的提问；不改 `~/.codex/config.toml`。shell 配置只经 install 改（加 PATH 那一段，用户看过 dry-run 说"装"就算同意），你自己不去改，除非用户明确让你改。
 
 ## 9. 宿主差异
 
@@ -240,8 +241,9 @@
 ```
 装好了。以后这样用：
 1. 打开 Herdr：
-   ① 终端里输入 herdr 回车（提示找不到的话，输入 ~/.local/bin/herdr；顺手把
-      export PATH="$HOME/.local/bin:$PATH" 加进 ~/.zshrc 再开一个新终端，以后直接输 herdr 就行）。
+   ① 开一个新终端（刚才装的时候把 ~/.local/bin 加进了 ~/.zshrc，新开的终端里才认得 herdr、claude），
+      输入 herdr 回车。（没加上的话说：输入 ~/.local/bin/herdr；再把 export PATH="$HOME/.local/bin:$PATH"
+      加进 ~/.zshrc、开一个新终端，以后直接输 herdr 就行）
    ② 第一次会自动开好一个窗口，点一下它就能打字，输入 cd ~/code 回车。
    ③ 输入 claude 回车，第一次会打开浏览器让你登录（用 Codex 的话：先输入 codex login 登录，
       再输入 codex -s danger-full-access）。
