@@ -1,0 +1,2660 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="claude:viewport-fit-sides" content="cover">
+<title>drover 架构与流程</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Noto+Sans+SC:wght@400;500;700;900&display=swap">
+<style>
+/* 版式：牧场手册。宽屏左边一列"院子地图"目录，右边单栏正文；插画和技术图可以占满正文宽度，长文字收在 42em 以内。 */
+:root {
+  --bg: #FBF6EC;          /* 奶油纸 */
+  --surface: #FFFDF8;     /* 卡片、图里的框 */
+  --sunk: #F4EBDB;        /* 内嵌块、图里的院子 */
+  --ink: #2E2A25;         /* 正文 */
+  --muted: #6B6153;       /* 次要文字 */
+  --line: #E5D8C2;
+  --line-strong: #CBB894;
+  --terra: #B4502C;       /* 赤陶：主强调，编排者 */
+  --terra-soft: #F8DFD2;
+  --mustard: #D9A21B;     /* 芥末黄：用户、脚本 */
+  --mustard-ink: #8A6400;
+  --mustard-soft: #FBEDC6;
+  --teal: #2C8174;        /* 浅青：herdr、worker */
+  --teal-soft: #D9EEEA;
+  --peach: #EDB894;
+  --peach-soft: #FBE6D6;
+  --cc: #C8642F;          /* Claude Code 标记色 */
+  --code-bg: #F3EAD9;
+  --shadow: 0 1px 0 rgba(90, 64, 30, .06), 0 8px 24px -14px rgba(90, 64, 30, .35);
+  --font-display: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --font-body: "Noto Sans SC", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #1C1915; --surface: #27221C; --sunk: #2F2922; --ink: #F0E7D8; --muted: #B6A993;
+    --line: #3B342B; --line-strong: #5E523F;
+    --terra: #EE8E68; --terra-soft: #4A2B1F;
+    --mustard: #E6B845; --mustard-ink: #F0C860; --mustard-soft: #42351A;
+    --teal: #6CC5B7; --teal-soft: #1E3A35;
+    --peach: #9A6646; --peach-soft: #3B2A20;
+    --cc: #F09A62; --code-bg: #2C2620;
+    --shadow: 0 1px 0 rgba(0, 0, 0, .3), 0 10px 28px -16px rgba(0, 0, 0, .8);
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #1C1915; --surface: #27221C; --sunk: #2F2922; --ink: #F0E7D8; --muted: #B6A993;
+  --line: #3B342B; --line-strong: #5E523F;
+  --terra: #EE8E68; --terra-soft: #4A2B1F;
+  --mustard: #E6B845; --mustard-ink: #F0C860; --mustard-soft: #42351A;
+  --teal: #6CC5B7; --teal-soft: #1E3A35;
+  --peach: #9A6646; --peach-soft: #3B2A20;
+  --cc: #F09A62; --code-bg: #2C2620;
+  --shadow: 0 1px 0 rgba(0, 0, 0, .3), 0 10px 28px -16px rgba(0, 0, 0, .8);
+  color-scheme: dark;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; scroll-behavior: smooth; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: 16px;
+  line-height: 1.75;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+img { max-width: 100%; height: auto; display: block; }
+a { color: var(--teal); text-underline-offset: 3px; }
+a:focus-visible, button:focus-visible { outline: 2px solid var(--terra); outline-offset: 3px; border-radius: 4px; }
+code, kbd { font-family: var(--font-mono); font-size: .86em; background: var(--code-bg); border-radius: 5px; padding: .08em .38em; overflow-wrap: anywhere; }
+strong { font-weight: 700; }
+h1, h2, h3 { text-wrap: balance; line-height: 1.25; margin: 0; }
+p { margin: 0; }
+ul, ol { margin: 0; padding-left: 1.3em; }
+li + li { margin-top: .35em; }
+
+/* ---------- 整体布局 ---------- */
+.layout {
+  max-width: 1240px;
+  margin: 0 auto;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 32px;
+  padding-block: 40px 72px;
+}
+@media (min-width: 1100px) {
+  .layout { grid-template-columns: 196px minmax(0, 1fr); gap: 56px; }
+}
+main { min-width: 0; display: grid; gap: 0; }
+
+/* ---------- 目录：院子地图 ---------- */
+.toc { font-size: 14px; }
+.toc-title { font-family: var(--font-display); font-size: 13px; font-weight: 700; letter-spacing: .08em; color: var(--terra); margin-bottom: 10px; }
+.toc ol { list-style: none; padding: 0; margin: 0; display: flex; flex-wrap: wrap; gap: 6px 8px; }
+.toc li + li { margin-top: 0; }
+.toc a {
+  display: block; color: var(--muted); text-decoration: none;
+  padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line);
+  background: var(--surface);
+}
+.toc a:hover { color: var(--ink); border-color: var(--line-strong); }
+.toc a[aria-current="true"] { color: var(--terra); border-color: var(--terra); }
+@media (min-width: 1100px) {
+  .layout > .toc { grid-row: 1 / span 2; }
+  .toc { position: sticky; top: calc(env(safe-area-inset-top, 0px) + 28px); align-self: start; }
+  .toc ol { display: grid; gap: 2px; }
+  .toc a { border: 0; background: none; padding: 5px 12px; border-radius: 8px; }
+  .toc a[aria-current="true"] { background: var(--terra-soft); }
+}
+
+/* ---------- 开头 ---------- */
+.hero { display: grid; gap: 22px; min-width: 0; }
+.eyebrow { font-size: 13px; letter-spacing: .12em; color: var(--muted); font-weight: 500; }
+.hero h1 { font-family: var(--font-display); font-weight: 700; font-size: clamp(50px, 8.5vw, 88px); line-height: 1; color: var(--ink); letter-spacing: -.03em; }
+.hero h1 span { color: var(--terra); }
+.hero .tagline { font-family: var(--font-body); font-weight: 700; font-size: clamp(20px, 2.8vw, 26px); line-height: 1.45; color: var(--ink); max-width: 30em; }
+.hero .lead { max-width: 42em; color: var(--ink); }
+.meta { display: flex; flex-wrap: wrap; gap: 8px; font-size: 13px; }
+.meta span { border: 1px solid var(--line-strong); border-radius: 999px; padding: 2px 12px; color: var(--muted); background: var(--surface); }
+.cover { margin: 8px 0 0; }
+/* 插画容器固定 16:9，图按 cover 填满：换一套尺寸或构图不同的插画，版面也不会乱 */
+.img-box { aspect-ratio: 16 / 9; max-width: 100%; width: 100%; overflow: hidden; border-radius: 16px; background: var(--sunk); box-shadow: var(--shadow); }
+.img-box img { width: 100%; height: 100%; object-fit: cover; object-position: center; }
+.cover .img-box { border-radius: 22px; }
+.cover figcaption { font-size: 13px; color: var(--muted); margin-top: 8px; }
+
+.trio { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; margin-top: 6px; }
+.trio > div { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; min-width: 0; }
+.trio h3 { font-size: 15px; display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.trio p { font-size: 14px; color: var(--muted); line-height: 1.65; }
+.dot { width: 12px; height: 12px; border-radius: 50%; display: inline-block; flex: none; border: 2px solid currentColor; }
+.dot.m { color: var(--line-strong); background: var(--surface); }
+.dot.c { color: var(--terra); background: var(--terra-soft); }
+.dot.w { color: var(--teal); background: var(--teal-soft); }
+/* 开头的亮点卡：整张可点，跳到最新的那一步（⑨ 任务看板） */
+.away { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 14px; align-items: start; text-decoration: none; color: var(--ink); background: var(--terra-soft); border: 2px solid var(--terra); border-radius: 16px; padding: 14px 18px; }
+.away:hover { box-shadow: var(--shadow); }
+.away-tag { font-family: var(--font-mono); font-size: 12px; font-weight: 700; color: var(--surface); background: var(--terra); border-radius: 999px; padding: 2px 10px; white-space: nowrap; margin-top: 2px; }
+.away-body { display: grid; gap: 4px; min-width: 0; }
+.away-body strong { font-size: 16.5px; color: var(--terra); }
+.away-body > span { font-size: 14.5px; line-height: 1.7; }
+.away-go { font-family: var(--font-display); font-weight: 700; font-size: 22px; color: var(--terra); line-height: 1.2; }
+@media (max-width: 560px) { .away { grid-template-columns: minmax(0, 1fr); gap: 8px; } .away-tag { justify-self: start; } .away-go { display: none; } }
+
+/* ---------- 分节与栅栏 ---------- */
+.fence {
+  height: 18px; margin-block: 56px; opacity: .75;
+  background:
+    linear-gradient(var(--line-strong), var(--line-strong)) 0 4px / 100% 2px no-repeat,
+    linear-gradient(var(--line-strong), var(--line-strong)) 0 12px / 100% 2px no-repeat,
+    repeating-linear-gradient(90deg, var(--line-strong) 0 4px, transparent 4px 64px);
+}
+section { min-width: 0; display: grid; gap: 20px; scroll-margin-top: 20px; }
+section > header { display: grid; gap: 6px; }
+section h2 { font-family: var(--font-body); font-weight: 900; font-size: clamp(26px, 3.6vw, 34px); color: var(--ink); letter-spacing: .01em; }
+.prose { max-width: 42em; display: grid; gap: 14px; }
+.prose p, .prose li { color: var(--ink); }
+.small { font-size: 14px; color: var(--muted); }
+h3.sub { font-size: 19px; margin-top: 8px; }
+
+/* 牧羊犬旁白 */
+.bark {
+  max-width: 40em; display: flex; gap: 12px; align-items: flex-start;
+  font-size: 14.5px; color: var(--ink); line-height: 1.65;
+  background: var(--peach-soft); border-radius: 16px 16px 16px 4px; padding: 12px 16px;
+}
+.bark b { font-family: var(--font-body); font-weight: 900; font-size: 16px; color: var(--terra); flex: none; line-height: 1.5; }
+
+/* ---------- 图 ---------- */
+.fig { margin: 0; display: grid; gap: 10px; min-width: 0; }
+.fig .canvas { background: var(--surface); border: 1px solid var(--line); border-radius: 18px; padding: 18px 16px; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.fig figcaption { font-size: 14px; color: var(--muted); max-width: 52em; line-height: 1.65; }
+.fig figcaption b { color: var(--ink); }
+.swipe { display: none; font-size: 12px; color: var(--muted); }
+@media (max-width: 820px) { .swipe { display: block; } }
+
+.dg { display: block; width: 100%; height: auto; font-family: var(--font-body); color: var(--ink); }
+.dg.w-timeline { min-width: 940px; }
+.dg.w-arch { min-width: 780px; }
+.dg.w-seq { min-width: 820px; }
+.dg.w-int { min-width: 800px; }
+.dg text { fill: var(--ink); font-size: 13px; }
+.dg .tt { font-size: 15px; font-weight: 700; }
+.dg .ts { font-size: 12px; fill: var(--muted); }
+.dg .tm { font-family: var(--font-mono); font-size: 11.5px; }
+.dg .tmb { font-family: var(--font-mono); font-size: 13px; font-weight: 600; }
+.dg .tl { font-size: 12.5px; }
+.dg .tb { font-weight: 700; }
+.dg .c-terra { fill: var(--terra); }
+.dg .c-teal { fill: var(--teal); }
+.dg .c-mus { fill: var(--mustard-ink); }
+.dg .c-muted { fill: var(--muted); }
+.dg .b { fill: var(--surface); stroke: var(--line-strong); stroke-width: 1.5; }
+.dg .b-terra { fill: var(--terra-soft); stroke: var(--terra); stroke-width: 1.5; }
+.dg .b-teal { fill: var(--teal-soft); stroke: var(--teal); stroke-width: 1.5; }
+.dg .b-mus { fill: var(--mustard-soft); stroke: var(--mustard); stroke-width: 1.5; }
+.dg .b-peach { fill: var(--peach-soft); stroke: var(--peach); stroke-width: 1.5; }
+.dg .dash { stroke-dasharray: 6 5; }
+.dg .frame { fill: var(--sunk); stroke: var(--line-strong); stroke-width: 1.2; stroke-dasharray: 6 5; }
+.dg .tab { fill: var(--sunk); stroke: var(--line-strong); stroke-width: 1.2; }
+.dg .tab-on { fill: var(--terra-soft); stroke: var(--terra); stroke-width: 1.5; }
+.dg .chip-cc { fill: var(--surface); stroke: var(--cc); stroke-width: 1.5; }
+.dg .chip-cx { fill: var(--surface); stroke: var(--teal); stroke-width: 1.5; }
+.dg .c-cc { fill: var(--cc); }
+.dg .e { fill: none; stroke: var(--ink); stroke-width: 1.6; }
+.dg .e-terra { stroke: var(--terra); }
+.dg .e-teal { stroke: var(--teal); }
+.dg .ah { fill: var(--ink); }
+.dg .ah-terra { fill: var(--terra); }
+.dg .ah-teal { fill: var(--teal); }
+.dg .life { stroke: var(--line-strong); stroke-width: 1.3; stroke-dasharray: 4 5; fill: none; }
+.dg .road { fill: var(--peach-soft); stroke: var(--peach); stroke-width: 1.5; }
+.dg .stop1 { fill: var(--teal-soft); stroke: var(--teal); stroke-width: 2; }
+.dg .stop2 { fill: var(--mustard-soft); stroke: var(--mustard); stroke-width: 2; }
+.dg .stop3 { fill: var(--terra-soft); stroke: var(--terra); stroke-width: 2; }
+.dg .bracket1 { stroke: var(--teal); stroke-width: 2; fill: none; }
+.dg .bracket2 { stroke: var(--mustard); stroke-width: 2; fill: none; }
+.dg .bracket3 { stroke: var(--terra); stroke-width: 2; fill: none; }
+.dg .commit { fill: var(--terra); stroke: var(--surface); stroke-width: 2; }
+.dg .commit-base { fill: var(--ink); stroke: var(--surface); stroke-width: 2; }
+.dg .commit-item { fill: var(--teal); stroke: var(--surface); stroke-width: 2; }
+.dg .note { fill: var(--sunk); stroke: var(--line-strong); stroke-width: 1.2; }
+
+/* ---------- 演进阶段 ---------- */
+.stages { display: grid; gap: 44px; }
+.stage { display: grid; gap: 16px; min-width: 0; scroll-margin-top: 20px; }
+.stage-head { display: flex; align-items: center; gap: 14px; }
+.stage-no {
+  width: 48px; height: 48px; flex: none; border-radius: 50%;
+  display: grid; place-items: center;
+  font-family: var(--font-display); font-size: 21px; font-weight: 700; line-height: 1;
+  border: 2px solid currentColor;
+}
+.era1 .stage-no { color: var(--teal); background: var(--teal-soft); }
+.era2 .stage-no { color: var(--mustard-ink); background: var(--mustard-soft); }
+.era3 .stage-no { color: var(--terra); background: var(--terra-soft); }
+.stage-head h3 { font-size: 22px; }
+.stage-date { font-family: var(--font-mono); font-size: 12.5px; color: var(--muted); line-height: 1.5; }
+.stage-body { display: grid; gap: 20px; grid-template-columns: minmax(0, 1fr); align-items: start; }
+@media (min-width: 820px) {
+  .stage-body { grid-template-columns: minmax(0, 5fr) minmax(0, 6fr); gap: 28px; }
+}
+.stage-fig { margin: 0; min-width: 0; }
+.stage-fig figcaption { font-size: 13px; color: var(--muted); margin-top: 8px; }
+/* 演进图：同一张底图逐阶段加组件 */
+.dg.w-evo { min-width: 720px; }
+.dg .ev-n { fill: var(--terra-soft); stroke: var(--terra); stroke-width: 1.8; }
+.dg .ev-o { fill: var(--surface); stroke: var(--line-strong); stroke-width: 1.3; }
+.dg .evf-n { fill: var(--sunk); stroke: var(--terra); stroke-width: 1.5; stroke-dasharray: 6 5; }
+.dg .evf-o { fill: var(--sunk); stroke: var(--line-strong); stroke-width: 1.2; stroke-dasharray: 6 5; }
+.dg .evchip-n { fill: var(--surface); stroke: var(--terra); stroke-width: 1.5; }
+.dg .evchip-o { fill: var(--surface); stroke: var(--line-strong); stroke-width: 1.2; }
+.dg .evt-n { fill: var(--ink); }
+.dg .evt-o { fill: var(--muted); }
+.dg .evt-c { fill: var(--terra); }
+.dg .eva-n { fill: none; stroke: var(--terra); stroke-width: 1.8; }
+.dg .eva-o { fill: none; stroke: var(--line-strong); stroke-width: 1.5; }
+.dg .evm-n { fill: var(--terra); }
+.dg .evm-o { fill: var(--line-strong); }
+.dg .ev-g { fill: none; stroke: var(--line-strong); stroke-width: 1.1; stroke-dasharray: 2 5; opacity: .7; }
+.dg .ev-badge { fill: var(--terra); }
+.dg .ev-badge-t { fill: var(--surface); font-family: var(--font-mono); font-size: 9.5px; font-weight: 700; letter-spacing: .05em; }
+.evo-legend { display: flex; flex-wrap: wrap; gap: 8px 20px; align-items: center; font-size: 13.5px; color: var(--muted); background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 10px 14px; }
+.evo-legend > span { display: inline-flex; align-items: center; gap: 8px; }
+.sw { width: 30px; height: 18px; border-radius: 5px; display: inline-block; flex: none; position: relative; }
+.sw.new { background: var(--terra-soft); border: 1.8px solid var(--terra); }
+.sw.old { background: var(--surface); border: 1.3px solid var(--line-strong); }
+.sw.ghost { background: none; border: 1.3px dotted var(--line-strong); }
+.nb { font-family: var(--font-mono); font-size: 10px; font-weight: 700; color: var(--surface); background: var(--terra); border-radius: 999px; padding: 0 6px; letter-spacing: .05em; }
+.chg { color: var(--terra); font-weight: 700; }
+.ln { width: 30px; height: 0; border-top: 2px solid var(--muted); display: inline-block; }
+.ln.d { border-top-style: dashed; }
+.stage .evo { margin-top: 4px; }
+.story-fig { margin: 0; max-width: 820px; min-width: 0; }
+
+.story-fig figcaption { font-size: 13.5px; color: var(--muted); margin-top: 8px; }
+@media (min-width: 820px) { .stage-body.solo { grid-template-columns: minmax(0, 1fr); max-width: 46em; } }
+
+/* 结尾：瓶颈三连 */
+.triple { list-style: none; padding: 0; margin: 0; display: grid; gap: 14px; grid-template-columns: minmax(0, 1fr); counter-reset: none; }
+@media (min-width: 760px) { .triple { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+.triple li { margin: 0; background: var(--surface); border: 1px solid var(--line); border-radius: 16px; padding: 16px 18px; display: grid; gap: 6px; align-content: start; }
+.triple .tn { font-family: var(--font-mono); font-size: 12px; font-weight: 700; color: var(--muted); letter-spacing: .06em; }
+.triple h3 { font-size: 26px; font-weight: 900; }
+.triple p { font-size: 14.5px; line-height: 1.7; }
+.triple .tw { font-family: var(--font-mono); font-size: 12px; color: var(--muted); }
+.triple li.now { border: 2px solid var(--terra); background: var(--terra-soft); }
+.triple li.now h3, .triple li.now .tn { color: var(--terra); }
+.punch { font-size: 22px; font-weight: 900; color: var(--terra); }
+.pce { margin: 0; display: grid; gap: 14px; min-width: 0; }
+.pce > div { display: grid; grid-template-columns: 4.6em minmax(0, 1fr); gap: 12px; align-items: baseline; }
+.pce dt { font-size: 13px; font-weight: 700; text-align: center; border-radius: 999px; padding: 1px 0; }
+.pce dt.p { color: var(--terra); background: var(--terra-soft); }
+.pce dt.c { color: var(--teal); background: var(--teal-soft); }
+.pce dt.e { color: var(--mustard-ink); background: var(--mustard-soft); }
+.pce dd { margin: 0; min-width: 0; font-size: 15px; }
+.pce dd ul { margin-top: 4px; }
+.refine { border: 1.5px dashed var(--terra); border-radius: 16px; padding: 16px 18px; display: grid; gap: 12px; background: var(--surface); }
+.refine h4 { margin: 0; font-size: 16px; color: var(--terra); }
+
+/* ---------- 卡片、表格、代码 ---------- */
+.roles { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
+.role { background: var(--surface); border: 1px solid var(--line); border-radius: 16px; padding: 18px 18px 16px; display: grid; gap: 8px; align-content: start; min-width: 0; }
+.role .n { font-family: var(--font-display); font-weight: 700; font-size: 26px; line-height: 1; color: var(--terra); }
+.role h3 { font-size: 17px; }
+.role p, .role li { font-size: 14.5px; line-height: 1.7; }
+.role.key { border: 2px solid var(--terra); background: var(--terra-soft); position: relative; }
+.role.key .flag { position: absolute; top: -12px; right: 14px; font-size: 12px; font-weight: 700; color: var(--surface); background: var(--terra); padding: 2px 10px; border-radius: 999px; }
+
+.table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 14.5px; line-height: 1.65; font-family: var(--font-body); color: var(--ink); }
+th, td { text-align: left; vertical-align: top; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+tr:last-child td { border-bottom: 0; }
+th { font-size: 13px; color: var(--muted); font-weight: 700; background: var(--sunk); white-space: nowrap; }
+td:first-child { white-space: nowrap; }
+.t-events { min-width: 720px; }
+.t-hosts { min-width: 760px; }
+.t-hosts td:first-child { font-weight: 700; }
+.ev { font-family: var(--font-mono); font-size: 12.5px; padding: 2px 8px; border-radius: 6px; display: inline-block; }
+.ev.ok { background: var(--teal-soft); color: var(--teal); }
+.ev.stop { background: var(--mustard-soft); color: var(--mustard-ink); }
+.ev.warn { background: var(--terra-soft); color: var(--terra); }
+.ev.meta2 { background: var(--sunk); color: var(--muted); }
+.host-cc { color: var(--cc); font-weight: 700; }
+.host-cx { color: var(--teal); font-weight: 700; }
+
+pre.code {
+  margin: 0; background: var(--code-bg); border-radius: 14px; padding: 14px 16px;
+  font-family: var(--font-mono); font-size: 13px; line-height: 1.7; overflow-x: auto; color: var(--ink);
+}
+pre.code code { background: none; padding: 0; font-size: inherit; overflow-wrap: normal; }
+/* 整段要复制的话：自动换行，复制出来仍是原句 */
+pre.code.wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
+pre.code.wrap code { overflow-wrap: anywhere; }
+pre.code .cm { color: var(--muted); }
+.cols { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); align-items: start; }
+.cols > div { min-width: 0; display: grid; gap: 8px; }
+/* 目录树的注释比较长：每栏至少 380px，宽屏两栏一行 */
+.cols.tree { grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr)); }
+.cols h3 { font-size: 16px; }
+
+.pipe { list-style: none; padding: 0; margin: 0; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; counter-reset: pipe; }
+.pipe li { margin: 0; counter-increment: pipe; background: var(--surface); border: 1px solid var(--line-strong); border-radius: 10px; padding: 6px 12px; font-size: 14px; display: flex; gap: 8px; align-items: baseline; }
+.pipe li::before { content: counter(pipe); font-family: var(--font-display); font-weight: 700; color: var(--teal); font-size: 14px; }
+
+.steps { counter-reset: st; list-style: none; padding: 0; display: grid; gap: 10px; max-width: 46em; }
+.steps > li { counter-increment: st; display: grid; grid-template-columns: 2.2em minmax(0, 1fr); gap: 10px; margin: 0; }
+.steps > li::before { content: counter(st); font-family: var(--font-display); font-weight: 700; font-size: 17px; color: var(--terra); line-height: 1.6; text-align: center; }
+
+.borrow { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
+.borrow > div { background: var(--surface); border: 1px solid var(--line); border-radius: 16px; padding: 16px 18px; display: grid; gap: 8px; align-content: start; min-width: 0; }
+.borrow h3 { font-size: 16px; }
+.borrow blockquote { margin: 0; font-family: var(--font-mono); font-size: 12.5px; color: var(--muted); line-height: 1.6; padding-left: 10px; border-left: 2px solid var(--peach); }
+.borrow p { font-size: 14.5px; line-height: 1.7; }
+
+/* 离开电脑：飞书 oncall 的流程图 */
+.dg.w-oncall { min-width: 820px; }
+.dg .sep { stroke: var(--peach); stroke-width: 1.2; stroke-dasharray: 4 5; }
+
+footer.end { margin-top: 64px; font-size: 13px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 6px 18px; }
+</style>
+
+<div class="layout">
+
+<header class="hero" id="top">
+  <p class="eyebrow">技术架构与流程说明 · 11-19 更新</p>
+  <h1>drover<span>.</span></h1>
+  <p class="tagline">把“一个人盯一个 agent”，变成“人只提需求、看一页汇报、拍板”。离开电脑，在飞书里也一样。</p>
+  <div class="lead prose">
+    <p>drover 是一套多 agent 派发体系的名字，也是它的命令（<code>/drover</code>、<code>$drover</code>）和 CLI（<code>drover</code>）的名字。名字取“赶牧群的人”的意思，和它脚下的终端牧场 Herdr 配成一对。分析、拆条目、派发、追踪、验收、集成，都交给一个编排者（orchestrator）和一群 worker；人只在开头说一句需求、在中间偶尔拍个板、在最后看一页汇报。</p>
+    <p>整份文档只有一条主线：<strong>提效，打破人的瓶颈</strong>。下面每一次演进，都是把一件原本必须由人盯着做的事，挪给流程、脚本或者另一个 agent。后来人连电脑都不用守着了（飞书 oncall），结论到你手里之前先过一遍审（不用你一条条追问依据）；最新的一步是任务看板：几个任务各走到哪、在等谁、要你做什么，扫一眼就知道。</p>
+  </div>
+  <div class="meta"><span>读者：用 Claude Code / Codex 的工程师</span><span>宿主：不挑 agent</span><span>CLI：Python 标准库</span><span>飞书 oncall：选装</span></div>
+  <figure class="cover">
+    <div class="img-box"><img src="images/01-cover.jpg" alt="封面插画：drover 概览，人只管方向，活交给编排者和一群 agent"></div>
+    <figcaption>封面：drover 的全貌。人只管方向和拍板，活交给编排者和一群 worker。</figcaption>
+  </figure>
+  <div class="trio" aria-label="三层角色">
+    <div><h3><span class="dot m" aria-hidden="true"></span>主会话</h3><p>主工作台里的那个会话，就是你打交道的 drover 本身。负责路由、问答、审核、转达：只读每个任务的一页 rollup，方案和结论先按 rollup 里的依据审过再转。</p></div>
+    <div><h3><span class="dot c" aria-hidden="true"></span>编排者</h3><p>orchestrator，一个任务一个，全程编排这个任务，跑在 herdr 的 <code>orch</code> workspace 里。拆条目、派 worker、验收、集成、推送。</p></div>
+    <div><h3><span class="dot w" aria-hidden="true"></span>worker</h3><p>一个条目一个 agent 一个 worktree。只干活、跑相关测试、写报告，不提交、不 rebase。</p></div>
+  </div>
+  <a class="away" href="#stage-9">
+    <span class="away-tag">新 · 11-19</span>
+    <span class="away-body">
+      <strong>任务看板：扫一眼就知道哪件该你做</strong>
+      <span>主会话旁边开一个“看板”tab，一行一个任务，按等你 / 进行中 / 完成分表：当前状态、要你做什么、在这个状态上待了多久。完成的点一下 [收尾] 就收。主会话只在有要处理的事时才被叫醒，转达不再被状态更新刷掉；drover 自己在后台更新，不用重开会话。</span>
+    </span>
+    <span class="away-go" aria-hidden="true">→</span>
+  </a>
+</header>
+
+<nav class="toc" aria-label="目录">
+  <div class="toc-title">院子地图</div>
+  <ol>
+    <li><a href="#history">演进史</a></li>
+    <li><a href="#arch">现在的架构</a></li>
+    <li><a href="#roles">编排者的四个身份</a></li>
+    <li><a href="#flow">一次派发</a></li>
+    <li><a href="#integrate">集成与推送</a></li>
+    <li><a href="#watch">状态与事件</a></li>
+    <li><a href="#accept">按证据验收</a></li>
+    <li><a href="#hosts">宿主差异</a></li>
+    <li><a href="#oncall">离开电脑：飞书 oncall</a></li>
+    <li><a href="#principles">几条原则</a></li>
+    <li><a href="#files">目录与文件</a></li>
+    <li><a href="#install">怎么装、怎么用</a></li>
+    <li><a href="#ending">结尾：瓶颈三连</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<div class="fence" aria-hidden="true"></div>
+
+<!-- ================= 演进史 ================= -->
+<section id="history">
+  <header>
+    <p class="eyebrow">演进史</p>
+    <h2>从盯着一只羊，到只看一张纸条</h2>
+  </header>
+  <div class="prose">
+    <p>九个阶段，每一步都在回答同一个问题：现在人卡在哪？先看全景，再逐个展开。</p>
+  </div>
+
+  <figure class="fig">
+    <div class="canvas">
+      <svg class="dg w-timeline" viewBox="0 0 1200 232" role="img" aria-label="演进时间线：九个阶段从一个 agent 一个终端到打包分享、离开电脑用飞书管，再到结论先过审、任务看板；瓶颈从人盯 agent、到人盯流程、再到人只拍板，拍板也不用守在电脑前，最后扫一眼看板就知道哪件该自己做">
+        <defs>
+          <marker id="tl-ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-terra"/></marker>
+        </defs>
+        <!-- 行标签 -->
+        <text x="16" y="62" class="ts">时间</text>
+        <text x="16" y="141" class="ts">阶段</text>
+        <text x="16" y="196" class="ts">人在干嘛</text>
+        <!-- 三段时期 -->
+        <path d="M70,34 V28 H422 V34" class="bracket1"/>
+        <text x="246" y="20" text-anchor="middle" class="tl tb c-teal">人盯 agent</text>
+        <path d="M458,34 V28 H550 V34" class="bracket2"/>
+        <text x="504" y="20" text-anchor="middle" class="tl tb c-mus">人盯流程</text>
+        <path d="M586,34 V28 H1190 V34" class="bracket3"/>
+        <text x="888" y="20" text-anchor="middle" class="tl tb c-terra">人只拍板（在哪都行）</text>
+        <!-- 日期 -->
+        <text x="120" y="62" text-anchor="middle" class="tm c-muted">更早（无记录）</text>
+        <text x="248" y="62" text-anchor="middle" class="tm">09-17</text>
+        <text x="376" y="62" text-anchor="middle" class="tm">09-17 后 · 10-20</text>
+        <text x="504" y="62" text-anchor="middle" class="tm">10-23 · 11-02/03</text>
+        <text x="632" y="62" text-anchor="middle" class="tm">11-03 · 11-04</text>
+        <text x="760" y="62" text-anchor="middle" class="tm">11-06</text>
+        <text x="888" y="62" text-anchor="middle" class="tm">11-08</text>
+        <text x="1016" y="62" text-anchor="middle" class="tm">11-11/15/16</text>
+        <text x="1144" y="62" text-anchor="middle" class="tm">11-18/19</text>
+        <!-- 小路 -->
+        <rect x="74" y="86" width="1092" height="14" rx="7" class="road"/>
+        <line x1="1166" y1="93" x2="1192" y2="93" class="e e-terra" marker-end="url(#tl-ah)"/>
+        <!-- 站点：九站，均分 120–1144 -->
+        <circle cx="120" cy="93" r="16" class="stop1"/><text x="120" y="98" text-anchor="middle" class="tb c-teal">1</text>
+        <circle cx="248" cy="93" r="16" class="stop1"/><text x="248" y="98" text-anchor="middle" class="tb c-teal">2</text>
+        <circle cx="376" cy="93" r="16" class="stop1"/><text x="376" y="98" text-anchor="middle" class="tb c-teal">3</text>
+        <circle cx="504" cy="93" r="16" class="stop2"/><text x="504" y="98" text-anchor="middle" class="tb c-mus">4</text>
+        <circle cx="632" cy="93" r="16" class="stop3"/><text x="632" y="98" text-anchor="middle" class="tb c-terra">5</text>
+        <circle cx="760" cy="93" r="16" class="stop3"/><text x="760" y="98" text-anchor="middle" class="tb c-terra">6</text>
+        <circle cx="888" cy="93" r="16" class="stop3"/><text x="888" y="98" text-anchor="middle" class="tb c-terra">7</text>
+        <circle cx="1016" cy="93" r="16" class="stop3"/><text x="1016" y="98" text-anchor="middle" class="tb c-terra">8</text>
+        <circle cx="1144" cy="93" r="16" class="stop3"/><text x="1144" y="98" text-anchor="middle" class="tb c-terra">9</text>
+        <!-- 阶段名 -->
+        <text x="120" y="137" text-anchor="middle" class="tb">一个 agent</text>
+        <text x="120" y="155" text-anchor="middle" class="tb">一个终端</text>
+        <text x="248" y="137" text-anchor="middle" class="tb">引入 Herdr</text>
+        <text x="376" y="137" text-anchor="middle" class="tb">Herdr</text>
+        <text x="376" y="155" text-anchor="middle" class="tb">多 worktree</text>
+        <text x="504" y="137" text-anchor="middle" class="tb">前身 dispatch</text>
+        <text x="504" y="155" text-anchor="middle" class="tb">流程 + 脚本</text>
+        <text x="632" y="137" text-anchor="middle" class="tb">编排者</text>
+        <text x="632" y="155" text-anchor="middle" class="ts">含 11-04 细化</text>
+        <text x="760" y="137" text-anchor="middle" class="tb">打包分享</text>
+        <text x="760" y="155" text-anchor="middle" class="ts">含 11-07 / 08 补强</text>
+        <text x="888" y="137" text-anchor="middle" class="tb">离开电脑</text>
+        <text x="888" y="155" text-anchor="middle" class="ts">飞书 oncall</text>
+        <text x="1016" y="137" text-anchor="middle" class="tb">结论先过审</text>
+        <text x="1016" y="155" text-anchor="middle" class="ts">根治 · 证据 · 先审</text>
+        <text x="1144" y="137" text-anchor="middle" class="tb">任务看板</text>
+        <text x="1144" y="155" text-anchor="middle" class="ts">一键收尾 · 自动更新</text>
+        <!-- 人在干嘛 -->
+        <text x="120" y="196" text-anchor="middle" class="tl c-muted">盯一个窗口干等</text>
+        <text x="248" y="196" text-anchor="middle" class="tl c-muted">在窗口间来回切</text>
+        <text x="376" y="196" text-anchor="middle" class="tl c-muted">给 agent 分院子</text>
+        <text x="504" y="196" text-anchor="middle" class="tl c-muted">手工调度变脚本</text>
+        <text x="632" y="196" text-anchor="middle" class="tl c-muted">只看一页、只拍板</text>
+        <text x="760" y="196" text-anchor="middle" class="tl c-muted">别人也能上手</text>
+        <text x="888" y="196" text-anchor="middle" class="tl c-muted">在手机上拍板</text>
+        <text x="1016" y="196" text-anchor="middle" class="tl c-muted">不用追问依据</text>
+        <text x="1144" y="196" text-anchor="middle" class="tl c-muted">扫一眼看板</text>
+        <text x="120" y="214" text-anchor="middle" class="ts">（起点）</text>
+      </svg>
+    </div>
+    <p class="swipe">← 图比屏幕宽，可以左右滑动 →</p>
+    <figcaption><b>时间线。</b>站点之间的间距只表示先后，不代表时间长短。最早那一段没有记录，所以不写日期。上方三段颜色是“人的瓶颈落在哪”：先是盯 agent，再是盯流程，最后只剩拍板；到 ⑦，拍板也不用守在电脑前了；⑧ 让结论到你手里之前先过一遍审，⑨ 让你扫一眼看板就知道哪件该你做。</figcaption>
+  </figure>
+
+  <div class="prose">
+    <p>下面每个阶段都配一张架构演进图，讲清楚“这一步多了什么”；①–⑤ 和 ⑦ 另有一张插画讲故事，⑥ ⑧ ⑨ 没有。九张演进图用同一张底图，组件的位置固定不动，逐阶段往上加。</p>
+  </div>
+  <div class="evo-legend" aria-label="架构演进图图例">
+    <span><span class="sw new" aria-hidden="true"></span><span class="nb">NEW</span> 这一步新增</span>
+    <span><span class="sw old" aria-hidden="true"></span>之前就有</span>
+    <span><span class="sw ghost" aria-hidden="true"></span>之后才会有</span>
+    <span><span class="chg">赤陶色文字</span>这一步改了的标签</span>
+    <span><span class="ln" aria-hidden="true"></span>命令 / 消息</span>
+    <span><span class="ln d" aria-hidden="true"></span>写文件 / 往上汇报</span>
+  </div>
+
+  <div class="stages">
+
+    <!-- ① -->
+    <article class="stage era1" id="stage-1">
+      <div class="stage-head">
+        <span class="stage-no" aria-hidden="true">1</span>
+        <div><h3>一个 agent 一个终端</h3><p class="stage-date">更早 · 没有记录</p></div>
+      </div>
+      <div class="stage-body">
+        <figure class="stage-fig">
+          <div class="img-box"><img src="images/02-one-terminal.jpg" loading="lazy" alt="阶段 ① 插画：一个 agent 一个终端，人是瓶颈"></div>
+          <figcaption>阶段 ①：一个 agent 一个终端，人是瓶颈。</figcaption>
+        </figure>
+        <dl class="pce">
+          <div><dt class="p">卡在哪</dt><dd>人盯着一个 agent 干等。agent 干活时人闲着，agent 等人审批、等人回话时它闲着。两边轮流发呆，一次只推进一件事。</dd></div>
+          <div><dt class="c">怎么改</dt><dd>还没改，这是起点。大家都这么开始的。</dd></div>
+          <div><dt class="e">效果</dt><dd>人的注意力就是吞吐量的上限。</dd></div>
+        </dl>
+      </div>
+    <!-- evo:1:begin -->
+    <figure class="fig evo">
+      <div class="canvas">
+      <svg class="dg w-evo" viewBox="0 0 900 490" role="img" aria-label="阶段 ① 的架构演进图：一个人、一个终端、一个 agent。人直接盯着它：审批、回话、看结果。">
+        <defs>
+          <marker id="evm1n" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="evm-n"/></marker>
+          <marker id="evm1o" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="evm-o"/></marker>
+        </defs>
+        <rect x="14" y="320" width="152" height="72" rx="10" class="ev-g"/>
+        <rect x="14" y="420" width="152" height="60" rx="12" class="ev-g"/>
+        <rect x="700" y="20" width="180" height="70" rx="12" class="ev-g"/>
+        <rect x="200" y="236" width="680" height="124" rx="14" class="ev-g"/>
+        <rect x="436" y="266" width="208" height="80" rx="10" class="ev-g"/>
+        <rect x="656" y="266" width="208" height="80" rx="10" class="ev-g"/>
+        <rect x="216" y="376" width="208" height="42" rx="8" class="ev-g"/>
+        <rect x="436" y="376" width="208" height="42" rx="8" class="ev-g"/>
+        <rect x="656" y="376" width="208" height="42" rx="8" class="ev-g"/>
+        <rect x="200" y="112" width="420" height="100" rx="10" class="ev-g"/>
+        <rect x="650" y="112" width="230" height="100" rx="10" class="ev-g"/>
+        <rect x="200" y="20" width="180" height="70" rx="12" class="ev-g"/>
+        <rect x="480" y="20" width="200" height="70" rx="12" class="ev-g"/>
+        <rect x="216" y="436" width="428" height="44" rx="8" class="ev-g"/>
+        <rect x="680" y="436" width="200" height="44" rx="22" class="ev-g"/>
+        <rect x="14" y="112" width="152" height="100" rx="10" class="ev-g"/>
+        <rect x="216" y="376" width="208" height="42" rx="8" class="ev-n"/>
+        <text x="232" y="402" class="tl tb evt-n">仓库检出目录</text>
+        <rect x="216" y="266" width="208" height="80" rx="10" class="ev-n"/>
+        <text x="228" y="283" class="tm evt-n">终端</text>
+        <rect x="228" y="292" width="124" height="44" rx="8" class="ev-n"/>
+        <text x="290" y="312" text-anchor="middle" class="tl tb evt-n">agent</text>
+        <path d="M320,346 V374" class="eva-n"/>
+        <rect x="14" y="24" width="152" height="56" rx="28" class="ev-n"/>
+        <text x="90" y="48" text-anchor="middle" class="tt evt-n">人</text>
+        <text x="90" y="67" text-anchor="middle" class="ts evt-n">盯着一个 agent</text>
+        <path d="M60,82 V306 H214" class="eva-n" marker-start="url(#evm1n)" marker-end="url(#evm1n)"/>
+        <text x="68" y="298" class="tl evt-c">盯着 · 审批 · 回话</text>
+      </svg>
+      </div>
+      <p class="swipe">← 图比屏幕宽，可以左右滑动 →</p>
+      <figcaption><b>阶段 ① 的架构。</b>一个人、一个终端、一个 agent。人直接盯着它：审批、回话、看结果。</figcaption>
+    </figure>
+    <!-- evo:1:end -->
+    </article>
+
+    <!-- ② -->
+    <article class="stage era1" id="stage-2">
+      <div class="stage-head">
+        <span class="stage-no" aria-hidden="true">2</span>
+        <div><h3>引入 Herdr</h3><p class="stage-date">09-17 装上 herdr 技能</p></div>
+      </div>
+      <div class="stage-body">
+        <figure class="stage-fig">
+          <div class="img-box"><img src="images/03-herdr.jpg" loading="lazy" alt="阶段 ② 插画：终端多路复用，一墙 pane，人在中间来回切"></div>
+          <figcaption>阶段 ②：终端多路复用，一墙 pane，人在中间来回切。</figcaption>
+        </figure>
+        <dl class="pce">
+          <div><dt class="p">卡在哪</dt><dd>开了多个终端以后，人在窗口之间来回切，记不住谁在等审批、谁已经做完了。</dd></div>
+          <div><dt class="c">怎么改</dt><dd>用 Herdr 组织终端：workspace / tab / pane 三层；它能认出 pane 里跑的是 coding agent，给出 <code>working</code> / <code>idle</code> / <code>blocked</code> / <code>done</code> 状态。agent 自己也能用 <code>herdr</code> CLI 开 pane、起 agent、读别的 pane 的输出。</dd></div>
+          <div><dt class="e">效果</dt><dd>不用挨个窗口看，状态一目了然。更重要的是 <strong>agent 能指挥 agent</strong>，后面几步都建在这一点上。</dd></div>
+        </dl>
+      </div>
+    <!-- evo:2:begin -->
+    <figure class="fig evo">
+      <div class="canvas">
+      <svg class="dg w-evo" viewBox="0 0 900 490" role="img" aria-label="阶段 ② 的架构演进图：多出 herdr：workspace / tab / pane 组织多个终端，每个 agent 在自己的 pane 里，herdr 报 working / blocked / done。但大家还在同一个检出目录里改。">
+        <defs>
+          <marker id="evm2n" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="evm-n"/></marker>
+          <marker id="evm2o" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="evm-o"/></marker>
+        </defs>
+        <rect x="14" y="320" width="152" height="72" rx="10" class="ev-g"/>
+        <rect x="14" y="420" width="152" height="60" rx="12" class="ev-g"/>
+        <rect x="700" y="20" width="180" height="70" rx="12" class="ev-g"/>
+        <rect x="216" y="376" width="208" height="42" rx="8" class="ev-g"/>
+        <rect x="436" y="376" width="208" height="42" rx="8" class="ev-g"/>
+        <rect x="656" y="376" width="208" height="42" rx="8" class="ev-g"/>
+        <rect x="200" y="112" width="420" height="100" rx="10" class="ev-g"/>
+        <rect x="650" y="112" width="230" height="100" rx="10" class="ev-g"/>
+        <rect x="200" y="20" width="180" height="70" rx="12" class="ev-g"/>
+        <rect x="480" y="20" width="200" height="70" rx="12" class="ev-g"/>
+        <rect x="216" y="436" width="428" height="44" rx="8" class="ev-g"/>
+        <rect x="680" y="436" width="200" height="44" rx="22" class="ev-g"/>
+        <rect x="14" y="112" width="152" height="100" rx="10" class="ev-g"/>
+        <rect x="200" y="236" width="680" height="124" rx="14" class="evf-n"/>
+        <rect x="850" y="228" width="36" height="15" rx="7.5" class="ev-badge"/><text x="868" y="239" text-anchor="middle" class="ev-badge-t">NEW</text>
+        <text x="216" y="255" class="tm evt-n">herdr · workspace / tab / pane</text>
+        <rect x="216" y="376" width="648" height="42" rx="8" class="ev-o"/>
+        <text x="232" y="394" class="tl tb evt-o">仓库检出目录</text>
+        <text x="232" y="411" class="ts evt-c">多个 agent 在同一个目录里改，互相踩文件、依赖、dev server</text>
+        <rect x="216" y="266" width="208" height="80" rx="10" class="ev-o"/>
+        <text x="228" y="283" class="tm evt-c">pane</text>
+        <rect x="228" y="292" width="124" height="44" rx="8" class="ev-o"/>
+        <text x="290" y="312" text-anchor="middle" class="tl tb evt-o">agent</text>
+        <rect x="356" y="303" width="64" height="22" rx="11" class="evchip-n"/>
+        <text x="388" y="318" text-anchor="middle" class="tm evt-n">working</text>
+        <path d="M320,346 V374" class="eva-o"/>
+        <rect x="436" y="266" width="208" height="80" rx="10" class="ev-n"/>
+        <rect x="614" y="258" width="36" height="15" rx="7.5" class="ev-badge"/><text x="632" y="269" text-anchor="middle" class="ev-badge-t">NEW</text>
+        <text x="448" y="283" class="tm evt-n">pane</text>
+        <rect x="448" y="292" width="124" height="44" rx="8" class="ev-n"/>
+        <text x="510" y="312" text-anchor="middle" class="tl tb evt-n">agent</text>
+        <rect x="576" y="303" width="64" height="22" rx="11" class="evchip-n"/>
+        <text x="608" y="318" text-anchor="middle" class="tm evt-n">blocked</text>
+        <path d="M540,346 V374" class="eva-n"/>
+        <rect x="656" y="266" width="208" height="80" rx="10" class="ev-n"/>
+        <rect x="834" y="258" width="36" height="15" rx="7.5" class="ev-badge"/><text x="852" y="269" text-anchor="middle" class="ev-badge-t">NEW</text>
+        <text x="668" y="283" class="tm evt-n">pane</text>
+        <rect x="668" y="292" width="124" height="44" rx="8" class="ev-n"/>
+        <text x="730" y="312" text-anchor="middle" class="tl tb evt-n">agent</text>
+        <rect x="796" y="303" width="64" height="22" rx="11" class="evchip-n"/>
+        <text x="828" y="318" text-anchor="middle" class="tm evt-n">done</text>
+        <path d="M760,346 V374" class="eva-n"/>
+        <rect x="14" y="24" width="152" height="56" rx="28" class="ev-o"/>
+        <text x="90" y="48" text-anchor="middle" class="tt evt-o">人</text>
+        <text x="90" y="67" text-anchor="middle" class="ts evt-c">看状态、切 pane</text>
+        <path d="M60,82 V306 H198" class="eva-n" marker-start="url(#evm2n)" marker-end="url(#evm2n)"/>
+        <text x="68" y="298" class="tl evt-c">看状态，切过去</text>
+      </svg>
+      </div>
+      <p class="swipe">← 图比屏幕宽，可以左右滑动 →</p>
+      <figcaption><b>阶段 ② 的架构。</b>多出 herdr：workspace / tab / pane 组织多个终端，每个 agent 在自己的 pane 里，herdr 报 working / blocked / done。但大家还在同一个检出目录里改。</figcaption>
+    </figure>
+    <!-- evo:2:end -->
+    </article>
+
+    <!-- ③ -->
+    <article class="stage era1" id="stage-3">
+      <div class="stage-head">
+        <span class="stage-no" aria-hidden="true">3</span>
+        <div><h3>Herdr 多 worktree</h3><p class="stage-date">09-17 之后到 10 月（具体日期没记录）· 10-20 装上 Herdr 的 Codex hook</p></div>
+      </div>
+      <div class="stage-body">
+        <figure class="stage-fig">
+          <div class="img-box"><img src="images/04-worktrees.jpg" loading="lazy" alt="阶段 ③ 插画：并行 worktree，每个 agent 各干各的"></div>
+          <figcaption>阶段 ③：并行 worktree，每个 agent 各干各的、互不干扰。</figcaption>
+        </figure>
+        <dl class="pce">
+          <div><dt class="p">卡在哪</dt><dd>多个 agent 在同一个检出目录里改，互相踩文件、踩依赖、抢 dev server。</dd></div>
+          <div><dt class="c">怎么改</dt><dd>每个任务一个 git worktree，交给 herdr worktree 管理，统一放在 <code>~/.herdr/worktrees/&lt;仓库&gt;/…</code>；依赖在 worktree 里独立安装，不软链源仓库的 <code>node_modules</code> / <code>.venv</code>。Codex 的 pane 装上 herdr 的状态 hook 后，也能报 working / idle / blocked。</dd></div>
+          <div><dt class="e">效果</dt><dd>并行不打架：一只羊一个院子。</dd></div>
+        </dl>
+      </div>
+    <!-- evo:3:begin -->
+    <figure class="fig evo">
+      <div class="canvas">
+      <svg class="dg w-evo" viewBox="0 0 900 490" role="img" aria-label="阶段 ③ 的架构演进图：共用的检出目录换成每个 agent 一个 git worktree，依赖在 worktree 里独立安装；Codex 的 pane 也能报状态了。">
+        <defs>
+          <marker id="evm3n" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="evm-n"/></marker>
+          <marker id="evm3o" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="evm-o"/></marker>
+        </defs>
+        <rect x="14" y="320" width="152" height="72" rx="10" class="ev-g"/>
+        <rect x="14" y="420" width="152" height="60" rx="12" class="ev-g"/>
+        <rect x="700" y="20" width="180" height="70" rx="12" class="ev-g"/>
+        <rect x="200" y="112" width="420" height="100" rx="10" class="ev-g"/>
+        <rect x="650" y="112" width="230" height="100" rx="10" class="ev-g"/>
+        <rect x="200" y="20" width="180" height="70" rx="12" class="ev-g"/>
+        <rect x="480" y="20" width="200" height="70" rx="12" class="ev-g"/>
+        <rect x="216" y="436" width="428" height="44" rx="8" class="ev-g"/>
+        <rect x="680" y="436" width="200" height="44" rx="22" class="ev-g"/>
+        <rect x="14" y="112" width="152" height="100" rx="10" class="ev-g"/>
+        <rect x="200" y="236" width="680" height="124" rx="14" class="evf-o"/>
+        <text x="216" y="255" class="tm evt-o">herdr · workspace / tab / pane</text>
+        <rect x="216" y="266" width="208" height="80" rx="10" class="ev-o"/>
+        <text x="228" y="283" class="tm evt-o">pane</text>
+        <rect x="228" y="292" width="124" height="44" rx="8" class="ev-o"/>
+        <text x="290" y="312" text-anchor="middle" class="tl tb evt-o">agent</text>
+        <text x="290" y="328" text-anchor="middle" class="tm evt-c">claude / codex</text>
+        <rect x="356" y="303" width="64" height="22" rx="11" class="evchip-o"/>
+        <text x="388" y="318" text-anchor="middle" class="tm evt-o">working</text>
+        <path d="M320,346 V374" class="eva-n"/>
+        <rect x="436" y="266" width="208" height="80" rx="10" class="ev-o"/>
+        <text x="448" y="283" class="tm evt-o">pane</text>
+        <rect x="448" y="292" width="124" height="44" rx="8" class="ev-o"/>
+        <text x="510" y="312" text-anchor="middle" class="tl tb evt-o">agent</text>
+        <text x="510" y="328" text-anchor="middle" class="tm evt-c">claude / codex</text>
+        <rect x="576" y="303" width="64" height="22" rx="11" class="evchip-o"/>
+        <text x="608" y="318" text-anchor="middle" class="tm evt-o">blocked</text>
+        <path d="M540,346 V374" class="eva-n"/>
+        <rect x="656" y="266" width="208" height="80" rx="10" class="ev-o"/>
+        <text x="668" y="283" class="tm evt-o">pane</text>
+        <rect x="668" y="292" width="124" height="44" rx="8" class="ev-o"/>
+        <text x="730" y="312" text-anchor="middle" class="tl tb evt-o">agent</text>
+        <text x="730" y="328" text-anchor="middle" class="tm evt-c">claude / codex</text>
+        <rect x="796" y="303" width="64" height="22" rx="11" class="evchip-o"/>
+        <text x="828" y="318" text-anchor="middle" class="tm evt-o">done</text>
+        <path d="M760,346 V374" class="eva-n"/>
+        <rect x="216" y="376" width="208" height="42" rx="8" class="ev-n"/>
+        <rect x="394" y="368" width="36" height="15" rx="7.5" class="ev-badge"/><text x="412" y="379" text-anchor="middle" class="ev-badge-t">NEW</text>
+        <text x="228" y="394" class="tm tb evt-n">git worktree</text>
+        <text x="228" y="411" class="ts evt-n">依赖在里面独立安装</text>
+        <rect x="436" y="376" width="208" height="42" rx="8" class="ev-n"/>
+        <rect x="614" y="368" width="36" height="15" rx="7.5" class="ev-badge"/><text x="632" y="379" text-anchor="middle" class="ev-badge-t">NEW</text>
+        <text x="448" y="394" class="tm tb evt-n">git worktree</text>
+        <text x="448" y="411" class="ts evt-n">依赖在里面独立安装</text>
+        <rect x="656" y="376" width="208" height="42" rx="8" class="ev-n"/>
+        <rect x="834" y="368" width="36" height="15" rx="7.5" class="ev-badge"/><text x="852" y="379" text-anchor="middle" class="ev-badge-t">NEW</text>
+        <text x="668" y="394" class="tm tb evt-n">git worktree</text>
+        <text x="668" y="411" class="ts evt-n">依赖在里面独立安装</text>
+        <rect x="14" y="24" width="152" height="56" rx="28" class="ev-o"/>
+        <text x="90" y="48" text-anchor="middle" class="tt evt-o">人</text>
+        <text x="90" y="67" text-anchor="middle" class="ts evt-o">看状态、切 pane</text>
+        <path d="M60,82 V306 H198" class="eva-o" marker-start="url(#evm3o)" marker-end="url(#evm3o)"/>
+        <text x="68" y="298" class="tl evt-o">看状态，切过去</text>
+      </svg>
+      </div>
+      <p class="swipe">← 图比屏幕宽，可以左右滑动 →</p>
+      <figcaption><b>阶段 ③ 的架构。</b>共用的检出目录换成每个 agent 一个 git worktree，依赖在 worktree 里独立安装；Codex 的 pane 也能报状态了。</figcaption>
+    </figure>
+    <!-- evo:3:end -->
+    </article>
+
+    <!-- ④ -->
+    <article class="stage era2" id="stage-4">
+      <div class="stage-head">
+        <span class="stage-no" aria-hidden="true">4</span>
+        <div><h3>drover 的前身 dispatch：流程 + 脚本</h3><p class="stage-date">10-23 最早一条派发记录 · 11-02 / 11-03 脚本化</p></div>
+      </div>
+      <div class="stage-body">
+        <figure class="stage-fig">
+          <div class="img-box"><img src="images/05-dispatch.jpg" loading="lazy" alt="阶段 ④ 插画：一句需求变成带完成证据的任务书，结果要过验收门"></div>
+          <figcaption>阶段 ④：一句需求变成带完成证据的任务书，结果要过验收门。</figcaption>
+        </figure>
+        <dl class="pce">
+          <div><dt class="p">卡在哪</dt><dd>每次派发都要人手工建 worktree、装依赖、起 agent、写一大段 prompt、盯进度、对结果。院子分好了，人却成了调度员。</dd></div>
+          <div><dt class="c">怎么改</dt><dd>前身 dispatch 最早只有一个 <code>/dispatch</code> 命令（流程）和一个 <code>dispatch</code> 脚本（Python 标准库，每个子命令输出一个 JSON），这个脚本就是现在 drover CLI 的底子：
+            <ul>
+              <li><code>wt</code> 建 worktree，<code>deps</code> 独立装依赖，<code>agent-start</code> 起 claude / codex 并自动处理信任弹窗；</li>
+              <li><code>brief</code> 按固定模板拼任务书，<strong>完成证据必填</strong>；</li>
+              <li><code>watch</code> 在状态变化时输出 EVENT；</li>
+              <li><code>accept</code> 按证据验收：重跑验证命令，用 code-review-graph 建图看风险和没有测试覆盖的函数；</li>
+              <li>codex 复审（11-03 是必做，11-04 起改成带 <code>--review</code> 才做）；<code>history</code> 把历史派发记录当记忆。</li>
+            </ul>
+          </dd></div>
+          <div><dt class="e">效果</dt><dd>派发和验收标准化。“做完了”这三个字，从此要附证据。</dd></div>
+        </dl>
+      </div>
+    <!-- evo:4:begin -->
+    <figure class="fig evo">
+      <div class="canvas">
+      <svg class="dg w-evo" viewBox="0 0 900 490" role="img" aria-label="阶段 ④ 的架构演进图（drover 的前身 dispatch）：多出 bin/dispatch 脚本和任务目录。人跑 /dispatch，脚本建 worktree、装依赖、起 agent、发任务书、watch、accept；任务书带完成证据，agent 写报告。">
+        <defs>
+          <marker id="evm4n" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="evm-n"/></marker>
+          <marker id="evm4o" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="evm-o"/></marker>
+        </defs>
+        <rect x="14" y="320" width="152" height="72" rx="10" class="ev-g"/>
+        <rect x="14" y="420" width="152" height="60" rx="12" class="ev-g"/>
+        <rect x="700" y="20" width="180" height="70" rx="12" class="ev-g"/>
+        <rect x="200" y="20" width="180" height="70" rx="12" class="ev-g"/>
+        <rect x="480" y="20" width="200" height="70" rx="12" class="ev-g"/>
+        <rect x="216" y="436" width="428" height="44" rx="8" class="ev-g"/>
+        <rect x="680" y="436" width="200" height="44" rx="22" class="ev-g"/>
+        <rect x="14" y="112" width="152" height="100" rx="10" class="ev-g"/>
+        <rect x="200" y="236" width="680" height="124" rx="14" class="evf-o"/>
+        <text x="216" y="255" class="tm evt-o">herdr · workspace / tab / pane</text>
+        <rect x="216" y="266" width="208" height="80" rx="10" class="ev-o"/>
+        <text x="228" y="283" class="tm evt-o">pane</text>
+        <rect x="228" y="292" width="124" height="44" rx="8" class="ev-o"/>
+        <text x="290" y="312" text-anchor="middle" class="tl tb evt-o">agent</text>
+        <text x="290" y="328" text-anchor="middle" class="tm evt-o">claude / codex</text>
+        <rect x="356" y="303" width="64" height="22" rx="11" class="evchip-o"/>
+        <text x="388" y="318" text-anchor="middle" class="tm evt-o">working</text>
+        <path d="M320,346 V374" class="eva-o"/>
+        <rect x="436" y="266" width="208" height="80" rx="10" class="ev-o"/>
+        <text x="448" y="283" class="tm evt-o">pane</text>
+        <rect x="448" y="292" width="124" height="44" rx="8" class="ev-o"/>
+        <text x="510" y="312" text-anchor="middle" class="tl tb evt-o">agent</text>
+        <text x="510" y="328" text-anchor="middle" class="tm evt-o">claude / codex</text>
+        <rect x="576" y="303" width="64" height="22" rx="11" class="evchip-o"/>
+        <text x="608" y="318" text-anchor="middle" class="tm evt-o">blocked</text>
+        <path d="M540,346 V374" class="eva-o"/>
+        <rect x="656" y="266" width="208" height="80" rx="10" class="ev-o"/>
+        <text x="668" y="283" class="tm evt-o">pane</text>
+        <rect x="668" y="292" width="124" height="44" rx="8" class="ev-o"/>
+        <text x="730" y="312" text-anchor="middle" class="tl tb evt-o">agent</text>
+        <text x="730" y="328" text-anchor="middle" class="tm evt-o">claude / codex</text>
+        <rect x="796" y="303" width="64" height="22" rx="11" class="evchip-o"/>
+        <text x="828" y="318" text-anchor="middle" class="tm evt-o">done</text>
+        <path d="M760,346 V374" class="eva-o"/>
+        <rect x="216" y="376" width="208" height="42" rx="8" class="ev-o"/>
+        <text x="228" y="394" class="tm tb evt-o">git worktree</text>
+        <text x="228" y="411" class="ts evt-o">依赖在里面独立安装</text>
+        <rect x="436" y="376" width="208" height="42" rx="8" class="ev-o"/>
+        <text x="448" y="394" class="tm tb evt-o">git worktree</text>
+        <text x="448" y="411" class="ts evt-o">依赖在里面独立安装</text>
+        <rect x="656" y="376" width="208" height="42" rx="8" class="ev-o"/>
+        <text x="668" y="394" class="tm tb evt-o">git worktree</text>
+        <text x="668" y="411" class="ts evt-o">依赖在里面独立安装</text>
+        <rect x="14" y="24" width="152" height="56" rx="28" class="ev-o"/>
+        <text x="90" y="48" text-anchor="middle" class="tt evt-o">人</text>
+        <text x="90" y="67" text-anchor="middle" class="ts evt-c">跑 /dispatch、对结果</text>
+        <rect x="200" y="112" width="420" height="100" rx="10" class="ev-n"/>
+        <rect x="590" y="104" width="36" height="15" rx="7.5" class="ev-badge"/><text x="608" y="115" text-anchor="middle" class="ev-badge-t">NEW</text>
+        <text x="216" y="132" class="tmb evt-n">bin/dispatch</text>
+        <text x="216" y="151" class="tm evt-n">wt · deps · agent-start · brief · watch · accept</text>
+        <text x="216" y="168" class="tm evt-n">review · collect · history</text>
+        <rect x="650" y="112" width="230" height="100" rx="10" class="ev-n"/>
+        <rect x="850" y="104" width="36" height="15" rx="7.5" class="ev-badge"/><text x="868" y="115" text-anchor="middle" class="ev-badge-t">NEW</text>
+        <text x="666" y="132" class="tm tb evt-n">&lt;slug&gt;/ 任务目录</text>
+        <text x="666" y="151" class="tl evt-n">任务书（brief）+ 完成证据</text>
+        <text x="666" y="169" class="tm evt-n">&lt;agent&gt;.md 报告 · accept.json</text>
+        <text x="666" y="186" class="tm evt-n">dispatch.md 状态文件</text>
+        <path d="M620,162 H648" class="eva-n dash" marker-end="url(#evm4n)"/>
+        <path d="M410,212 V234" class="eva-n" marker-end="url(#evm4n)"/>
+        <text x="418" y="229" class="tm evt-c">herdr CLI</text>
+        <path d="M90,82 V160 H198" class="eva-n" marker-end="url(#evm4n)"/>
+        <text x="144" y="152" text-anchor="middle" class="tm evt-c">/dispatch</text>
+      </svg>
+      </div>
+      <p class="swipe">← 图比屏幕宽，可以左右滑动 →</p>
+      <figcaption><b>阶段 ④ 的架构。</b>drover 的前身 dispatch：多出 bin/dispatch 脚本和任务目录。人跑 /dispatch，脚本建 worktree、装依赖、起 agent、发任务书、watch、accept；任务书带完成证据，agent 写报告。</figcaption>
+    </figure>
+    <!-- evo:4:end -->
+    </article>
+
+    <!-- ⑤ -->
+    <article class="stage era3" id="stage-5">
+      <div class="stage-head">
+        <span class="stage-no" aria-hidden="true">5</span>
+        <div><h3>编排者</h3><p class="stage-date">11-03 · 11-04 细化、起名 drover</p></div>
+      </div>
+      <div class="stage-body">
+        <figure class="stage-fig">
+          <div class="img-box"><img src="images/06-orchestrator.jpg" loading="lazy" alt="阶段 ⑤ 插画：一个任务一个编排者，往上只交一页"></div>
+          <figcaption>阶段 ⑤：一个任务一个编排者，往上只交一页。</figcaption>
+        </figure>
+        <dl class="pce">
+          <div><dt class="p">卡在哪</dt><dd>所有任务都在主会话里分析、派发、验收，摸底、报告、验收输出很快把主会话的上下文撑满；人还是得看过程。</dd></div>
+          <div><dt class="c">怎么改</dt><dd>主会话只做路由、问答、转达（11-15 起加上审核，见 <a href="#stage-8">⑧</a>）。每个任务交给一个编排者（<code>drover orch-start</code>，在 herdr 的 <code>orch</code> workspace 里一个任务一个 tab），往上只交一页 <code>rollup.md</code>（不超过 40 行），不转贴 worker 的原始报告。11-04 起名 drover，派发脚本从此就是 drover CLI。</dd></div>
+          <div><dt class="e">效果</dt><dd>主会话和人只看一页汇报，只在要拍板时出场。</dd></div>
+        </dl>
+      </div>
+    <!-- evo:5:begin -->
+    <figure class="fig evo">
+      <div class="canvas">
+      <svg class="dg w-evo" viewBox="0 0 900 490" role="img" aria-label="阶段 ⑤ 的架构演进图：人只和主会话说话。主会话用 orch-start 起编排者，编排者往上只交 rollup.md；agent 成了编排者派出去的 worker，条目 worktree 用 integrate 归集到集成 worktree，整体检查后 push；派发脚本从这一步起叫 bin/drover。">
+        <defs>
+          <marker id="evm5n" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="evm-n"/></marker>
+          <marker id="evm5o" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="evm-o"/></marker>
+        </defs>
+        <rect x="14" y="320" width="152" height="72" rx="10" class="ev-g"/>
+        <rect x="14" y="420" width="152" height="60" rx="12" class="ev-g"/>
+        <rect x="700" y="20" width="180" height="70" rx="12" class="ev-g"/>
+        <rect x="14" y="112" width="152" height="100" rx="10" class="ev-g"/>
+        <rect x="200" y="236" width="680" height="124" rx="14" class="evf-o"/>
+        <text x="216" y="255" class="tm evt-o">herdr · workspace / tab / pane</text>
+        <rect x="216" y="266" width="208" height="80" rx="10" class="ev-o"/>
+        <text x="228" y="283" class="tm evt-o">pane</text>
+        <rect x="228" y="292" width="124" height="44" rx="8" class="ev-o"/>
+        <text x="290" y="312" text-anchor="middle" class="tl tb evt-c">worker</text>
+        <text x="290" y="328" text-anchor="middle" class="tm evt-o">claude / codex</text>
+        <rect x="356" y="303" width="64" height="22" rx="11" class="evchip-o"/>
+        <text x="388" y="318" text-anchor="middle" class="tm evt-o">working</text>
+        <path d="M320,346 V374" class="eva-o"/>
+        <rect x="436" y="266" width="208" height="80" rx="10" class="ev-o"/>
+        <text x="448" y="283" class="tm evt-o">pane</text>
+        <rect x="448" y="292" width="124" height="44" rx="8" class="ev-o"/>
+        <text x="510" y="312" text-anchor="middle" class="tl tb evt-c">worker</text>
+        <text x="510" y="328" text-anchor="middle" class="tm evt-o">claude / codex</text>
+        <rect x="576" y="303" width="64" height="22" rx="11" class="evchip-o"/>
+        <text x="608" y="318" text-anchor="middle" class="tm evt-o">blocked</text>
+        <path d="M540,346 V374" class="eva-o"/>
+        <rect x="656" y="266" width="208" height="80" rx="10" class="ev-o"/>
+        <text x="668" y="283" class="tm evt-o">pane</text>
+        <rect x="668" y="292" width="124" height="44" rx="8" class="ev-o"/>
+        <text x="730" y="312" text-anchor="middle" class="tl tb evt-c">worker</text>
+        <text x="730" y="328" text-anchor="middle" class="tm evt-o">claude / codex</text>
+        <rect x="796" y="303" width="64" height="22" rx="11" class="evchip-o"/>
+        <text x="828" y="318" text-anchor="middle" class="tm evt-o">done</text>
+        <path d="M760,346 V374" class="eva-o"/>
+        <rect x="216" y="376" width="208" height="42" rx="8" class="ev-o"/>
+        <text x="228" y="394" class="tm tb evt-c">task/&lt;slug&gt;-api</text>
+        <text x="228" y="411" class="ts evt-o">依赖在里面独立安装</text>
+        <rect x="436" y="376" width="208" height="42" rx="8" class="ev-o"/>
+        <text x="448" y="394" class="tm tb evt-c">task/&lt;slug&gt;-ui</text>
+        <text x="448" y="411" class="ts evt-o">依赖在里面独立安装</text>
+        <rect x="656" y="376" width="208" height="42" rx="8" class="ev-o"/>
+        <text x="668" y="394" class="tm tb evt-c">task/&lt;slug&gt;-docs</text>
+        <text x="668" y="411" class="ts evt-o">依赖在里面独立安装</text>
+        <rect x="14" y="24" width="152" height="56" rx="28" class="ev-o"/>
+        <text x="90" y="48" text-anchor="middle" class="tt evt-o">人</text>
+        <text x="90" y="67" text-anchor="middle" class="ts evt-c">提需求、看一页、拍板</text>
+        <rect x="200" y="112" width="420" height="100" rx="10" class="ev-o"/>
+        <text x="216" y="132" class="tmb evt-c">bin/drover</text>
+        <text x="216" y="151" class="tm evt-o">wt · deps · agent-start · brief · watch · accept</text>
+        <text x="216" y="168" class="tm evt-o">review · collect · history</text>
+        <text x="216" y="185" class="tm evt-c">+ orch-start · integrate · push · heavy</text>
+        <rect x="650" y="112" width="230" height="100" rx="10" class="ev-o"/>
+        <text x="666" y="132" class="tm tb evt-o">&lt;slug&gt;/ 任务目录</text>
+        <text x="666" y="151" class="tl evt-o">任务书（brief）+ 完成证据</text>
+        <text x="666" y="169" class="tm evt-o">&lt;agent&gt;.md 报告 · accept.json</text>
+        <text x="666" y="186" class="tm evt-o">dispatch.md 状态文件</text>
+        <text x="666" y="203" class="tm evt-c">request.md · rollup.md</text>
+        <path d="M620,162 H648" class="eva-o dash" marker-end="url(#evm5o)"/>
+        <path d="M410,212 V234" class="eva-o" marker-end="url(#evm5o)"/>
+        <text x="418" y="229" class="tm evt-o">herdr CLI</text>
+        <rect x="200" y="20" width="180" height="70" rx="12" class="ev-n"/>
+        <rect x="350" y="12" width="36" height="15" rx="7.5" class="ev-badge"/><text x="368" y="23" text-anchor="middle" class="ev-badge-t">NEW</text>
+        <text x="290" y="42" text-anchor="middle" class="tt evt-n">主会话</text>
+        <text x="290" y="59" text-anchor="middle" class="ts evt-n">路由 / 问答 / 转达</text>
+        <rect x="480" y="20" width="200" height="70" rx="12" class="ev-n"/>
+        <rect x="650" y="12" width="36" height="15" rx="7.5" class="ev-badge"/><text x="668" y="23" text-anchor="middle" class="ev-badge-t">NEW</text>
+        <text x="580" y="42" text-anchor="middle" class="tt evt-n">编排者</text>
+        <text x="580" y="59" text-anchor="middle" class="ts evt-n">拆条目 · 派发 · 验收 · 集成</text>
+        <path d="M166,44 H198" class="eva-n" marker-end="url(#evm5n)"/>
+        <text x="182" y="38" text-anchor="middle" class="ts evt-c">需求</text>
+        <path d="M200,64 H168" class="eva-n dash" marker-end="url(#evm5n)"/>
+        <text x="182" y="79" text-anchor="middle" class="ts evt-c">汇报</text>
+        <path d="M380,44 H478" class="eva-n" marker-end="url(#evm5n)"/>
+        <text x="429" y="38" text-anchor="middle" class="tm evt-c">orch-start</text>
+        <path d="M480,64 H382" class="eva-n dash" marker-end="url(#evm5n)"/>
+        <text x="429" y="79" text-anchor="middle" class="tm evt-c">rollup.md</text>
+        <path d="M580,90 V110" class="eva-n" marker-end="url(#evm5n)"/>
+        <rect x="216" y="436" width="428" height="44" rx="8" class="ev-n"/>
+        <rect x="228" y="428" width="36" height="15" rx="7.5" class="ev-badge"/><text x="246" y="439" text-anchor="middle" class="ev-badge-t">NEW</text>
+        <text x="232" y="454" class="tm tb evt-n">集成 worktree  task/&lt;slug&gt;</text>
+        <text x="232" y="472" class="ts evt-n">integrate 归集各条目 · 整体检查一次 · 迁移</text>
+        <path d="M320,418 V434" class="eva-n" marker-end="url(#evm5n)"/>
+        <path d="M540,418 V434" class="eva-n" marker-end="url(#evm5n)"/>
+        <path d="M760,418 L638,434" class="eva-n" marker-end="url(#evm5n)"/>
+        <rect x="680" y="436" width="200" height="44" rx="22" class="ev-n"/>
+        <rect x="850" y="428" width="36" height="15" rx="7.5" class="ev-badge"/><text x="868" y="439" text-anchor="middle" class="ev-badge-t">NEW</text>
+        <text x="780" y="463" text-anchor="middle" class="tm evt-n">origin/&lt;上游&gt;</text>
+        <path d="M644,458 H678" class="eva-n" marker-end="url(#evm5n)"/>
+        <text x="661" y="451" text-anchor="middle" class="tm evt-c">push</text>
+      </svg>
+      </div>
+      <p class="swipe">← 图比屏幕宽，可以左右滑动 →</p>
+      <figcaption><b>阶段 ⑤ 的架构。</b>人只和主会话说话。主会话用 orch-start 起编排者，编排者往上只交 rollup.md；agent 成了编排者派出去的 worker，条目 worktree 用 integrate 归集到集成 worktree，整体检查后 push。脚本这一步起叫 bin/drover（赤陶色）。</figcaption>
+    </figure>
+    <!-- evo:5:end -->
+      <div class="refine">
+        <h4>11-04：同一阶段的细化</h4>
+        <dl class="pce">
+          <div><dt class="p">卡在哪</dt><dd>
+            <ul>
+              <li>复述落在 worker 开工之后：第一次按编排者模式派发时，复述写在 rollup 的“当前进度”里，主会话转给用户时，worker 已经开工两分钟。</li>
+              <li>一个仓库的多条需求排队串行：一批五条需求按“每仓库一个 worktree”只开了两个，其余排队。</li>
+              <li>全量测试在多个 worktree 里同时跑，把机器打满，用例超时。</li>
+            </ul>
+          </dd></div>
+          <div><dt class="c">怎么改</dt><dd>
+            <ul>
+              <li><strong>复述不等确认</strong>：主会话第一条回复就复述目标，这段目标写进每份任务书和最终汇报的开头。</li>
+              <li><strong>条目并行 + 集成 worktree</strong>：一个条目一个 agent 一个 worktree，同时派发；每个仓库一个编排者的集成 worktree，统一归集、同步上游、整体检查、推送。</li>
+              <li><strong>子编排者</strong>：某个仓库活太多时 <code>orch-start --parent</code>，它也只交 rollup。</li>
+              <li><code>heavy</code> 重命令排队锁（11-18 起改成按资源调度，见<a href="#ending">结尾</a>）；<code>accept --verify-baseline</code> 和基线比失败集合；<code>watch</code> 认出“agent 在等后台命令”（<code>waiting-background</code>）。</li>
+            </ul>
+          </dd></div>
+          <div><dt class="e">效果</dt><dd>同一个仓库的多条需求也能并行；全量测试只跑一次；不再把“在等后台命令”误当成做完。</dd></div>
+        </dl>
+      </div>
+      <p class="small">11-05 起，主会话和编排者也能跑在 Codex 里（<code>orch-start --kind codex</code>）：流程正文只写一份，宿主不同的做法见<a href="#hosts">宿主差异</a>；CLI 同时多了 <code>orch-status</code> 和 <code>watch --until-event</code>，给没有 Monitor 的宿主用。</p>
+      <aside class="bark"><b>汪</b><span>我负责在山谷里跑腿，你只看我交上来的那一页。那页纸第一行永远是你要做成的事，免得你忘了当初为什么派我下去。</span></aside>
+    </article>
+
+    <!-- ⑥ -->
+    <article class="stage era3" id="stage-6">
+      <div class="stage-head">
+        <span class="stage-no" aria-hidden="true">6</span>
+        <div><h3>打包分享</h3><p class="stage-date">11-06</p></div>
+      </div>
+      <div class="stage-body solo">
+        <dl class="pce">
+          <div><dt class="p">卡在哪</dt><dd>只在作者本机能用：脚本、流程、路由规则散在好几个目录里，有的路径写死。</dd></div>
+          <div><dt class="c">怎么改</dt><dd>独立包 <code>drover</code>：一条 <code>./install.sh</code> 入口（先查 git、python3，缺 herdr 时可以替你装），后面是 <code>install.py</code>（Claude Code / Codex，link / copy）、README 和这份文档。CLI 从 <code>~/.drover/config.json</code> 读主工作台和仓库目录，不再写死本机路径。打包时名字也统一了：入口都叫 drover（<code>/drover</code>、<code>$drover</code>、<code>~/.drover/bin/drover</code>），装好的东西都在 <code>~/.drover/</code> 下，herdr 里放编排者的 workspace 叫 <code>orch</code>。</dd></div>
+          <div><dt class="e">效果</dt><dd>别人 clone 下来就能装。瓶颈从“只有一个人会用”变成“谁都能用”。</dd></div>
+        </dl>
+      </div>
+    <!-- evo:6:begin -->
+    <figure class="fig evo">
+      <div class="canvas">
+      <svg class="dg w-evo" viewBox="0 0 900 490" role="img" aria-label="阶段 ⑥ 的架构演进图：多出 drover 包：./install.sh 先查 git、python3，再交给 install.py，把 CLI、流程正文、技能、权限、路由规则装到位，别人 clone 下来就能用。">
+        <defs>
+          <marker id="evm6n" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="evm-n"/></marker>
+          <marker id="evm6o" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="evm-o"/></marker>
+        </defs>
+        <rect x="14" y="320" width="152" height="72" rx="10" class="ev-g"/>
+        <rect x="14" y="420" width="152" height="60" rx="12" class="ev-g"/>
+        <rect x="700" y="20" width="180" height="70" rx="12" class="ev-g"/>
+        <rect x="200" y="236" width="680" height="124" rx="14" class="evf-o"/>
+        <text x="216" y="255" class="tm evt-o">herdr · workspace / tab / pane</text>
+        <rect x="216" y="266" width="208" height="80" rx="10" class="ev-o"/>
+        <text x="228" y="283" class="tm evt-o">pane</text>
+        <rect x="228" y="292" width="124" height="44" rx="8" class="ev-o"/>
+        <text x="290" y="312" text-anchor="middle" class="tl tb evt-o">worker</text>
+        <text x="290" y="328" text-anchor="middle" class="tm evt-o">claude / codex</text>
+        <rect x="356" y="303" width="64" height="22" rx="11" class="evchip-o"/>
+        <text x="388" y="318" text-anchor="middle" class="tm evt-o">working</text>
+        <path d="M320,346 V374" class="eva-o"/>
+        <rect x="436" y="266" width="208" height="80" rx="10" class="ev-o"/>
+        <text x="448" y="283" class="tm evt-o">pane</text>
+        <rect x="448" y="292" width="124" height="44" rx="8" class="ev-o"/>
+        <text x="510" y="312" text-anchor="middle" class="tl tb evt-o">worker</text>
+        <text x="510" y="328" text-anchor="middle" class="tm evt-o">claude / codex</text>
+        <rect x="576" y="303" width="64" height="22" rx="11" class="evchip-o"/>
+        <text x="608" y="318" text-anchor="middle" class="tm evt-o">blocked</text>
+        <path d="M540,346 V374" class="eva-o"/>
+        <rect x="656" y="266" width="208" height="80" rx="10" class="ev-o"/>
+        <text x="668" y="283" class="tm evt-o">pane</text>
+        <rect x="668" y="292" width="124" height="44" rx="8" class="ev-o"/>
+        <text x="730" y="312" text-anchor="middle" class="tl tb evt-o">worker</text>
+        <text x="730" y="328" text-anchor="middle" class="tm evt-o">claude / codex</text>
+        <rect x="796" y="303" width="64" height="22" rx="11" class="evchip-o"/>
+        <text x="828" y="318" text-anchor="middle" class="tm evt-o">done</text>
+        <path d="M760,346 V374" class="eva-o"/>
+        <rect x="216" y="376" width="208" height="42" rx="8" class="ev-o"/>
+        <text x="228" y="394" class="tm tb evt-o">task/&lt;slug&gt;-api</text>
+        <text x="228" y="411" class="ts evt-o">依赖在里面独立安装</text>
+        <rect x="436" y="376" width="208" height="42" rx="8" class="ev-o"/>
+        <text x="448" y="394" class="tm tb evt-o">task/&lt;slug&gt;-ui</text>
+        <text x="448" y="411" class="ts evt-o">依赖在里面独立安装</text>
+        <rect x="656" y="376" width="208" height="42" rx="8" class="ev-o"/>
+        <text x="668" y="394" class="tm tb evt-o">task/&lt;slug&gt;-docs</text>
+        <text x="668" y="411" class="ts evt-o">依赖在里面独立安装</text>
+        <rect x="14" y="24" width="152" height="56" rx="28" class="ev-o"/>
+        <text x="90" y="48" text-anchor="middle" class="tt evt-o">人</text>
+        <text x="90" y="67" text-anchor="middle" class="ts evt-o">提需求、看一页、拍板</text>
+        <rect x="200" y="112" width="420" height="100" rx="10" class="ev-o"/>
+        <text x="216" y="132" class="tmb evt-o">bin/drover</text>
+        <text x="216" y="151" class="tm evt-o">wt · deps · agent-start · brief · watch · accept</text>
+        <text x="216" y="168" class="tm evt-o">review · collect · history</text>
+        <text x="216" y="185" class="tm evt-o">+ orch-start · integrate · push · heavy</text>
+        <text x="216" y="202" class="tm evt-o">+ orch-status · watch --until-event</text>
+        <rect x="650" y="112" width="230" height="100" rx="10" class="ev-o"/>
+        <text x="666" y="132" class="tm tb evt-o">&lt;slug&gt;/ 任务目录</text>
+        <text x="666" y="151" class="tl evt-o">任务书（brief）+ 完成证据</text>
+        <text x="666" y="169" class="tm evt-o">&lt;agent&gt;.md 报告 · accept.json</text>
+        <text x="666" y="186" class="tm evt-o">dispatch.md 状态文件</text>
+        <text x="666" y="203" class="tm evt-o">request.md · rollup.md</text>
+        <path d="M620,162 H648" class="eva-o dash" marker-end="url(#evm6o)"/>
+        <path d="M410,212 V234" class="eva-o" marker-end="url(#evm6o)"/>
+        <text x="418" y="229" class="tm evt-o">herdr CLI</text>
+        <rect x="200" y="20" width="180" height="70" rx="12" class="ev-o"/>
+        <text x="290" y="42" text-anchor="middle" class="tt evt-o">主会话</text>
+        <text x="290" y="59" text-anchor="middle" class="ts evt-o">路由 / 问答 / 转达</text>
+        <rect x="480" y="20" width="200" height="70" rx="12" class="ev-o"/>
+        <text x="580" y="42" text-anchor="middle" class="tt evt-o">编排者</text>
+        <text x="580" y="59" text-anchor="middle" class="ts evt-o">拆条目 · 派发 · 验收 · 集成</text>
+        <path d="M166,44 H198" class="eva-o" marker-end="url(#evm6o)"/>
+        <text x="182" y="38" text-anchor="middle" class="ts evt-o">需求</text>
+        <path d="M200,64 H168" class="eva-o dash" marker-end="url(#evm6o)"/>
+        <text x="182" y="79" text-anchor="middle" class="ts evt-o">汇报</text>
+        <path d="M380,44 H478" class="eva-o" marker-end="url(#evm6o)"/>
+        <text x="429" y="38" text-anchor="middle" class="tm evt-o">orch-start</text>
+        <path d="M480,64 H382" class="eva-o dash" marker-end="url(#evm6o)"/>
+        <text x="429" y="79" text-anchor="middle" class="tm evt-o">rollup.md</text>
+        <path d="M580,90 V110" class="eva-o" marker-end="url(#evm6o)"/>
+        <rect x="216" y="436" width="428" height="44" rx="8" class="ev-o"/>
+        <text x="232" y="454" class="tm tb evt-o">集成 worktree  task/&lt;slug&gt;</text>
+        <text x="232" y="472" class="ts evt-o">integrate 归集各条目 · 整体检查一次 · 迁移</text>
+        <path d="M320,418 V434" class="eva-o" marker-end="url(#evm6o)"/>
+        <path d="M540,418 V434" class="eva-o" marker-end="url(#evm6o)"/>
+        <path d="M760,418 L638,434" class="eva-o" marker-end="url(#evm6o)"/>
+        <rect x="680" y="436" width="200" height="44" rx="22" class="ev-o"/>
+        <text x="780" y="463" text-anchor="middle" class="tm evt-o">origin/&lt;上游&gt;</text>
+        <path d="M644,458 H678" class="eva-o" marker-end="url(#evm6o)"/>
+        <text x="661" y="451" text-anchor="middle" class="tm evt-o">push</text>
+        <rect x="14" y="112" width="152" height="100" rx="10" class="ev-n"/>
+        <rect x="136" y="104" width="36" height="15" rx="7.5" class="ev-badge"/><text x="154" y="115" text-anchor="middle" class="ev-badge-t">NEW</text>
+        <text x="90" y="134" text-anchor="middle" class="tl tb evt-n">drover 包</text>
+        <text x="90" y="154" text-anchor="middle" class="tm evt-n">./install.sh</text>
+        <text x="90" y="172" text-anchor="middle" class="tm evt-n">→ install.py</text>
+        <text x="90" y="190" text-anchor="middle" class="tm evt-n">link / copy</text>
+        <path d="M166,162 H198" class="eva-n dash" marker-end="url(#evm6n)"/>
+      </svg>
+      </div>
+      <p class="swipe">← 图比屏幕宽，可以左右滑动 →</p>
+      <figcaption><b>阶段 ⑥ 的架构。</b>多出 drover 包：./install.sh 先查 git、python3，再交给 install.py，把 CLI、流程正文、技能、权限、路由规则装到位，别人 clone 下来就能用。</figcaption>
+    </figure>
+    <!-- evo:6:end -->
+      <div class="refine">
+        <h4>11-06 晚到 11-08 上午：跑起来才发现的毛刺</h4>
+        <dl class="pce">
+          <div><dt class="p">卡在哪</dt><dd>
+            <ul>
+              <li>确认框漏报：11-06 一个 worker 连着弹两个确认，编排者批完第一个，第二个没人管，三次各空等 10～24 分钟；编排者挂着 Monitor 盯 worker 时写完“完成”，主会话这边只看到 <code>waiting-background</code>，也漏了。</li>
+              <li>11-07 一个编排者派的后台 Explore 子 agent 弹出确认框，主 agent 停在 “Waiting for 1 background agent to finish”，herdr 按这一行报 working，确认框一直没人管，直到用户自己在 pane 里看到。</li>
+              <li><code>cd &lt;目录&gt; &amp;&amp; git …</code> 会触发 Claude Code 内置的强制确认：不走白名单、没有 “don't ask again”，每条都要人批。子代理看不到规则，最爱这么写。</li>
+              <li>收尾只清理、不汇总：要部署的时候，还得一个个任务去翻改了哪些配置、推了哪个提交。</li>
+            </ul>
+          </dd></div>
+          <div><dt class="c">怎么改</dt><dd>
+            <ul>
+              <li><strong>watch 不再漏报</strong>（11-06 晚）：同一状态下 herdr 的序号变了、或者弹框换了就重报；WebFetch 域名授权弹框被 herdr 报成 done 时按屏幕改报 blocked；编排者另报一行 <code>rollup:&lt;状态&gt;</code>；<code>api-error</code> 只认最后一个输出块。</li>
+              <li><strong>收尾先汇总、再清理</strong>（11-07）：<code>drover wrapup</code> 收集推送记录、远端核对、迁移和配置文件、整体检查结果，编排者补全成 <code>wrapup.md</code> 再清理；几个任务一起收尾，主会话合成一张总表。</li>
+              <li><strong>后台子 agent 的确认框</strong>（11-08）：watch 在 working 时也每 10 秒看一次屏幕，底部是确认框就报 blocked，子 agent 连着弹的每一个都报；<code>orch-status</code> 多了按屏幕修正的 <code>screen_status</code> 和顶层的 <code>blocked</code> 列表。</li>
+              <li><strong>从源头少弹</strong>（11-08）：install 往 <code>~/.claude/settings.json</code> 加一个 PreToolUse hook，拦下 <code>cd … &amp;&amp; git …</code>，把 <code>git -C &lt;目录&gt; …</code> 的改法回给 agent，让它自己改写重试；对子代理也生效，hook 自己出错一律放行。</li>
+            </ul>
+          </dd></div>
+          <div><dt class="e">效果</dt><dd>确认框不再漏批，也少弹了一类没法加白名单的；收尾时拿到一张照着就能部署的表。</dd></div>
+        </dl>
+      </div>
+    </article>
+
+    <!-- ⑦ -->
+    <article class="stage era3" id="stage-7">
+      <div class="stage-head">
+        <span class="stage-no" aria-hidden="true">7</span>
+        <div><h3>离开电脑：飞书 oncall</h3><p class="stage-date">11-08</p></div>
+      </div>
+      <div class="stage-body">
+        <figure class="stage-fig">
+          <div class="img-box"><img src="images/12-oncall.jpg" width="1600" height="900" loading="lazy" alt="阶段 ⑦ 插画：离开电脑，飞书 oncall。左边办公室里机器牧羊犬就地批掉小机器人的请求，开发者的工位空着，主会话坐在控制台前；一条细线从控制台连到右边咖啡馆露台上开发者的手机，手机上是一张带两个按钮的卡片"></div>
+          <figcaption>阶段 ⑦：人去了咖啡馆，工位空着。小机器人的请求由牧羊犬（编排者）就地批掉，只有主会话那一条线连到你的手机，推来一张带按钮的卡片。画里没画的：编排者和 worker 卡太久没人批，也会升级到你。</figcaption>
+        </figure>
+        <dl class="pce">
+          <div><dt class="p">卡在哪</dt><dd>拍板只能守在电脑前：人一走开，编排者“等你决定”就停着，主会话的确认框也没人点。以前单独装过 herdr-oncall 插件，可它谁弹框都推、每轮回答都推，2 小时 58 条，一大半本来有人接。</dd></div>
+          <div><dt class="c">怎么改</dt><dd>
+            <ul>
+              <li><strong>装 drover 时顺带装上</strong>：install 从 GitHub 装 herdr-oncall 插件（现在是选装，装的时候加 <code>--oncall</code>），在插件配置目录写一个 <code>drover.env</code>；在终端里装完当场问一句要不要用飞书扫码配对。</li>
+              <li><strong>按角色推</strong>：主会话在 herdr 里登记成 <code>drover</code>，插件只在主会话需要你时推：它的确认框、你在飞书里提问的那一轮的回答、以 <code>【转达】</code> 开头的转达。编排者和 worker 的确认框由上一层批，卡 5 / 10 分钟没人批才升级到你。</li>
+              <li><strong>飞书就是主会话的遥控器</strong>：不引用直接发的消息，加上 <code>[飞书] </code> 前缀送进主会话，和你在终端里说的话一样处理。</li>
+              <li><strong>图片也能发</strong>（11-18 补上）：飞书里发给主会话的纯图片、图文消息，图片存到 <code>~/.drover/oncall-images</code>，在原来的位置换成一行 <code>[图片] &lt;本机路径&gt;</code> 和文字一起送进去，主会话自己打开看。</li>
+            </ul>
+          </dd></div>
+          <div><dt class="e">效果</dt><dd>离开电脑也能派活、问进度、拍板，手机只响该你的事。联调后定的分寸：飞书用来接收审批和下达命令，不是把所有对话都转一遍。细节见<a href="#oncall">离开电脑</a>一节。</dd></div>
+        </dl>
+      </div>
+    <!-- evo:7:begin -->
+    <figure class="fig evo">
+      <div class="canvas">
+      <svg class="dg w-evo" viewBox="0 0 900 490" role="img" aria-label="阶段 ⑦ 的架构演进图：多出 herdr-oncall 插件和你的飞书。插件按 herdr 里的名字认角色，主会话叫 drover；只在主会话需要你时推到飞书，编排者和 worker 卡久了才升级；你在飞书里直接发的消息加上 [飞书] 前缀送进主会话。CLI 多了 oncall 和 main-register。">
+        <defs>
+          <marker id="evm7n" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="evm-n"/></marker>
+          <marker id="evm7o" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="evm-o"/></marker>
+        </defs>
+        <rect x="700" y="20" width="180" height="70" rx="12" class="ev-g"/>
+        <rect x="200" y="236" width="680" height="124" rx="14" class="evf-o"/>
+        <text x="216" y="255" class="tm evt-o">herdr · workspace / tab / pane</text>
+        <rect x="216" y="266" width="208" height="80" rx="10" class="ev-o"/>
+        <text x="228" y="283" class="tm evt-o">pane</text>
+        <rect x="228" y="292" width="124" height="44" rx="8" class="ev-o"/>
+        <text x="290" y="312" text-anchor="middle" class="tl tb evt-o">worker</text>
+        <text x="290" y="328" text-anchor="middle" class="tm evt-o">claude / codex</text>
+        <rect x="356" y="303" width="64" height="22" rx="11" class="evchip-o"/>
+        <text x="388" y="318" text-anchor="middle" class="tm evt-o">working</text>
+        <path d="M320,346 V374" class="eva-o"/>
+        <rect x="436" y="266" width="208" height="80" rx="10" class="ev-o"/>
+        <text x="448" y="283" class="tm evt-o">pane</text>
+        <rect x="448" y="292" width="124" height="44" rx="8" class="ev-o"/>
+        <text x="510" y="312" text-anchor="middle" class="tl tb evt-o">worker</text>
+        <text x="510" y="328" text-anchor="middle" class="tm evt-o">claude / codex</text>
+        <rect x="576" y="303" width="64" height="22" rx="11" class="evchip-o"/>
+        <text x="608" y="318" text-anchor="middle" class="tm evt-o">blocked</text>
+        <path d="M540,346 V374" class="eva-o"/>
+        <rect x="656" y="266" width="208" height="80" rx="10" class="ev-o"/>
+        <text x="668" y="283" class="tm evt-o">pane</text>
+        <rect x="668" y="292" width="124" height="44" rx="8" class="ev-o"/>
+        <text x="730" y="312" text-anchor="middle" class="tl tb evt-o">worker</text>
+        <text x="730" y="328" text-anchor="middle" class="tm evt-o">claude / codex</text>
+        <rect x="796" y="303" width="64" height="22" rx="11" class="evchip-o"/>
+        <text x="828" y="318" text-anchor="middle" class="tm evt-o">done</text>
+        <path d="M760,346 V374" class="eva-o"/>
+        <rect x="216" y="376" width="208" height="42" rx="8" class="ev-o"/>
+        <text x="228" y="394" class="tm tb evt-o">task/&lt;slug&gt;-api</text>
+        <text x="228" y="411" class="ts evt-o">依赖在里面独立安装</text>
+        <rect x="436" y="376" width="208" height="42" rx="8" class="ev-o"/>
+        <text x="448" y="394" class="tm tb evt-o">task/&lt;slug&gt;-ui</text>
+        <text x="448" y="411" class="ts evt-o">依赖在里面独立安装</text>
+        <rect x="656" y="376" width="208" height="42" rx="8" class="ev-o"/>
+        <text x="668" y="394" class="tm tb evt-o">task/&lt;slug&gt;-docs</text>
+        <text x="668" y="411" class="ts evt-o">依赖在里面独立安装</text>
+        <rect x="14" y="24" width="152" height="56" rx="28" class="ev-o"/>
+        <text x="90" y="48" text-anchor="middle" class="tt evt-o">人</text>
+        <text x="90" y="67" text-anchor="middle" class="ts evt-o">提需求、看一页、拍板</text>
+        <rect x="200" y="112" width="420" height="100" rx="10" class="ev-o"/>
+        <text x="216" y="132" class="tmb evt-o">bin/drover</text>
+        <text x="216" y="151" class="tm evt-o">wt · deps · agent-start · brief · watch · accept</text>
+        <text x="216" y="168" class="tm evt-o">review · collect · history<tspan class="evt-c">  + oncall · main-register</tspan></text>
+        <text x="216" y="185" class="tm evt-o">+ orch-start · integrate · push · heavy</text>
+        <text x="216" y="202" class="tm evt-o">+ orch-status · watch --until-event</text>
+        <rect x="650" y="112" width="230" height="100" rx="10" class="ev-o"/>
+        <text x="666" y="132" class="tm tb evt-o">&lt;slug&gt;/ 任务目录</text>
+        <text x="666" y="151" class="tl evt-o">任务书（brief）+ 完成证据</text>
+        <text x="666" y="169" class="tm evt-o">&lt;agent&gt;.md 报告 · accept.json</text>
+        <text x="666" y="186" class="tm evt-o">dispatch.md 状态文件</text>
+        <text x="666" y="203" class="tm evt-o">request.md · rollup.md</text>
+        <path d="M620,162 H648" class="eva-o dash" marker-end="url(#evm7o)"/>
+        <path d="M410,212 V234" class="eva-o" marker-end="url(#evm7o)"/>
+        <text x="418" y="229" class="tm evt-o">herdr CLI</text>
+        <rect x="200" y="20" width="180" height="70" rx="12" class="ev-o"/>
+        <text x="290" y="42" text-anchor="middle" class="tt evt-o">主会话<tspan class="tm evt-c"> · drover</tspan></text>
+        <text x="290" y="59" text-anchor="middle" class="ts evt-o">路由 / 问答 / 转达</text>
+        <rect x="480" y="20" width="200" height="70" rx="12" class="ev-o"/>
+        <text x="580" y="42" text-anchor="middle" class="tt evt-o">编排者</text>
+        <text x="580" y="59" text-anchor="middle" class="ts evt-o">拆条目 · 派发 · 验收 · 集成</text>
+        <path d="M166,44 H198" class="eva-o" marker-end="url(#evm7o)"/>
+        <text x="182" y="38" text-anchor="middle" class="ts evt-o">需求</text>
+        <path d="M200,64 H168" class="eva-o dash" marker-end="url(#evm7o)"/>
+        <text x="182" y="79" text-anchor="middle" class="ts evt-o">汇报</text>
+        <path d="M380,44 H478" class="eva-o" marker-end="url(#evm7o)"/>
+        <text x="429" y="38" text-anchor="middle" class="tm evt-o">orch-start</text>
+        <path d="M480,64 H382" class="eva-o dash" marker-end="url(#evm7o)"/>
+        <text x="429" y="79" text-anchor="middle" class="tm evt-o">rollup.md</text>
+        <path d="M580,90 V110" class="eva-o" marker-end="url(#evm7o)"/>
+        <rect x="216" y="436" width="428" height="44" rx="8" class="ev-o"/>
+        <text x="232" y="454" class="tm tb evt-o">集成 worktree  task/&lt;slug&gt;</text>
+        <text x="232" y="472" class="ts evt-o">integrate 归集各条目 · 整体检查一次 · 迁移</text>
+        <path d="M320,418 V434" class="eva-o" marker-end="url(#evm7o)"/>
+        <path d="M540,418 V434" class="eva-o" marker-end="url(#evm7o)"/>
+        <path d="M760,418 L638,434" class="eva-o" marker-end="url(#evm7o)"/>
+        <rect x="680" y="436" width="200" height="44" rx="22" class="ev-o"/>
+        <text x="780" y="463" text-anchor="middle" class="tm evt-o">origin/&lt;上游&gt;</text>
+        <path d="M644,458 H678" class="eva-o" marker-end="url(#evm7o)"/>
+        <text x="661" y="451" text-anchor="middle" class="tm evt-o">push</text>
+        <rect x="14" y="112" width="152" height="100" rx="10" class="ev-o"/>
+        <text x="90" y="134" text-anchor="middle" class="tl tb evt-o">drover 包</text>
+        <text x="90" y="154" text-anchor="middle" class="tm evt-o">./install.sh</text>
+        <text x="90" y="172" text-anchor="middle" class="tm evt-o">→ install.py</text>
+        <text x="90" y="190" text-anchor="middle" class="tm evt-o">link / copy</text>
+        <path d="M166,162 H198" class="eva-o dash" marker-end="url(#evm7o)"/>
+        <rect x="14" y="320" width="152" height="72" rx="10" class="ev-n"/>
+        <rect x="136" y="312" width="36" height="15" rx="7.5" class="ev-badge"/><text x="154" y="323" text-anchor="middle" class="ev-badge-t">NEW</text>
+        <text x="90" y="342" text-anchor="middle" class="tl tb evt-n">herdr-oncall 插件</text>
+        <text x="90" y="361" text-anchor="middle" class="tm evt-n">drover.env</text>
+        <text x="90" y="380" text-anchor="middle" class="ts evt-n">只为主会话推</text>
+        <rect x="14" y="420" width="152" height="60" rx="12" class="ev-n"/>
+        <rect x="136" y="412" width="36" height="15" rx="7.5" class="ev-badge"/><text x="154" y="423" text-anchor="middle" class="ev-badge-t">NEW</text>
+        <text x="90" y="444" text-anchor="middle" class="tl tb evt-n">你的飞书</text>
+        <text x="90" y="464" text-anchor="middle" class="ts evt-n">【转达】· 卡片按钮</text>
+        <path d="M166,330 H182 V86 H198" class="eva-n" marker-start="url(#evm7n)" marker-end="url(#evm7n)"/>
+        <text x="174" y="262" text-anchor="end" class="ts evt-c">[飞书] 消息 ↑</text>
+        <text x="174" y="280" text-anchor="end" class="ts evt-c">↓ 确认框 · 【转达】</text>
+        <path d="M166,352 H198" class="eva-n dash" marker-end="url(#evm7n)" marker-start="url(#evm7n)"/>
+        <path d="M90,392 V418" class="eva-n" marker-start="url(#evm7n)" marker-end="url(#evm7n)"/>
+      </svg>
+      </div>
+      <p class="swipe">← 图比屏幕宽，可以左右滑动 →</p>
+      <figcaption><b>阶段 ⑦ 的架构。</b>多出 herdr-oncall 插件和你的飞书。插件按 herdr 里的名字认角色（主会话登记成 <code>drover</code>，赤陶色），只在主会话需要你时推：确认框、飞书提问那一轮的回答、以 <code>【转达】</code> 开头的转达；虚线是它盯着 herdr 里的编排者和 worker，卡 5 / 10 分钟没人批才升级。你在飞书里直接发的消息加上 <code>[飞书] </code> 前缀送进主会话。CLI 多了 <code>oncall</code>（配对、开关、看状态）和 <code>main-register</code>（登记主会话）。</figcaption>
+    </figure>
+    <!-- evo:7:end -->
+    </article>
+
+    <!-- ⑧ -->
+    <article class="stage era3" id="stage-8">
+      <div class="stage-head">
+        <span class="stage-no" aria-hidden="true">8</span>
+        <div><h3>结论先过审</h3><p class="stage-date">11-11 根治三问 · 11-15 转达前先审、证据有定义 · 11-16 现象要带原因</p></div>
+      </div>
+      <div class="stage-body solo">
+        <dl class="pce">
+          <div><dt class="p">卡在哪</dt><dd>
+            <ul>
+              <li>修 bug 改在了症状上：11-11 复盘 5 个案例，都是在问题显现的地方加判断、特例、兜底，没改在产生问题的那一层。</li>
+              <li>主会话成了传声筒：转达编排者的方案时没审就附和，否决理由、对外部服务行为的断言都是用户追问之后才去核实，结果被推翻。</li>
+              <li>只有现象没有原因：一个结论只写了问题在哪一层、没说为什么，主会话也照转了；那次的探针只试了一种写法就下了结论，官方文档一查就有原因。还有一个识别类任务，把 AI 自己的逐项核对当成结论转给了用户。</li>
+            </ul>
+            一句话：结论对不对，最后还得人一条条追问。
+          </dd></div>
+          <div><dt class="c">怎么改</dt><dd>
+            <ul>
+              <li><strong>根治三问</strong>（11-11）：①应该怎样：从用户目标和这件事本身推，不从现有实现推；②哪一层偏了：问题在哪一层产生、为什么，给证据；③改在哪：改在产生的那一层，能删不加，能复用现有链路就不新建。写进计划、任务书、摸底、验收和 rollup。</li>
+              <li><strong>证据有定义</strong>（11-15、11-16）：事实所在那一层的代码（文件:行）或实测；外部平台查官方文档。注释、命名、调用方那一侧的代码、别人的报告、记忆都只算线索。一两次查询能核实的先核实；现象要连原因一起写。</li>
+              <li><strong>主会话转达前先审</strong>（11-15）：对照 rollup 里的“应该怎样 / 根因 / 依据 / 读过的仓库”看四件事：证据够不够；链路经过的仓库都读过没有；否决理由是核实过的事实，不是“要跨仓”“改动大”这类代价；“应该怎样”是不是从目标推出来的。哪条不过，就用 <code>drover prompt</code> 打回编排者补；打回两轮还不过才转给你，并写明哪几条没核实。</li>
+              <li><strong>识别类结果只算初步</strong>（11-16）：OCR、识图、转写，AI 自己的核对标成初步，原件和识别原文一起给你，由你对照原件核对。</li>
+            </ul>
+          </dd></div>
+          <div><dt class="e">效果</dt><dd>到你手里的结论先过了主会话这一关，依据就写在里面，不用再一条条追问“为什么”。真要追问了，说明主会话漏审，它会打回编排者补。</dd></div>
+        </dl>
+      </div>
+    <!-- evo:8:begin -->
+    <figure class="fig evo">
+      <div class="canvas">
+      <svg class="dg w-evo" viewBox="0 0 900 490" role="img" aria-label="阶段 ⑧ 的架构演进图：没有新部件，改的是标签。主会话从路由、问答、转达变成路由、问答、审核、转达；编排者交上来的 rollup 带着应该怎样、根因和依据，依据不够主会话就打回去补；人只拍板，不用追问依据。">
+        <defs>
+          <marker id="evm8n" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="evm-n"/></marker>
+          <marker id="evm8o" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="evm-o"/></marker>
+        </defs>
+        <rect x="700" y="20" width="180" height="70" rx="12" class="ev-g"/>
+        <rect x="200" y="236" width="680" height="124" rx="14" class="evf-o"/>
+        <text x="216" y="255" class="tm evt-o">herdr · workspace / tab / pane</text>
+        <rect x="216" y="266" width="208" height="80" rx="10" class="ev-o"/>
+        <text x="228" y="283" class="tm evt-o">pane</text>
+        <rect x="228" y="292" width="124" height="44" rx="8" class="ev-o"/>
+        <text x="290" y="312" text-anchor="middle" class="tl tb evt-o">worker</text>
+        <text x="290" y="328" text-anchor="middle" class="tm evt-o">claude / codex</text>
+        <rect x="356" y="303" width="64" height="22" rx="11" class="evchip-o"/>
+        <text x="388" y="318" text-anchor="middle" class="tm evt-o">working</text>
+        <path d="M320,346 V374" class="eva-o"/>
+        <rect x="436" y="266" width="208" height="80" rx="10" class="ev-o"/>
+        <text x="448" y="283" class="tm evt-o">pane</text>
+        <rect x="448" y="292" width="124" height="44" rx="8" class="ev-o"/>
+        <text x="510" y="312" text-anchor="middle" class="tl tb evt-o">worker</text>
+        <text x="510" y="328" text-anchor="middle" class="tm evt-o">claude / codex</text>
+        <rect x="576" y="303" width="64" height="22" rx="11" class="evchip-o"/>
+        <text x="608" y="318" text-anchor="middle" class="tm evt-o">blocked</text>
+        <path d="M540,346 V374" class="eva-o"/>
+        <rect x="656" y="266" width="208" height="80" rx="10" class="ev-o"/>
+        <text x="668" y="283" class="tm evt-o">pane</text>
+        <rect x="668" y="292" width="124" height="44" rx="8" class="ev-o"/>
+        <text x="730" y="312" text-anchor="middle" class="tl tb evt-o">worker</text>
+        <text x="730" y="328" text-anchor="middle" class="tm evt-o">claude / codex</text>
+        <rect x="796" y="303" width="64" height="22" rx="11" class="evchip-o"/>
+        <text x="828" y="318" text-anchor="middle" class="tm evt-o">done</text>
+        <path d="M760,346 V374" class="eva-o"/>
+        <rect x="216" y="376" width="208" height="42" rx="8" class="ev-o"/>
+        <text x="228" y="394" class="tm tb evt-o">task/&lt;slug&gt;-api</text>
+        <text x="228" y="411" class="ts evt-o">依赖在里面独立安装</text>
+        <rect x="436" y="376" width="208" height="42" rx="8" class="ev-o"/>
+        <text x="448" y="394" class="tm tb evt-o">task/&lt;slug&gt;-ui</text>
+        <text x="448" y="411" class="ts evt-o">依赖在里面独立安装</text>
+        <rect x="656" y="376" width="208" height="42" rx="8" class="ev-o"/>
+        <text x="668" y="394" class="tm tb evt-o">task/&lt;slug&gt;-docs</text>
+        <text x="668" y="411" class="ts evt-o">依赖在里面独立安装</text>
+        <rect x="14" y="24" width="152" height="56" rx="28" class="ev-o"/>
+        <text x="90" y="48" text-anchor="middle" class="tt evt-o">人</text>
+        <text x="90" y="67" text-anchor="middle" class="ts evt-c">拍板，不用追问依据</text>
+        <rect x="200" y="112" width="420" height="100" rx="10" class="ev-o"/>
+        <text x="216" y="132" class="tmb evt-o">bin/drover</text>
+        <text x="216" y="151" class="tm evt-o">wt · deps · agent-start · brief · watch · accept</text>
+        <text x="216" y="168" class="tm evt-o">review · collect · history  + oncall · main-register</text>
+        <text x="216" y="185" class="tm evt-o">+ orch-start · integrate · push · heavy</text>
+        <text x="216" y="202" class="tm evt-o">+ orch-status · watch --until-event</text>
+        <rect x="650" y="112" width="230" height="100" rx="10" class="ev-o"/>
+        <text x="666" y="132" class="tm tb evt-o">&lt;slug&gt;/ 任务目录</text>
+        <text x="666" y="151" class="tl evt-o">任务书（brief）+ 完成证据</text>
+        <text x="666" y="169" class="tm evt-o">&lt;agent&gt;.md 报告 · accept.json</text>
+        <text x="666" y="186" class="tm evt-o">dispatch.md 状态文件</text>
+        <text x="666" y="203" class="tm evt-o">request.md · rollup.md<tspan class="evt-c"> + 依据</tspan></text>
+        <path d="M620,162 H648" class="eva-o dash" marker-end="url(#evm8o)"/>
+        <path d="M410,212 V234" class="eva-o" marker-end="url(#evm8o)"/>
+        <text x="418" y="229" class="tm evt-o">herdr CLI</text>
+        <rect x="200" y="20" width="180" height="70" rx="12" class="ev-o"/>
+        <text x="290" y="42" text-anchor="middle" class="tt evt-o">主会话<tspan class="tm"> · drover</tspan></text>
+        <text x="290" y="59" text-anchor="middle" class="ts evt-c">路由 / 问答 / 审核 / 转达</text>
+        <rect x="480" y="20" width="200" height="70" rx="12" class="ev-o"/>
+        <text x="580" y="42" text-anchor="middle" class="tt evt-o">编排者</text>
+        <text x="580" y="59" text-anchor="middle" class="ts evt-o">拆条目 · 派发 · 验收 · 集成</text>
+        <path d="M166,44 H198" class="eva-o" marker-end="url(#evm8o)"/>
+        <text x="182" y="38" text-anchor="middle" class="ts evt-o">需求</text>
+        <path d="M200,64 H168" class="eva-o dash" marker-end="url(#evm8o)"/>
+        <text x="182" y="79" text-anchor="middle" class="ts evt-o">汇报</text>
+        <path d="M380,44 H478" class="eva-o" marker-end="url(#evm8o)"/>
+        <text x="429" y="38" text-anchor="middle" class="tm evt-o">orch-start</text>
+        <text x="429" y="58" text-anchor="middle" class="ts evt-c">打回补证据</text>
+        <path d="M480,64 H382" class="eva-o dash" marker-end="url(#evm8o)"/>
+        <text x="429" y="79" text-anchor="middle" class="tm evt-o">rollup.md</text>
+        <path d="M580,90 V110" class="eva-o" marker-end="url(#evm8o)"/>
+        <rect x="216" y="436" width="428" height="44" rx="8" class="ev-o"/>
+        <text x="232" y="454" class="tm tb evt-o">集成 worktree  task/&lt;slug&gt;</text>
+        <text x="232" y="472" class="ts evt-o">integrate 归集各条目 · 整体检查一次 · 迁移</text>
+        <path d="M320,418 V434" class="eva-o" marker-end="url(#evm8o)"/>
+        <path d="M540,418 V434" class="eva-o" marker-end="url(#evm8o)"/>
+        <path d="M760,418 L638,434" class="eva-o" marker-end="url(#evm8o)"/>
+        <rect x="680" y="436" width="200" height="44" rx="22" class="ev-o"/>
+        <text x="780" y="463" text-anchor="middle" class="tm evt-o">origin/&lt;上游&gt;</text>
+        <path d="M644,458 H678" class="eva-o" marker-end="url(#evm8o)"/>
+        <text x="661" y="451" text-anchor="middle" class="tm evt-o">push</text>
+        <rect x="14" y="112" width="152" height="100" rx="10" class="ev-o"/>
+        <text x="90" y="134" text-anchor="middle" class="tl tb evt-o">drover 包</text>
+        <text x="90" y="154" text-anchor="middle" class="tm evt-o">./install.sh</text>
+        <text x="90" y="172" text-anchor="middle" class="tm evt-o">→ install.py</text>
+        <text x="90" y="190" text-anchor="middle" class="tm evt-o">link / copy</text>
+        <path d="M166,162 H198" class="eva-o dash" marker-end="url(#evm8o)"/>
+        <rect x="14" y="320" width="152" height="72" rx="10" class="ev-o"/>
+        <text x="90" y="342" text-anchor="middle" class="tl tb evt-o">herdr-oncall 插件</text>
+        <text x="90" y="361" text-anchor="middle" class="tm evt-o">drover.env</text>
+        <text x="90" y="380" text-anchor="middle" class="ts evt-o">只为主会话推</text>
+        <rect x="14" y="420" width="152" height="60" rx="12" class="ev-o"/>
+        <text x="90" y="444" text-anchor="middle" class="tl tb evt-o">你的飞书</text>
+        <text x="90" y="464" text-anchor="middle" class="ts evt-o">【转达】· 卡片按钮</text>
+        <path d="M166,330 H182 V86 H198" class="eva-o" marker-start="url(#evm8o)" marker-end="url(#evm8o)"/>
+        <text x="174" y="262" text-anchor="end" class="ts evt-o">[飞书] 消息 ↑</text>
+        <text x="174" y="280" text-anchor="end" class="ts evt-o">↓ 确认框 · 【转达】</text>
+        <path d="M166,352 H198" class="eva-o dash" marker-end="url(#evm8o)" marker-start="url(#evm8o)"/>
+        <path d="M90,392 V418" class="eva-o" marker-start="url(#evm8o)" marker-end="url(#evm8o)"/>
+      </svg>
+      </div>
+      <p class="swipe">← 图比屏幕宽，可以左右滑动 →</p>
+      <figcaption><b>阶段 ⑧ 的架构。</b>没有新部件，改的是几处标签（赤陶色）：主会话从“路由 / 问答 / 转达”变成“路由 / 问答 / 审核 / 转达”；编排者交上来的 rollup 带着依据（应该怎样、根因、依据、读过的仓库），依据不够，主会话就用 <code>drover prompt</code> 打回去补（还是走往下那条线）；人只拍板，不用追问依据。</figcaption>
+    </figure>
+    <!-- evo:8:end -->
+    </article>
+
+    <!-- ⑨ -->
+    <article class="stage era3" id="stage-9">
+      <div class="stage-head">
+        <span class="stage-no" aria-hidden="true">9</span>
+        <div><h3>任务看板</h3><p class="stage-date">11-18 · 11-19 · 一键收尾、自动更新</p></div>
+      </div>
+      <div class="stage-body solo">
+        <dl class="pce">
+          <div><dt class="p">卡在哪</dt><dd>
+            <ul>
+              <li>转达被冲掉：主会话同时盯 3 个以上编排者时，各任务的转达（尤其是“等你决定”）被不断推来的状态更新冲掉。11-18 看了主会话一晚上的会话记录：Monitor 每 30 分钟到期一次，重挂时 watch 又把当前状态全报一遍，主会话每 30 分钟回两段“没有新进展”，最后一次转达之后输出了 53 段，把前面的转达顶了上去。</li>
+              <li>“转达过没有”只记在主会话的上下文里，<code>/clear</code> 之后就分不清了。</li>
+              <li>想知道现在有哪些任务、各走到哪、在等谁，得翻聊天记录。</li>
+              <li>drover 更新要自己想起来跑 <code>update</code>，规则变了还得 <code>/clear</code>。</li>
+            </ul>
+          </dd></div>
+          <div><dt class="c">怎么改</dt><dd>
+            <ul>
+              <li><strong>主会话的追踪只报要处理的事</strong>：<code>watch --main</code> 自动盯所有顶层编排者，只报未读的 rollup（等你决定 / 完成 / 受阻 / 需要换编排者）、确认框、接口错误、意外退出、停了 N 分钟没更新、herdr 连不上，还有 drover 自己的更新；working、进行中都不报。哪份 rollup 读过由 drover 记（主会话用 <code>drover rollup</code> 读了才算），报过的事件记在磁盘上，重挂、<code>/clear</code> 之后都不重报。Claude Code 的主会话用后台 Bash 挂 <code>--until-event</code>，只在有事时退出、叫醒它（实测挂 35 分钟，只在退出时叫醒了一次）。</li>
+              <li><strong>看板</strong> <code>drover board</code>：一个状态一张表（等你 / 进行中 / 完成），一行一个任务，列是 任务（中文标题）| 当前状态 | 要你做什么 | 状态持续 | 代号，完成那张多一列收尾，提醒写在那个任务下面。终端里问进度，给 Markdown 表格；飞书里发“看板”“进度”，给 <code>--plain</code> 纯文字，按手机一屏排好；看板 tab 里是 <code>--live</code>。</li>
+              <li><strong>看板 tab</strong>：<code>board --tab</code> 在主会话旁边开一个同级 tab，tab 名就是汇总（比如“看板·等你2·完成1”），每 15 秒重画；表比终端宽时能左右滚，按住拖动选中、松开自动复制。</li>
+              <li><strong>一键收尾</strong>：看板上点 [收尾] / [全部收尾]，经 herdr-oncall 送进主会话；在终端、飞书里说“全部收尾”也一样。主会话只收“完成、收尾：可以、编排者还开着”的任务；编排者在 rollup 开头写了“收尾：先别，&lt;原因&gt;”的不收。</li>
+              <li><strong>rollup 开头几行</strong>：标题 / 摘要 / 要你做 / 收尾 / 提醒，看板就读这几行；状态持续、总耗时由 drover 记在每个任务的 <code>timeline.jsonl</code> 里。</li>
+              <li><strong>转达带上其他在等你的</strong>：每条转达末尾附上 <code>board --pending</code> 的输出，推到手机的每一条都带着全部待定的事，前面的不会被后面的冲掉。</li>
+              <li><strong>全自动更新</strong>：主会话活着时，drover 每 30 分钟在后台查一次新版本，能快进就装。规则变了，<code>watch --main</code> 报一行 <code>drover updated</code>，主会话跑 <code>drover rules</code> 把改动读进来，不用 <code>/clear</code>；看板 tab 自己换成新代码。<code>/clear</code> 之后，之前挂着的 watch 报 <code>session-restarted</code>，新对话自己接上。被本地改动挡住、连续 24 小时连不上更新源，各报一行；在 <code>~/.drover/config.json</code> 里写 <code>"auto_update": false</code> 可以关掉。</li>
+            </ul>
+          </dd></div>
+          <div><dt class="e">效果</dt><dd>任务一多，扫一眼看板就知道哪件该你做、在这个状态上待了多久；主会话只在有事时开口，转达不再被刷掉；drover 更新了，不用重开会话。</dd></div>
+        </dl>
+      </div>
+    <!-- evo:9:begin -->
+    <figure class="fig evo">
+      <div class="canvas">
+      <svg class="dg w-evo" viewBox="0 0 900 490" role="img" aria-label="阶段 ⑨ 的架构演进图：多出看板 tab，它在主会话旁边，读各任务的 rollup 开头几行和时间线，画成等你、进行中、完成三张表，上面的收尾按钮经 herdr-oncall 送进主会话。主会话改用 watch --main 追踪，CLI 多了 board、rollup、rules、update，任务目录多了 timeline.jsonl，drover 包在后台自动更新。">
+        <defs>
+          <marker id="evm9n" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="evm-n"/></marker>
+          <marker id="evm9o" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="evm-o"/></marker>
+        </defs>
+        <rect x="200" y="236" width="680" height="124" rx="14" class="evf-o"/>
+        <text x="216" y="255" class="tm evt-o">herdr · workspace / tab / pane</text>
+        <rect x="216" y="266" width="208" height="80" rx="10" class="ev-o"/>
+        <text x="228" y="283" class="tm evt-o">pane</text>
+        <rect x="228" y="292" width="124" height="44" rx="8" class="ev-o"/>
+        <text x="290" y="312" text-anchor="middle" class="tl tb evt-o">worker</text>
+        <text x="290" y="328" text-anchor="middle" class="tm evt-o">claude / codex</text>
+        <rect x="356" y="303" width="64" height="22" rx="11" class="evchip-o"/>
+        <text x="388" y="318" text-anchor="middle" class="tm evt-o">working</text>
+        <path d="M320,346 V374" class="eva-o"/>
+        <rect x="436" y="266" width="208" height="80" rx="10" class="ev-o"/>
+        <text x="448" y="283" class="tm evt-o">pane</text>
+        <rect x="448" y="292" width="124" height="44" rx="8" class="ev-o"/>
+        <text x="510" y="312" text-anchor="middle" class="tl tb evt-o">worker</text>
+        <text x="510" y="328" text-anchor="middle" class="tm evt-o">claude / codex</text>
+        <rect x="576" y="303" width="64" height="22" rx="11" class="evchip-o"/>
+        <text x="608" y="318" text-anchor="middle" class="tm evt-o">blocked</text>
+        <path d="M540,346 V374" class="eva-o"/>
+        <rect x="656" y="266" width="208" height="80" rx="10" class="ev-o"/>
+        <text x="668" y="283" class="tm evt-o">pane</text>
+        <rect x="668" y="292" width="124" height="44" rx="8" class="ev-o"/>
+        <text x="730" y="312" text-anchor="middle" class="tl tb evt-o">worker</text>
+        <text x="730" y="328" text-anchor="middle" class="tm evt-o">claude / codex</text>
+        <rect x="796" y="303" width="64" height="22" rx="11" class="evchip-o"/>
+        <text x="828" y="318" text-anchor="middle" class="tm evt-o">done</text>
+        <path d="M760,346 V374" class="eva-o"/>
+        <rect x="216" y="376" width="208" height="42" rx="8" class="ev-o"/>
+        <text x="228" y="394" class="tm tb evt-o">task/&lt;slug&gt;-api</text>
+        <text x="228" y="411" class="ts evt-o">依赖在里面独立安装</text>
+        <rect x="436" y="376" width="208" height="42" rx="8" class="ev-o"/>
+        <text x="448" y="394" class="tm tb evt-o">task/&lt;slug&gt;-ui</text>
+        <text x="448" y="411" class="ts evt-o">依赖在里面独立安装</text>
+        <rect x="656" y="376" width="208" height="42" rx="8" class="ev-o"/>
+        <text x="668" y="394" class="tm tb evt-o">task/&lt;slug&gt;-docs</text>
+        <text x="668" y="411" class="ts evt-o">依赖在里面独立安装</text>
+        <rect x="14" y="24" width="152" height="56" rx="28" class="ev-o"/>
+        <text x="90" y="48" text-anchor="middle" class="tt evt-o">人</text>
+        <text x="90" y="67" text-anchor="middle" class="ts evt-c">扫一眼看板</text>
+        <rect x="200" y="112" width="420" height="100" rx="10" class="ev-o"/>
+        <text x="216" y="132" class="tmb evt-o">bin/drover</text>
+        <text x="216" y="151" class="tm evt-o">wt · deps · agent-start · brief · watch · accept</text>
+        <text x="216" y="168" class="tm evt-o">review · collect · history  + oncall · main-register</text>
+        <text x="216" y="185" class="tm evt-o">+ orch-start · integrate · push · heavy<tspan class="evt-c">  + board · rollup</tspan></text>
+        <text x="216" y="202" class="tm evt-o">+ orch-status · watch --until-event<tspan class="evt-c">  + rules · update</tspan></text>
+        <rect x="650" y="112" width="230" height="100" rx="10" class="ev-o"/>
+        <text x="666" y="132" class="tm tb evt-o">&lt;slug&gt;/ 任务目录</text>
+        <text x="666" y="151" class="tl evt-o">任务书（brief）+ 完成证据</text>
+        <text x="666" y="169" class="tm evt-o">&lt;agent&gt;.md 报告 · accept.json</text>
+        <text x="666" y="186" class="tm evt-o">dispatch.md<tspan class="evt-c"> · timeline.jsonl</tspan></text>
+        <text x="666" y="203" class="tm evt-o">request.md · rollup.md + 依据</text>
+        <path d="M620,162 H648" class="eva-o dash" marker-end="url(#evm9o)"/>
+        <path d="M410,212 V234" class="eva-o" marker-end="url(#evm9o)"/>
+        <text x="418" y="229" class="tm evt-o">herdr CLI</text>
+        <rect x="200" y="20" width="180" height="70" rx="12" class="ev-o"/>
+        <text x="290" y="42" text-anchor="middle" class="tt evt-o">主会话<tspan class="tm"> · drover</tspan></text>
+        <text x="290" y="59" text-anchor="middle" class="ts evt-o">路由 / 问答 / 审核 / 转达</text>
+        <rect x="480" y="20" width="200" height="70" rx="12" class="ev-o"/>
+        <text x="580" y="42" text-anchor="middle" class="tt evt-o">编排者</text>
+        <text x="580" y="59" text-anchor="middle" class="ts evt-o">拆条目 · 派发 · 验收 · 集成</text>
+        <path d="M166,44 H198" class="eva-o" marker-end="url(#evm9o)"/>
+        <text x="182" y="38" text-anchor="middle" class="ts evt-o">需求</text>
+        <path d="M200,64 H168" class="eva-o dash" marker-end="url(#evm9o)"/>
+        <text x="182" y="79" text-anchor="middle" class="ts evt-o">汇报</text>
+        <path d="M380,44 H478" class="eva-o" marker-end="url(#evm9o)"/>
+        <text x="429" y="38" text-anchor="middle" class="tm evt-o">orch-start</text>
+        <text x="429" y="58" text-anchor="middle" class="ts evt-o">打回补证据</text>
+        <path d="M480,64 H382" class="eva-o dash" marker-end="url(#evm9o)"/>
+        <text x="429" y="79" text-anchor="middle" class="tm evt-o">rollup.md</text>
+        <path d="M580,90 V110" class="eva-o" marker-end="url(#evm9o)"/>
+        <path d="M250,92 V110" class="eva-n" marker-end="url(#evm9n)"/>
+        <text x="258" y="106" class="tm evt-c">watch --main · board</text>
+        <rect x="216" y="436" width="428" height="44" rx="8" class="ev-o"/>
+        <text x="232" y="454" class="tm tb evt-o">集成 worktree  task/&lt;slug&gt;</text>
+        <text x="232" y="472" class="ts evt-o">integrate 归集各条目 · 整体检查一次 · 迁移</text>
+        <path d="M320,418 V434" class="eva-o" marker-end="url(#evm9o)"/>
+        <path d="M540,418 V434" class="eva-o" marker-end="url(#evm9o)"/>
+        <path d="M760,418 L638,434" class="eva-o" marker-end="url(#evm9o)"/>
+        <rect x="680" y="436" width="200" height="44" rx="22" class="ev-o"/>
+        <text x="780" y="463" text-anchor="middle" class="tm evt-o">origin/&lt;上游&gt;</text>
+        <path d="M644,458 H678" class="eva-o" marker-end="url(#evm9o)"/>
+        <text x="661" y="451" text-anchor="middle" class="tm evt-o">push</text>
+        <rect x="14" y="112" width="152" height="100" rx="10" class="ev-o"/>
+        <text x="90" y="134" text-anchor="middle" class="tl tb evt-o">drover 包</text>
+        <text x="90" y="154" text-anchor="middle" class="tm evt-o">./install.sh</text>
+        <text x="90" y="172" text-anchor="middle" class="tm evt-o">→ install.py</text>
+        <text x="90" y="190" text-anchor="middle" class="tm evt-o">link / copy</text>
+        <text x="90" y="206" text-anchor="middle" class="ts evt-c">后台自动更新</text>
+        <path d="M166,162 H198" class="eva-o dash" marker-end="url(#evm9o)"/>
+        <rect x="14" y="320" width="152" height="72" rx="10" class="ev-o"/>
+        <text x="90" y="342" text-anchor="middle" class="tl tb evt-o">herdr-oncall 插件</text>
+        <text x="90" y="361" text-anchor="middle" class="tm evt-o">drover.env</text>
+        <text x="90" y="380" text-anchor="middle" class="ts evt-o">只为主会话推</text>
+        <rect x="14" y="420" width="152" height="60" rx="12" class="ev-o"/>
+        <text x="90" y="444" text-anchor="middle" class="tl tb evt-o">你的飞书</text>
+        <text x="90" y="464" text-anchor="middle" class="ts evt-o">【转达】· 卡片按钮</text>
+        <path d="M166,330 H182 V86 H198" class="eva-o" marker-start="url(#evm9o)" marker-end="url(#evm9o)"/>
+        <text x="174" y="262" text-anchor="end" class="ts evt-c">[飞书] / [看板] 消息 ↑</text>
+        <text x="174" y="280" text-anchor="end" class="ts evt-o">↓ 确认框 · 【转达】</text>
+        <path d="M166,352 H198" class="eva-o dash" marker-end="url(#evm9o)" marker-start="url(#evm9o)"/>
+        <path d="M90,392 V418" class="eva-o" marker-start="url(#evm9o)" marker-end="url(#evm9o)"/>
+        <rect x="700" y="20" width="180" height="70" rx="12" class="ev-n"/>
+        <rect x="850" y="12" width="36" height="15" rx="7.5" class="ev-badge"/><text x="868" y="23" text-anchor="middle" class="ev-badge-t">NEW</text>
+        <text x="790" y="42" text-anchor="middle" class="tt evt-n">看板 tab</text>
+        <text x="790" y="60" text-anchor="middle" class="tm evt-n">board --live · [收尾]</text>
+        <text x="790" y="78" text-anchor="middle" class="ts evt-n">等你 / 进行中 / 完成</text>
+        <path d="M790,110 V92" class="eva-n dash" marker-end="url(#evm9n)"/>
+        <text x="782" y="106" text-anchor="end" class="ts evt-c">读 rollup、时间线</text>
+      </svg>
+      </div>
+      <p class="swipe">← 图比屏幕宽，可以左右滑动 →</p>
+      <figcaption><b>阶段 ⑨ 的架构。</b>多出看板 tab（右上角）：它是主会话旁边的一个同级 tab，读各任务 rollup 的开头几行和时间线，画成等你 / 进行中 / 完成三张表；上面的 [收尾] 按钮经 herdr-oncall 送进主会话（左边那条线的标签多了 <code>[看板]</code>）。主会话改用 <code>watch --main</code> 追踪，只在有要处理的事时被叫醒；CLI 多了 <code>board</code>、<code>rollup</code>、<code>rules</code>、<code>update</code>，任务目录多了 <code>timeline.jsonl</code>；drover 包在后台自己更新。赤陶色是这一步改了的标签。</figcaption>
+    </figure>
+    <!-- evo:9:end -->
+      <aside class="bark"><b>汪</b><span>以前主会话隔半小时就被叫醒一次，回你一句“没有新进展”，把要你拍板的事都挤了上去。现在没事谁也不叫；想知道羊群怎么样，看院子门口那块板子就行。</span></aside>
+    </article>
+
+  </div>
+</section>
+
+<div class="fence" aria-hidden="true"></div>
+
+<!-- ================= 架构 ================= -->
+<section id="arch">
+  <header>
+    <p class="eyebrow">现在的架构</p>
+    <h2>牧场全景：谁跟谁说话</h2>
+  </header>
+  <div class="prose">
+    <p>从上往下是一层层往下交活、往上只交结论。主会话和编排者之间只有两样东西：往下一份 <code>request.md</code>，往上一页 <code>rollup.md</code>，主会话先按依据审过再转给你。所有建 worktree、起 agent、发任务书、看状态的动作都走 drover CLI（<code>bin/drover</code>，装好后是 <code>~/.drover/bin/drover</code>），CLI 再通过 herdr CLI 指挥 herdr server。右边一列是落在磁盘上的文件，和左边同一高度的那一层对应。</p>
+    <p>左上角是主会话自己的两样：看板 tab（和主对话同级的一个 tab，<code>board --live</code> 按各任务 rollup 的开头几行和时间线画表，上面的 [收尾] 按钮经 herdr-oncall 送进主会话），和后台自动更新（主会话那边的命令每 30 分钟顺带查一次新版本，能快进就装，新规则用 <code>drover rules</code> 读进主会话）。主会话追踪编排者用 <code>watch --main</code>，只在有要处理的事时被叫醒。</p>
+    <p>右上角是离开电脑时的那条路：herdr-oncall 插件跑在 herdr 里，按名字认出主会话（<code>drover</code>）、编排者（<code>orch-*</code>）和 worker。主会话需要你时推到飞书，你在飞书里直接发的话送回主会话；编排者和 worker 的确认框平时由上一层批，卡久了插件才升级到你。</p>
+  </div>
+  <figure class="fig">
+    <div class="canvas">
+      <svg class="dg w-arch" viewBox="0 0 1000 846" role="img" aria-label="总体架构：用户对主会话说需求；主会话用 orch-start 起编排者，用 watch --main 追踪，只读 rollup、先审再转；编排者通过 drover CLI 和 herdr server 在各自的 worktree 里起 worker；改动经 integrate 归集到集成 worktree 后 push 到上游；右侧是任务目录里的文件。左上角：主会话旁边的看板 tab 和后台自动更新。右上角：herdr-oncall 插件跑在 herdr 里，主会话需要你时推到飞书，你在飞书里发的消息、看板上点的收尾送进主会话，编排者和 worker 卡久了才升级。">
+        <defs>
+          <marker id="ar-ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah"/></marker>
+          <marker id="ar-ah-t" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-terra"/></marker>
+        </defs>
+
+        <!-- L1 用户 -->
+        <rect x="240" y="16" width="200" height="52" rx="26" class="b-mus"/>
+        <text x="340" y="40" text-anchor="middle" class="tt">用户</text>
+        <text x="340" y="58" text-anchor="middle" class="ts">提需求 · 看一页 · 拍板</text>
+        <line x1="310" y1="68" x2="310" y2="110" class="e" marker-end="url(#ar-ah)"/>
+        <text x="302" y="94" text-anchor="end" class="tl">说需求</text>
+        <line x1="370" y1="110" x2="370" y2="70" class="e" marker-end="url(#ar-ah)"/>
+        <text x="378" y="94" class="tl">转达结论（开头是目标）</text>
+
+        <!-- 飞书 oncall：离开电脑时 -->
+        <rect x="530" y="16" width="176" height="52" rx="12" class="b-peach"/>
+        <text x="618" y="39" text-anchor="middle" class="tt">飞书（手机）</text>
+        <text x="618" y="58" text-anchor="middle" class="ts">只响该你的事</text>
+        <line x1="442" y1="42" x2="528" y2="42" class="e e-terra dash" marker-start="url(#ar-ah-t)" marker-end="url(#ar-ah-t)"/>
+        <text x="485" y="34" text-anchor="middle" class="ts c-terra">离开电脑时</text>
+        <rect x="530" y="112" width="176" height="88" rx="12" class="b-peach"/>
+        <text x="618" y="134" text-anchor="middle" class="tmb">herdr-oncall</text>
+        <text x="618" y="153" text-anchor="middle" class="ts">herdr 插件 · 按名字认角色</text>
+        <text x="618" y="172" text-anchor="middle" class="ts">编排者 / worker 的确认框</text>
+        <text x="618" y="191" text-anchor="middle" class="ts">卡 5 / 10 分钟才升级</text>
+        <line x1="618" y1="70" x2="618" y2="110" class="e e-terra" marker-start="url(#ar-ah-t)" marker-end="url(#ar-ah-t)"/>
+        <text x="626" y="94" class="ts c-terra">推送 · 送达</text>
+        <line x1="528" y1="140" x2="492" y2="140" class="e e-terra" marker-end="url(#ar-ah-t)"/>
+        <text x="510" y="132" text-anchor="middle" class="tm c-terra">[飞书]</text>
+        <text x="510" y="158" text-anchor="middle" class="tm c-terra">[看板]</text>
+        <line x1="492" y1="176" x2="528" y2="176" class="e e-terra" marker-end="url(#ar-ah-t)"/>
+        <text x="510" y="194" text-anchor="middle" class="ts c-terra">推送</text>
+        <path d="M694,200 V514 H666" class="e e-terra dash" marker-start="url(#ar-ah-t)"/>
+        <text x="700" y="232" class="ts c-terra" transform="rotate(90 700 232)">读 agent 状态</text>
+
+        <!-- 主会话旁边：自动更新、看板 tab -->
+        <rect x="16" y="16" width="168" height="76" rx="12" class="b-mus"/>
+        <text x="100" y="38" text-anchor="middle" class="tb">后台自动更新</text>
+        <text x="100" y="57" text-anchor="middle" class="tm">update --auto</text>
+        <text x="100" y="76" text-anchor="middle" class="ts">每 30 分钟 · drover rules</text>
+        <path d="M184,54 H214 V110" class="e dash" marker-end="url(#ar-ah)"/>
+        <rect x="16" y="112" width="168" height="88" rx="12" class="b-mus"/>
+        <text x="100" y="135" text-anchor="middle" class="tt">看板 tab</text>
+        <text x="100" y="154" text-anchor="middle" class="tm">board --live</text>
+        <text x="100" y="172" text-anchor="middle" class="ts">等你 / 进行中 / 完成</text>
+        <text x="100" y="190" text-anchor="middle" class="ts">[收尾] → herdr-oncall</text>
+
+        <!-- L2 主会话 -->
+        <rect x="190" y="112" width="300" height="88" rx="14" class="b"/>
+        <text x="340" y="138" text-anchor="middle" class="tt">主会话</text>
+        <text x="340" y="157" text-anchor="middle" class="ts">主工作台 · 路由 / 问答 / 审核 / 转达</text>
+        <rect x="246" y="168" width="92" height="22" rx="11" class="chip-cc"/>
+        <text x="292" y="183" text-anchor="middle" class="tm c-cc">Claude Code</text>
+        <rect x="346" y="168" width="88" height="22" rx="11" class="chip-cx"/>
+        <text x="390" y="183" text-anchor="middle" class="tm c-teal">Codex</text>
+
+        <!-- L2 ↔ L3 -->
+        <line x1="262" y1="200" x2="262" y2="276" class="e" marker-end="url(#ar-ah)"/>
+        <text x="254" y="221" text-anchor="end" class="tm">orch-start</text>
+        <text x="254" y="237" text-anchor="end" class="ts">写 request.md 后启动</text>
+        <line x1="312" y1="278" x2="312" y2="202" class="e e-terra dash" marker-end="url(#ar-ah-t)"/>
+        <text x="320" y="221" class="tm c-terra">rollup.md<tspan class="ts"> 只读这一页，≤ 40 行</tspan></text>
+        <text x="320" y="237" class="ts"><tspan class="tm">watch --main</tspan> 叫醒，先审再转</text>
+
+        <!-- L3 orch workspace -->
+        <rect x="16" y="244" width="664" height="180" rx="16" class="frame"/>
+        <text x="32" y="266" class="tm c-muted">herdr · orch workspace（一个任务一个 tab）</text>
+        <rect x="232" y="278" width="100" height="24" rx="6" class="tab-on"/>
+        <text x="282" y="295" text-anchor="middle" class="tm c-terra">orch-a</text>
+        <rect x="336" y="278" width="100" height="24" rx="6" class="tab"/>
+        <text x="386" y="295" text-anchor="middle" class="tm c-muted">orch-b</text>
+        <rect x="440" y="278" width="100" height="24" rx="6" class="tab"/>
+        <text x="490" y="295" text-anchor="middle" class="tm c-muted">orch-c</text>
+        <rect x="32" y="306" width="400" height="104" rx="10" class="b-terra"/>
+        <text x="52" y="334" class="tt">编排者（orchestrator）</text>
+        <text x="52" y="357" class="tl">拆条目 · 派 worker · 追踪 · 按证据验收</text>
+        <text x="52" y="377" class="tl">在集成 worktree 里统一检查和推送</text>
+        <text x="52" y="398" class="ts">宿主：Claude Code 或 Codex（--kind）</text>
+        <rect x="456" y="306" width="208" height="104" rx="10" class="b dash"/>
+        <text x="560" y="334" text-anchor="middle" class="tb">子编排者（可选）</text>
+        <text x="560" y="356" text-anchor="middle" class="ts">某个仓库活太多时</text>
+        <text x="560" y="376" text-anchor="middle" class="tm">orch-start --parent</text>
+        <text x="560" y="397" text-anchor="middle" class="ts">也只往上交 rollup</text>
+        <line x1="432" y1="358" x2="454" y2="358" class="e" marker-end="url(#ar-ah)"/>
+
+        <!-- L3 → L4 -->
+        <line x1="232" y1="410" x2="232" y2="466" class="e" marker-end="url(#ar-ah)"/>
+        <text x="242" y="444" class="tl">单条命令 · 读 JSON</text>
+
+        <!-- L4 脚本 + herdr -->
+        <rect x="32" y="468" width="400" height="112" rx="10" class="b-mus"/>
+        <text x="52" y="489" class="tmb">bin/drover（drover CLI）</text>
+        <text x="52" y="506" class="ts">Python 标准库 · 每个子命令输出一个 JSON</text>
+        <text x="52" y="524" class="tm">wt · deps · agent-start · brief · watch · accept</text>
+        <text x="52" y="540" class="tm">review · integrate · push · heavy · orch-start</text>
+        <text x="52" y="556" class="tm">wrapup · orch-status · oncall · main-register</text>
+        <text x="52" y="572" class="tm">board · rollup · rules · update · cleanup</text>
+        <rect x="488" y="468" width="176" height="92" rx="10" class="b"/>
+        <text x="576" y="494" text-anchor="middle" class="tt">herdr server</text>
+        <text x="576" y="514" text-anchor="middle" class="ts">unix socket · agent 状态</text>
+        <text x="576" y="535" text-anchor="middle" class="tm">working / idle</text>
+        <text x="576" y="552" text-anchor="middle" class="tm">blocked / done</text>
+        <line x1="432" y1="514" x2="486" y2="514" class="e" marker-end="url(#ar-ah)"/>
+        <text x="459" y="506" text-anchor="middle" class="tm">CLI</text>
+
+        <!-- L4 → L5 -->
+        <line x1="576" y1="560" x2="576" y2="602" class="e" marker-end="url(#ar-ah)"/>
+        <text x="566" y="597" text-anchor="end" class="tl">开 pane · 起 agent · 发任务书 · 读屏幕和状态</text>
+
+        <!-- L5 workers -->
+        <rect x="16" y="604" width="664" height="124" rx="16" class="frame"/>
+        <text x="32" y="626" class="tm c-muted">herdr · worktree workspaces（一个条目一个 worktree + 一个 worker）</text>
+        <rect x="32" y="638" width="200" height="78" rx="10" class="b-teal"/>
+        <text x="48" y="661" class="tb">worker · <tspan class="c-cc">claude</tspan></text>
+        <text x="48" y="682" class="tm">task/&lt;slug&gt;-api</text>
+        <text x="48" y="702" class="ts">自己的 pane + worktree</text>
+        <rect x="248" y="638" width="200" height="78" rx="10" class="b-teal"/>
+        <text x="264" y="661" class="tb">worker · <tspan class="c-teal">codex</tspan></text>
+        <text x="264" y="682" class="tm">task/&lt;slug&gt;-ui</text>
+        <text x="264" y="702" class="ts">自己的 pane + worktree</text>
+        <rect x="464" y="638" width="200" height="78" rx="10" class="b-teal"/>
+        <text x="480" y="661" class="tb">worker · <tspan class="c-cc">claude</tspan></text>
+        <text x="480" y="682" class="tm">task/&lt;slug&gt;-docs</text>
+        <text x="480" y="702" class="ts">自己的 pane + worktree</text>
+
+        <!-- L5 → L6 -->
+        <line x1="232" y1="728" x2="232" y2="770" class="e" marker-end="url(#ar-ah)"/>
+        <text x="242" y="754" class="tl"><tspan class="tm">integrate</tspan>（按顺序 cherry-pick 各条目）</text>
+
+        <!-- L6 集成 + 上游 -->
+        <rect x="32" y="772" width="416" height="56" rx="10" class="b-terra dash"/>
+        <text x="48" y="796" class="tb">集成 worktree（编排者的，每个仓库一个）</text>
+        <text x="48" y="816" class="tm">task/&lt;slug&gt; · 整体检查一次 · 迁移</text>
+        <rect x="496" y="776" width="168" height="48" rx="24" class="b"/>
+        <text x="580" y="805" text-anchor="middle" class="tm">origin/&lt;上游&gt;</text>
+        <line x1="448" y1="800" x2="494" y2="800" class="e" marker-end="url(#ar-ah)"/>
+        <text x="471" y="792" text-anchor="middle" class="tm">push</text>
+
+        <!-- 文件列 -->
+        <rect x="716" y="100" width="268" height="736" rx="16" class="frame"/>
+        <text x="732" y="124" class="tmb">~/.drover/&lt;slug&gt;/</text>
+        <rect x="732" y="146" width="236" height="52" rx="8" class="b"/>
+        <text x="746" y="167" class="tm tb">request.md</text>
+        <text x="746" y="187" class="ts">主会话写：原话 + 目标 + 上下文</text>
+        <rect x="732" y="256" width="236" height="52" rx="8" class="b-terra"/>
+        <text x="746" y="277" class="tm tb">rollup.md</text>
+        <text x="746" y="297" class="ts">编排者写，主会话只读这一页</text>
+        <rect x="732" y="318" width="236" height="52" rx="8" class="b"/>
+        <text x="746" y="339" class="tm tb">dispatch.md（状态文件）</text>
+        <text x="746" y="359" class="ts">计划、ID、决定，断了靠它接上</text>
+        <rect x="732" y="400" width="236" height="52" rx="8" class="b"/>
+        <text x="746" y="421" class="tm tb">timeline.jsonl</text>
+        <text x="746" y="441" class="ts">时间线：看板的“状态持续”按它算</text>
+        <rect x="732" y="488" width="236" height="52" rx="8" class="b"/>
+        <text x="746" y="509" class="tm tb">&lt;agent&gt;.prompt.md（任务书）</text>
+        <text x="746" y="529" class="ts">brief 按模板生成，发给 worker</text>
+        <rect x="732" y="644" width="236" height="52" rx="8" class="b"/>
+        <text x="746" y="665" class="tm tb">&lt;agent&gt;.md（报告）</text>
+        <text x="746" y="685" class="ts">worker 写，编排者拿去验收</text>
+        <rect x="732" y="772" width="236" height="52" rx="8" class="b"/>
+        <text x="746" y="793" class="tm tb">pushes.jsonl · accept*.json</text>
+        <text x="746" y="813" class="ts">推送账本、验收结果</text>
+      </svg>
+    </div>
+    <p class="swipe">← 图比屏幕宽，可以左右滑动 →</p>
+    <figcaption><b>总体架构。</b>用户只和主会话说话；主会话用 <code>orch-start</code> 起编排者、用 <code>watch --main</code> 追踪、只读 rollup，先审再转；编排者通过 <code>bin/drover</code> 和 herdr 指挥 worker。主会话、编排者、worker 三层都可以是 Claude Code 或 Codex。worker 在自己的条目 worktree 里干活，改动最后由 <code>integrate</code> 归集到编排者的集成 worktree，再 <code>push</code> 到上游，每次推送记进 <code>pushes.jsonl</code>。左上角的看板 tab 和后台自动更新都属于主会话这一层（芥末黄是脚本）：看板在主对话旁边，自动更新装完用 <code>drover rules</code> 把新规则读进主会话。赤陶色是飞书 oncall：插件从 herdr server 读各个 agent 的状态（右边那条竖的虚线），只为主会话推送，编排者和 worker 卡久了才升级；你在飞书里直接发的消息加上 <code>[飞书] </code> 前缀、看板上点的收尾加上 <code>[看板] </code> 前缀，都由它送进主会话。用户和飞书之间的虚线是离开电脑时才走的路，规则见<a href="#oncall">离开电脑</a>。</figcaption>
+  </figure>
+</section>
+
+<div class="fence" aria-hidden="true"></div>
+
+<!-- ================= 四个身份 ================= -->
+<section id="roles">
+  <header>
+    <p class="eyebrow">编排者</p>
+    <h2>一只牧羊犬，四份差事</h2>
+  </header>
+  <div class="prose"><p>编排者不是“高级 worker”。它不写业务代码，但一个任务从读懂到推上远端，中间每个需要判断的地方都归它。下面四个身份一个都不能少，第三个最容易被忘。</p></div>
+  <div class="roles">
+    <div class="role">
+      <span class="n">1</span>
+      <h3>接手整个任务</h3>
+      <p>主会话路由过来之后：读代码、拆条目、定完成证据，并行派 worker（一个条目一个 agent 一个 worktree），追踪到每个都有结果，按证据验收。审批弹窗按决策表自己批，危险的才升级。</p>
+    </div>
+    <div class="role">
+      <span class="n">2</span>
+      <h3>往上只交一页 rollup</h3>
+      <p><code>~/.drover/&lt;slug&gt;/rollup.md</code>，状态是 进行中 / 等你决定 / 完成 / 受阻 / 需要换编排者，下面几行（标题、摘要、要你做、收尾、提醒）是给看板读的。主会话和用户不看过程：摸底、报告、diff 都不看。要人决定的事写进 rollup 然后停下，主会话审过再转给你，你的回答原样转回来。</p>
+    </div>
+    <div class="role key">
+      <span class="flag">别忘了这一个</span>
+      <span class="n">3</span>
+      <h3>集成者</h3>
+      <p>把各条目 worktree 的改动归集到自己的集成 worktree（每个仓库一个，分支 <code>task/&lt;slug&gt;</code>），在这里统一同步一次上游、整体检查一次（全量测试只在这里跑）、执行迁移，最后统一推送。worker 不提交、不各自 rebase。对应流程第 9.1 节和 <code>integrate</code> / <code>push</code> 子命令，<a href="#integrate">下面单独画了图</a>。</p>
+    </div>
+    <div class="role">
+      <span class="n">4</span>
+      <h3>跨仓总指挥</h3>
+      <p>跨仓任务一个需求只配一个编排者：它定跨仓接口和推送顺序（一般先提供接口的一方、后调用方，迁移在依赖它的代码之前）。某个仓库活太多时起子编排者（<code>orch-start --parent</code>），子编排者也只交 rollup，写“可以推送”后等上层按顺序发“推送”。</p>
+    </div>
+  </div>
+  <div class="cols">
+    <div>
+      <h3>rollup 长这样</h3>
+      <pre class="code"><code># &lt;slug&gt;
+状态：进行中 | 等你决定 | 完成 | 受阻 | 需要换编排者
+标题：&lt;中文，≤ 12 个字，看板的“任务”列&gt;
+摘要：&lt;当前状态一句话，≤ 20 字&gt;
+要你做：&lt;≤ 15 字；没有就写“无”&gt;
+收尾：可以 | 先别，&lt;原因&gt;
+提醒：&lt;可选，一句要你注意的话&gt;
+
+## 需要你决定
+（只在“等你决定”时写：问题、选项、建议和理由）
+
+## 当前进度
+（几行就够，一行一件事）
+
+## 结论
+目标：…（第一行永远是目标）
+应该怎样：…（从目标推，不从现有设计推）
+根因：哪一层、为什么；改在：…（修 bug、设计类才有）
+依据：每条事实一行，仓库@分支 文件:行 / 实测 / 外部平台官方文档；读过的仓库：…
+结论、改动范围、验证、未决、下一步</code></pre>
+    </div>
+    <div class="prose">
+      <h3>为什么非得是一页</h3>
+      <p>主会话的上下文才是最稀缺的资源。它同时盯着好几个任务，每个任务只占一页，才不会被某个任务的日志和 diff 挤爆。主会话读 rollup 用 <code>drover rollup</code>，读了 drover 就记为已读，<code>watch --main</code> 不会再为这一版叫醒它。要细节的时候，可以让编排者答，或者直接 <code>herdr agent focus &lt;编排者名&gt;</code> 去它的窗口聊。</p>
+      <p>开头那几行写短：看板每格有长度上限，超出的折行或截掉。“收尾：先别，&lt;原因&gt;”是一键收尾前挡住不该收的那一道，比如还有没推的改动。</p>
+      <p>编排者自己的上下文快满时，把进度写全到状态文件，rollup 标“需要换编排者”，主会话用 <code>orch-start --args "resume &lt;slug&gt;"</code> 换一只新的狗接着赶。</p>
+    </div>
+  </div>
+</section>
+
+<div class="fence" aria-hidden="true"></div>
+
+<!-- ================= 一次派发 ================= -->
+<section id="flow">
+  <header>
+    <p class="eyebrow">一次派发的完整流程</p>
+    <h2>一句需求，从说出口到推上远端</h2>
+  </header>
+  <figure class="story-fig">
+    <div class="img-box"><img src="images/10-full-flow.jpg" loading="lazy" alt="插画：一次派发的全景"></div>
+    <figcaption>一次派发的全景：从一句需求到推上远端，人只在开头、拍板和结尾出现。下面的时序图把每一步拆开。</figcaption>
+  </figure>
+  <figure class="fig">
+    <div class="canvas">
+      <svg class="dg w-seq" viewBox="0 0 1000 902" role="img" aria-label="一次派发的时序图：用户说需求，主会话复述后用 orch-start 起编排者，后台挂着 watch --main；编排者分析后对每个条目执行 wt、deps、agent-start、brief --send，watch 追踪，worker 写报告，accept 验收，rollup 交回主会话；主会话先审，再以【转达】开头转给用户；用户说提交推送后编排者执行 integrate、accept、push。">
+        <defs>
+          <marker id="sq-ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah"/></marker>
+          <marker id="sq-ah-t" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-terra"/></marker>
+          <marker id="sq-ah-w" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-teal"/></marker>
+        </defs>
+
+        <!-- 片段框 -->
+        <rect x="392" y="390" width="592" height="232" rx="10" class="note dash"/>
+        <rect x="826" y="390" width="158" height="24" rx="6" class="b-peach"/>
+        <text x="905" y="407" text-anchor="middle" class="tl tb">每个条目一份 · 并行</text>
+        <rect x="16" y="718" width="772" height="178" rx="10" class="note dash"/>
+        <rect x="608" y="718" width="180" height="24" rx="6" class="b-peach"/>
+        <text x="698" y="735" text-anchor="middle" class="tl tb">用户说“提交推送”之后</text>
+
+        <!-- 生命线 -->
+        <line x1="90" y1="66" x2="90" y2="896" class="life"/>
+        <line x1="280" y1="66" x2="280" y2="896" class="life"/>
+        <line x1="480" y1="66" x2="480" y2="896" class="life"/>
+        <line x1="690" y1="66" x2="690" y2="896" class="life"/>
+        <line x1="900" y1="66" x2="900" y2="896" class="life"/>
+
+        <!-- 头部 -->
+        <rect x="15" y="16" width="150" height="50" rx="12" class="b-mus"/>
+        <text x="90" y="39" text-anchor="middle" class="tt">用户</text>
+        <text x="90" y="57" text-anchor="middle" class="ts">提需求、拍板</text>
+        <rect x="205" y="16" width="150" height="50" rx="12" class="b"/>
+        <text x="280" y="39" text-anchor="middle" class="tt">主会话</text>
+        <text x="280" y="57" text-anchor="middle" class="ts">路由 / 审核 / 转达</text>
+        <rect x="405" y="16" width="150" height="50" rx="12" class="b-terra"/>
+        <text x="480" y="39" text-anchor="middle" class="tt">编排者</text>
+        <text x="480" y="57" text-anchor="middle" class="tm c-muted">orch-xxx</text>
+        <rect x="615" y="16" width="150" height="50" rx="12" class="b"/>
+        <text x="690" y="39" text-anchor="middle" class="tmb">drover</text>
+        <text x="690" y="57" text-anchor="middle" class="ts">CLI + herdr</text>
+        <rect x="825" y="16" width="150" height="50" rx="12" class="b-teal"/>
+        <text x="900" y="39" text-anchor="middle" class="tt">worker</text>
+        <text x="900" y="57" text-anchor="middle" class="ts">条目 worktree 里</text>
+
+        <!-- 1 -->
+        <line x1="90" y1="104" x2="278" y2="104" class="e" marker-end="url(#sq-ah)"/>
+        <text x="185" y="96" text-anchor="middle" class="tl">说需求（可带 @仓库 …）</text>
+        <!-- 2 -->
+        <line x1="280" y1="140" x2="92" y2="140" class="e" marker-end="url(#sq-ah)"/>
+        <text x="185" y="132" text-anchor="middle" class="tl">复述目标，不等确认</text>
+        <!-- 3 -->
+        <line x1="280" y1="176" x2="688" y2="176" class="e" marker-end="url(#sq-ah)"/>
+        <text x="485" y="168" text-anchor="middle" class="tm">orch-start --request-file request.md</text>
+        <!-- 4 -->
+        <line x1="690" y1="212" x2="482" y2="212" class="e" marker-end="url(#sq-ah)"/>
+        <text x="585" y="204" text-anchor="middle" class="tl">新 tab + 开场 prompt</text>
+        <!-- 5 -->
+        <line x1="280" y1="248" x2="92" y2="248" class="e" marker-end="url(#sq-ah)"/>
+        <text x="185" y="240" text-anchor="middle" class="tl">“已交给 orch-xxx”</text>
+        <!-- 6 -->
+        <line x1="280" y1="284" x2="688" y2="284" class="e" marker-end="url(#sq-ah)"/>
+        <text x="485" y="276" text-anchor="middle" class="tm">watch --main（后台挂着）</text>
+        <!-- 7 -->
+        <line x1="480" y1="326" x2="688" y2="326" class="e e-terra" marker-end="url(#sq-ah-t)"/>
+        <text x="585" y="318" text-anchor="middle" class="tm">preflight · history</text>
+        <!-- 8 自己 -->
+        <rect x="382" y="344" width="196" height="30" rx="8" class="b-terra"/>
+        <text x="480" y="364" text-anchor="middle" class="tl">读代码 · 拆条目 · 写状态文件</text>
+
+        <!-- 9..14 每个条目 -->
+        <line x1="480" y1="432" x2="688" y2="432" class="e e-terra" marker-end="url(#sq-ah-t)"/>
+        <text x="585" y="424" text-anchor="middle" class="tm">wt → deps → agent-start</text>
+        <line x1="480" y1="468" x2="688" y2="468" class="e e-terra" marker-end="url(#sq-ah-t)"/>
+        <text x="585" y="460" text-anchor="middle" class="tm">brief --send</text>
+        <line x1="690" y1="504" x2="898" y2="504" class="e" marker-end="url(#sq-ah)"/>
+        <text x="795" y="496" text-anchor="middle" class="tl">任务书（目标打头）</text>
+        <line x1="690" y1="540" x2="482" y2="540" class="e" marker-end="url(#sq-ah)"/>
+        <text x="585" y="532" text-anchor="middle" class="tl"><tspan class="tm">watch</tspan>：EVENT 状态变化</text>
+        <line x1="900" y1="576" x2="482" y2="576" class="e e-teal dash" marker-end="url(#sq-ah-w)"/>
+        <text x="690" y="568" text-anchor="middle" class="tl">报告 <tspan class="tm">&lt;agent&gt;.md</tspan>（DONE / NEED_INPUT …）</text>
+        <line x1="480" y1="606" x2="688" y2="606" class="e e-terra" marker-end="url(#sq-ah-t)"/>
+        <text x="585" y="598" text-anchor="middle" class="tm">accept --verify（+ review）</text>
+
+        <!-- 15 16 -->
+        <line x1="480" y1="660" x2="282" y2="660" class="e e-terra dash" marker-end="url(#sq-ah-t)"/>
+        <text x="380" y="652" text-anchor="middle" class="tl"><tspan class="tm">rollup.md</tspan>：完成 / 等你决定</text>
+        <line x1="280" y1="696" x2="92" y2="696" class="e" marker-end="url(#sq-ah)"/>
+        <text x="185" y="688" text-anchor="middle" class="tl">先审，再【转达】（开头是目标）</text>
+
+        <!-- 17..20 提交推送 -->
+        <line x1="90" y1="768" x2="278" y2="768" class="e" marker-end="url(#sq-ah)"/>
+        <text x="185" y="760" text-anchor="middle" class="tl">“提交推送”</text>
+        <line x1="280" y1="804" x2="478" y2="804" class="e" marker-end="url(#sq-ah)"/>
+        <text x="380" y="796" text-anchor="middle" class="tl"><tspan class="tm">prompt</tspan> 转达原话</text>
+        <line x1="480" y1="840" x2="688" y2="840" class="e e-terra" marker-end="url(#sq-ah-t)"/>
+        <text x="585" y="832" text-anchor="middle" class="tm">integrate → accept → push</text>
+        <line x1="480" y1="876" x2="282" y2="876" class="e e-terra dash" marker-end="url(#sq-ah-t)"/>
+        <text x="380" y="868" text-anchor="middle" class="tl"><tspan class="tm">rollup.md</tspan>：完成</text>
+      </svg>
+    </div>
+    <p class="swipe">← 图比屏幕宽，可以左右滑动 →</p>
+    <figcaption><b>一次派发的时序。</b>实线是命令或消息，虚线是写文件、对方去读。赤陶色箭头是编排者发出的 CLI 命令。主会话的追踪是 <code>watch --main</code>：在 Claude Code 里用后台 Bash 挂着，只在有要处理的事时退出、叫醒主会话；Codex 没有后台任务，主会话每收到一条消息先跑一次 <code>board --json</code>。虚线框里那一段对每个条目各走一遍，同时进行。</figcaption>
+  </figure>
+
+  <ol class="steps">
+    <li><span>用户在主工作台的会话（Claude Code 或 Codex）里直接说需求，不用写 <code>/drover</code>；离开电脑时在飞书里直接发也一样。可以带 <code>@仓库</code>、<code>--agent codex</code>、<code>--orch codex</code>、<code>--review</code>、<code>--effort</code>；<code>--agent</code> / <code>--orch</code> 不写时，编排者和 worker 跟主会话用同一个宿主。要改代码的、调研 / 排查 / 方案 / 写文档，只要不是几次工具调用能答完的，都走下面这条路；主会话直接做的只有问答讲解、查进度转达、本机配置的一两处小改，拿不准默认派发。</span></li>
+    <li><span>主会话第一条回复先复述目标，不等确认；写 <code>~/.drover/&lt;slug&gt;/request.md</code>（用户原话 + 目标 + 一行“标题：”给看板用 + 上下文），跑 <code>drover orch-start --slug … --name orch-… --request-file …</code>，告诉用户编排者叫什么。<code>watch --main</code> 一直在后台挂着，新起的编排者自动跟上，不用另挂。</span></li>
+    <li><span>编排者读 request.md，加载流程正文 <code>flow/dispatch.md</code>，跑 <code>preflight</code>；读代码，用 <code>history</code> 查这个仓库的历史派发记录当线索；拆条目、定完成证据，写状态文件 <code>&lt;slug&gt;/dispatch.md</code>。</span></li>
+    <li><span>每个条目：<code>wt</code>（分支 <code>task/&lt;slug&gt;-&lt;条目&gt;</code>；新建前先同步主检出，从远端最新起；任务推过之后，下一轮从上一轮推的远端分支起，见<a href="#integrate">下一节</a>）→ <code>deps</code> → <code>agent-start</code> → 写任务段 <code>&lt;agent&gt;.task.md</code> → <code>brief --send</code>。任务书由脚本按模板拼：目标、任务、完成证据、工作目录、依赖、约束、完成协议。需要先核实现状的，加 <code>--survey</code> 让 worker 先摸底。</span></li>
+    <li><span><code>watch</code> 追踪，状态一变就出一行 EVENT。<code>blocked</code> 的权限弹窗（包括它派的后台子 agent 弹出来的）编排者按决策表自己批，push、删分支、写数据库、部署这类才升级给人。</span></li>
+    <li><span>worker 写报告 <code>&lt;slug&gt;/&lt;agent&gt;.md</code>（DONE / PARTIAL / FAILED / NEED_INPUT）→ 编排者 <code>accept --verify …</code> 按证据验收 → 带了 <code>--review</code> 的再 <code>review</code>（codex 只读复审）→ <code>collect</code>。</span></li>
+    <li><span>编排者写 rollup（“完成”或“等你决定”），<code>watch --main</code> 报一行未读的 <code>rollup:&lt;状态&gt;</code>；主会话用 <code>drover rollup</code> 读（读了就记为已读），按里面的依据先审（见 <a href="#stage-8">⑧</a>），不过就打回编排者补；审过再转给用户，第一行以 <code>【转达】</code> 开头、接着是目标（飞书 oncall 只推这样开头的转达），末尾附上其他在等你的（<code>board --pending</code>）。</span></li>
+    <li><span>用户说“提交推送” → 各条目提交 → <code>integrate</code> → <code>accept</code> 整体检查 → 迁移 → <code>push</code>。见<a href="#integrate">下一节</a>。</span></li>
+    <li><span>用户说“收尾”（或者在看板上点 [收尾] / [全部收尾]）→ 先汇总、再清理：编排者用 <code>drover wrapup</code> 收集事实（推送记录和远端核对、推送范围里的迁移和配置文件、整体检查结果、待清理的 worktree），补全成 <code>&lt;slug&gt;/wrapup.md</code>（变更、提交、数据库、配置、上线、验证、未决）；再用 <code>drover cleanup</code> 核实（里面的 worker 没在干活、内容都在这个任务推过的远端分支里）后删 worktree 和分支、关 pane，核实不过的不删、来问。rollup 里写精简版，主会话转给你后关掉编排者的 tab。几个任务一起收尾时，主会话用各 rollup 合成一张总表，末尾列出各 <code>wrapup.md</code> 的路径。只说“清理”就只清理，不写汇总。</span></li>
+  </ol>
+</section>
+
+<div class="fence" aria-hidden="true"></div>
+
+<!-- ================= 集成与推送 ================= -->
+<section id="integrate">
+  <header>
+    <p class="eyebrow">条目 worktree → 集成 worktree → 推送</p>
+    <h2>羊各自吃草，回圈只走一道门</h2>
+  </header>
+  <div class="prose">
+    <p>条目各干各的，但同步上游、全量测试、迁移、推送这几件事，每个仓库只在编排者的集成 worktree 里做一次。只有一个条目的任务也走这条路，流程统一。跨仓任务每个仓库各走一遍，顺序由编排者定。这就是编排者的第三个身份：集成者。</p>
+  </div>
+  <figure class="story-fig">
+    <div class="img-box"><img src="images/09-integrator.jpg" loading="lazy" alt="插画：编排者当集成者，条目 worktree 归集到集成 worktree，过检查门后推送"></div>
+    <figcaption>编排者当集成者：条目 worktree → 集成 worktree → 检查门 → 推送。</figcaption>
+  </figure>
+  <figure class="fig">
+    <div class="canvas">
+      <svg class="dg w-int" viewBox="0 0 1000 432" role="img" aria-label="集成与推送：各条目分支按条目提交，integrate 从最新的 origin 上游建集成 worktree 并按顺序 cherry-pick，accept 整体检查一次（全量测试只在这里），执行迁移，push 时上游有新提交就 rebase、报告、这次不推，回去补检查；没有新提交就推送，用 ls-remote 核对，记进任务的 pushes.jsonl。">
+        <defs>
+          <marker id="it-ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah"/></marker>
+          <marker id="it-ah-t" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-terra"/></marker>
+        </defs>
+
+        <!-- ① 条目 worktree -->
+        <text x="16" y="40" class="tb">① 条目 worktree</text>
+        <text x="16" y="60" class="ts">一个条目一个 agent 一个 worktree</text>
+        <rect x="16" y="110" width="180" height="46" rx="8" class="b-teal"/>
+        <text x="28" y="130" class="tm">task/&lt;slug&gt;-api</text>
+        <text x="28" y="148" class="ts">按条目提交</text>
+        <circle cx="180" cy="133" r="7" class="commit-item"/>
+        <rect x="16" y="166" width="180" height="46" rx="8" class="b-teal"/>
+        <text x="28" y="186" class="tm">task/&lt;slug&gt;-ui</text>
+        <text x="28" y="204" class="ts">按条目提交</text>
+        <circle cx="180" cy="189" r="7" class="commit-item"/>
+        <rect x="16" y="222" width="180" height="46" rx="8" class="b-teal"/>
+        <text x="28" y="242" class="tm">task/&lt;slug&gt;-docs</text>
+        <text x="28" y="260" class="ts">按条目提交</text>
+        <circle cx="180" cy="245" r="7" class="commit-item"/>
+        <text x="16" y="300" class="tl tb c-terra">worker 不提交、不各自 rebase</text>
+        <text x="16" y="320" class="ts">提交由编排者按条目做</text>
+        <text x="16" y="338" class="ts">worker 只跑相关测试 + tsc + lint</text>
+
+        <!-- ② integrate -->
+        <text x="236" y="40" class="tb">② <tspan class="tm tb">drover integrate</tspan></text>
+        <rect x="236" y="56" width="250" height="284" rx="14" class="b"/>
+        <line x1="300" y1="84" x2="300" y2="270" class="e" marker-end="url(#it-ah)"/>
+        <circle cx="300" cy="84" r="8" class="commit-base"/>
+        <text x="316" y="80" class="tm">先 fetch，再从最新的</text>
+        <text x="316" y="96" class="tm">origin/&lt;上游&gt; 建</text>
+        <circle cx="300" cy="133" r="8" class="commit"/>
+        <text x="316" y="137" class="tm">api′</text>
+        <circle cx="300" cy="189" r="8" class="commit"/>
+        <text x="316" y="193" class="tm">ui′</text>
+        <circle cx="300" cy="245" r="8" class="commit"/>
+        <text x="316" y="249" class="tm">docs′</text>
+        <text x="316" y="276" class="tm tb c-terra">task/&lt;slug&gt;</text>
+        <text x="252" y="304" class="ts">按 --from 顺序 cherry-pick，已应用的跳过</text>
+        <text x="252" y="324" class="ts">冲突就停下，解完再跑；最后装依赖</text>
+        <line x1="188" y1="133" x2="290" y2="133" class="e e-terra" marker-end="url(#it-ah-t)"/>
+        <line x1="188" y1="189" x2="290" y2="189" class="e e-terra" marker-end="url(#it-ah-t)"/>
+        <line x1="188" y1="245" x2="290" y2="245" class="e e-terra" marker-end="url(#it-ah-t)"/>
+        <text x="242" y="125" text-anchor="middle" class="tm c-terra">cherry-pick</text>
+
+        <!-- ③ 整体检查 -->
+        <text x="526" y="40" class="tb">③ 整体检查一次</text>
+        <rect x="526" y="56" width="210" height="196" rx="14" class="b"/>
+        <text x="542" y="82" class="tmb">drover accept</text>
+        <text x="542" y="106" class="tm">--verify tsc</text>
+        <text x="542" y="125" class="tm">--verify build</text>
+        <text x="542" y="144" class="tm">--verify-baseline 全量测试</text>
+        <text x="542" y="163" class="tm">--verify-baseline lint</text>
+        <rect x="542" y="176" width="178" height="26" rx="13" class="b-terra"/>
+        <text x="631" y="194" text-anchor="middle" class="tl tb c-terra">全量测试只在这里跑</text>
+        <text x="542" y="224" class="ts">失败集合和基线比</text>
+        <text x="542" y="241" class="ts">没有新增就算通过</text>
+        <line x1="486" y1="189" x2="524" y2="189" class="e" marker-end="url(#it-ah)"/>
+
+        <!-- ④ 迁移（箭头上） -->
+        <line x1="736" y1="104" x2="788" y2="104" class="e" marker-end="url(#it-ah)"/>
+        <text x="762" y="94" text-anchor="middle" class="tl tb">④ 迁移</text>
+        <text x="762" y="124" text-anchor="middle" class="ts">有就执行</text>
+
+        <!-- ⑤ push -->
+        <text x="790" y="40" class="tb">⑤ <tspan class="tm tb">drover push</tspan></text>
+        <rect x="790" y="56" width="194" height="96" rx="14" class="b"/>
+        <text x="887" y="86" text-anchor="middle" class="tl">先 fetch</text>
+        <text x="887" y="108" text-anchor="middle" class="tl tb">上游有新提交吗？</text>
+
+        <!-- 没有 -->
+        <line x1="940" y1="152" x2="940" y2="196" class="e" marker-end="url(#it-ah)"/>
+        <text x="948" y="180" class="tl tb">没有</text>
+        <rect x="844" y="198" width="140" height="64" rx="10" class="b"/>
+        <text x="914" y="224" text-anchor="middle" class="tm">push HEAD:&lt;上游&gt;</text>
+        <text x="914" y="246" text-anchor="middle" class="tl">ls-remote 核对</text>
+        <line x1="914" y1="262" x2="914" y2="300" class="e" marker-end="url(#it-ah)"/>
+        <rect x="844" y="302" width="140" height="52" rx="26" class="b-teal"/>
+        <text x="914" y="324" text-anchor="middle" class="tm">origin/&lt;上游&gt;</text>
+        <text x="914" y="342" text-anchor="middle" class="tm c-teal">verified: true</text>
+        <text x="914" y="376" text-anchor="middle" class="ts">记进 <tspan class="tm">pushes.jsonl</tspan></text>
+
+        <!-- 有新提交 -->
+        <line x1="820" y1="152" x2="820" y2="284" class="e e-terra" marker-end="url(#it-ah-t)"/>
+        <text x="812" y="226" text-anchor="end" class="tl tb c-terra">有</text>
+        <rect x="526" y="286" width="300" height="130" rx="12" class="b-terra"/>
+        <text x="542" y="310" class="tb">rebase 到新上游，这次不推</text>
+        <text x="542" y="332" class="tl">报告上游改了哪类文件、和我们重叠的文件</text>
+        <text x="542" y="352" class="tm">migrations / deps / code / docs</text>
+        <text x="542" y="378" class="tl"><tspan class="tm">needs_reverify</tspan>：true 先补检查</text>
+        <text x="542" y="398" class="tl">false（只改了文档）直接再跑 push</text>
+        <line x1="600" y1="286" x2="600" y2="254" class="e e-terra" marker-end="url(#it-ah-t)"/>
+        <text x="608" y="274" class="ts">新 base 已回写</text>
+      </svg>
+    </div>
+    <p class="swipe">← 图比屏幕宽，可以左右滑动 →</p>
+    <figcaption><b>条目 worktree → 集成 worktree → 推送。</b>青色点是条目分支上的提交，赤陶色点是 cherry-pick 到集成分支 <code>task/&lt;slug&gt;</code> 上的副本。推送这一步只有“上游没有新提交”才会真的推；有新提交就先 rebase、报告、停一次，补完检查再跑 <code>push</code>。</figcaption>
+  </figure>
+  <div class="prose">
+    <ul>
+      <li><strong>什么时候做</strong>：用户明确说了“提交推送”才做，编排者从主会话转达的原话里确认。</li>
+      <li><strong>integrate 冲突</strong>：脚本停下并返回冲突文件。在集成 worktree 里解完 → <code>git add</code> → <code>cherry-pick --continue</code> → 再跑一次同样的 <code>integrate</code>。不 <code>--abort</code>；要放弃某个提交先写明理由。</li>
+      <li><strong>整体检查</strong>：仓库基线本来就有失败的命令（全量测试、lint）放 <code>--verify-baseline</code>，脚本自动和上游比失败条目，只看有没有新增。</li>
+      <li><strong>push 回写 base</strong>：rebase 后的新上游写回 <code>&lt;slug&gt;/integrate-&lt;仓库&gt;.json</code>，补检查就用它当 <code>accept --base</code>。rebase 冲突是人工解的，下一次 push 会先停一次。</li>
+      <li><strong>推送成功的标准</strong>：<code>ls-remote</code> 核对后 <code>verified: true</code>。rebase 记录在集成状态 <code>integrate-&lt;仓库&gt;.json</code> 里。</li>
+      <li><strong>推送账本</strong>：每次推上去都记一行进任务的 <code>&lt;slug&gt;/pushes.jsonl</code>（目标分支、本地分支、推送前的远端头、远端提交、范围、提交列表、时间、核对过没有），没走集成状态的也记。收尾汇总的“提交”一节、新一轮从哪起、清理时核对什么，都按它来。定不了是哪个任务的就不推，提示加 <code>--slug</code>。</li>
+      <li><strong>新一轮的起点</strong>：任务推过之后接着改，<code>wt</code> / <code>integrate</code> 默认从上一轮推的那条远端分支（fetch 到最新）起，不从主检出所在的分支起；建之前先核实上一轮推上去的提交都在起点里（同一条分支看祖先，换了分支按补丁内容比）。不在（比如换到了新的 release 分支）就不建，列出缺的提交，交你定：<code>--carry "&lt;理由&gt;"</code> 带上这些提交在新分支上起，或者 <code>--base</code> 回到上一轮的分支接着改。</li>
+      <li><strong>推完不自动删</strong>：worktree、分支等你说“清理”或“收尾”时，编排者跑 <code>drover cleanup</code>：逐个核实里面的 worker 没在干活、提交和没提交的改动都在这个任务推过的远端分支的历史里（推上去之后又被后来的轮次改过也算），全过才删 worktree、本地分支、关掉 worker；核实不过的不动，写明原因来问你。主检出永远不动。探测、调研用的 worktree 不交付改动，报告记下就删，改过的代码先存成 patch 放进任务目录。</li>
+    </ul>
+  </div>
+  <aside class="bark"><b>汪</b><span>羊在外面各吃各的草，回圈只开一道门。门口数一遍，数对了才关门。</span></aside>
+</section>
+
+<div class="fence" aria-hidden="true"></div>
+
+<!-- ================= 状态与事件 ================= -->
+<section id="watch">
+  <header>
+    <p class="eyebrow">agent 状态与 watch 事件</p>
+    <h2>watch 每叫一声，都有对应动作</h2>
+  </header>
+  <div class="prose">
+    <p><code>drover watch &lt;agent…&gt;</code> 先打印每个 agent 当前的状态，之后状态一变就输出一行 <code>EVENT &lt;agent&gt; &lt;状态&gt; @时:分:秒</code>。前五个状态来自 herdr，后面几个是 CLI 在它上面多看了一眼得出的：看状态栏、看屏幕底部、看 worktree 有没有动。编排者另外还有一行 <code>rollup:&lt;状态&gt;</code>，盯的是它的 <code>rollup.md</code>。</p>
+  </div>
+  <div class="table-wrap">
+    <table class="t-events">
+      <thead><tr><th>事件</th><th>什么意思</th><th>怎么处理</th></tr></thead>
+      <tbody>
+        <tr><td><span class="ev ok">working</span></td><td>agent 在干活</td><td>继续等，不打扰。</td></tr>
+        <tr><td><span class="ev stop">idle</span> / <span class="ev stop">done</span></td><td>agent 停下了</td><td>读报告 <code>&lt;slug&gt;/&lt;agent&gt;.md</code>（worker 在对话里只回复报告路径和 status）；没有这个文件就看屏幕，做完没写文件的让它补写；走摸底的读 <code>&lt;agent&gt;.survey.md</code>。</td></tr>
+        <tr><td><span class="ev warn">blocked</span></td><td>停在弹窗或审批上。herdr 说漏的两种 watch 按屏幕补报：herdr 报 done / idle、屏幕底部却是确认弹框（比如 WebFetch 的域名授权）；herdr 报 working、屏幕底部却是后台子 agent 的确认框（主 agent 停在 “Waiting for N background agent(s) to finish”，working 时每 10 秒看一次屏幕）。同一状态下 herdr 的序号变了、或者弹框换了，会再报一次，连着弹的每一个都报</td><td>编排者用 <code>herdr agent read</code> 看清选项和光标位置，按决策表回答；常规开发操作直接批，push、删分支、数据库写、部署升级给人。永远先读再按键，批完再读一次屏，子 agent 常常紧接着弹下一个。编排者自己卡住时由主会话批。</td></tr>
+        <tr><td><span class="ev warn">gone</span></td><td>agent 进程退出了</td><td>看 pane 里的退出原因，<code>agent-start --resume</code> 续上，再让它接着做。</td></tr>
+        <tr><td><span class="ev stop">waiting-background(N)</span></td><td>herdr 报 done / idle，但状态栏里还有 N 个后台命令或 Monitor（比如全量测试、<code>heavy</code> 在排队，或者编排者挂着 watch 盯 worker）</td><td><strong>别去读报告</strong>，继续等。后台命令结束后 agent 会自己醒来接着干。Codex 的后台终端结束后不会自动唤醒 agent，所以不算进这一项。</td></tr>
+        <tr><td><span class="ev warn">api-error</span></td><td>herdr 报 done / idle，但屏幕上最后一个输出块是接口错误（Claude Code 行首的 <code>API Error: 503 …</code>、codex 的 stream error；正文里提到这几个字不算）。这一轮被接口错误打断了，agent 自己不会再动</td><td>等一两分钟，用 <code>drover prompt</code> 让它从中断的地方接着做；连着 3 次都报错就停下，标受阻。这个事件是 11-06 加的：一次接口 503，编排者和三个 worker 同时停住，6 个多小时没人发现。</td></tr>
+        <tr><td><span class="ev warn">working-no-output(Nm)</span></td><td>还在 working，但屏幕输出 N 分钟没变、也没在跑命令（默认 5 分钟）</td><td>多半卡在一次模型调用上。读最后的动作；活干完只差报告、或明显停住了，就 esc 再催“先汇报进度，做完就写报告”。</td></tr>
+        <tr><td><span class="ev meta2">working-no-diff(Nm)</span></td><td>还在 working，但 worktree N 分钟没有任何改动（默认 20 分钟）</td><td>只是提示，跑长测试、读大量代码时也会这样。抽查进展，真卡死再 esc 让它继续。卡在确认框上的时间不算进这两种计时。</td></tr>
+        <tr><td><span class="ev ok">rollup:&lt;状态&gt;</span></td><td>只对编排者：它的 <code>rollup.md</code> 状态变了就报；“等你决定 / 完成 / 受阻 / 需要换编排者”时内容变了也报（按内容判断：每行去掉首尾空白、删掉空行后比较，原样重写、只改空白不报，不看“更新：”行），“进行中”只改进度不报</td><td>上层读 rollup：子编排者由起它的编排者读，顶层编排者由主会话读（主会话用的是下面的 <code>watch --main</code>）。编排者写完“等你决定”后还挂着 watch 盯 worker，状态行是 <code>waiting-background(N)</code>，这时只有这一行能叫醒上层。</td></tr>
+        <tr><td><span class="ev meta2">herdr unreachable</span> / <span class="ev meta2">timeout</span></td><td>连不上 herdr / 这一轮等到期</td><td>重新挂 watch。</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="swipe">← 表格比屏幕宽，可以左右滑动 →</p>
+
+  <h3 class="sub">主会话的追踪：watch --main</h3>
+  <div class="prose">
+    <p>主会话不挨个盯编排者，用 <code>drover watch --main</code>：不写名字时每一轮自动找所有顶层编排者（新起的自动跟上，子编排者由它的上层盯），<strong>只报主会话要处理的事</strong>，一件事一行 <code>EVENT &lt;编排者名&gt; &lt;事件&gt; @时:分:秒</code>；working、<code>waiting-background</code>、<code>rollup:进行中</code>、done / idle 本身都不报。哪份 rollup 读过由 drover 记（主会话用 <code>drover rollup</code> 读了才算，编排者、别的终端读不算），报过的事件记在任务目录的 <code>main-watch.json</code>，重挂、<code>/clear</code> 之后都不重报，没有新东西时启动不输出任何一行。两个 <code>watch --main</code> 同时跑，同一件事也只报一次。</p>
+  </div>
+  <div class="table-wrap">
+    <table class="t-events">
+      <thead><tr><th>事件</th><th>什么时候报</th><th>主会话怎么做</th></tr></thead>
+      <tbody>
+        <tr><td><span class="ev ok">rollup:&lt;状态&gt;</span></td><td>状态是 等你决定 / 完成 / 受阻 / 需要换编排者，而且主会话还没读过这一版</td><td>用 <code>drover rollup</code> 读（记为已读），按依据先审，过了才转给你（第一行 <code>【转达】</code>）；不过就打回编排者补。需要换编排者的，起一个新的接着做。</td></tr>
+        <tr><td><span class="ev warn">blocked</span></td><td>编排者卡在确认框上（包括按屏幕补报的后台子 agent 确认框）；同一个弹框只报一次，换了再报</td><td>看屏幕批掉，破坏性的才问你；批完再看一眼，子 agent 常常紧接着弹下一个。</td></tr>
+        <tr><td><span class="ev warn">api-error</span></td><td>编排者这一轮被接口错误打断</td><td>等一两分钟让它接着做，它的 worker 也续上；连着 3 次都报错就告诉你是上游接口（API 或代理）的问题。</td></tr>
+        <tr><td><span class="ev warn">gone</span></td><td>编排者不在 herdr 里了，rollup 却不是 完成 / 需要换编排者（意外退出）</td><td><code>orch-start --args "resume &lt;slug&gt;"</code> 起一个新的，宿主沿用原来的。</td></tr>
+        <tr><td><span class="ev stop">stalled(Nm)</span></td><td>编排者停了 N 分钟，rollup 还是进行中，或者转过答复之后一直没更新</td><td>看一眼屏幕，分清是在等后台任务还是卡住了。</td></tr>
+        <tr><td><span class="ev meta2">herdr unreachable</span></td><td>herdr 连不上</td><td>跑 <code>drover preflight</code>：herdr server 还在就再挂，不在就告诉你。</td></tr>
+        <tr><td><span class="ev ok">drover updated(a..b)</span></td><td>后台自动更新装上了新版本（名字那一栏是 <code>drover</code>）；带 <code>rules</code> 的是主会话的规则也变了</td><td>跑 <code>drover rules</code> 把改动读进来，不用 <code>/clear</code>；再跑 <code>board --tab</code> 换掉旧代码的看板；终端里一句话告诉你更新到哪了。</td></tr>
+        <tr><td><span class="ev meta2">drover update-blocked</span><br><span class="ev meta2">update-unreachable(24h)</span></td><td>自动更新被挡住（clone 里有本地改动、和上游分叉）；连续 24 小时连不上更新源（网络、代理或认证的问题）</td><td>各说一句原因；同一个原因只报一次。</td></tr>
+        <tr><td><span class="ev ok">drover session-restarted</span></td><td>Claude Code 的主会话 <code>/clear</code> 了：之前挂着的 watch 看到会话换了</td><td>新对话不等你开口就接上：先处理看板最底下“主会话在处理”那一行的事，重新挂 watch，一两句话告诉你现在有哪些任务、各自在等谁。</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="swipe">← 表格比屏幕宽，可以左右滑动 →</p>
+  <div class="cols">
+    <div class="prose">
+      <h3>主会话怎么挂、怎么看全部</h3>
+      <p>Claude Code 的主会话用后台 Bash 挂 <code>watch --main --until-event</code>：有事才输出、输出完就退出，退出的通知叫醒主会话，处理完再挂同一条，始终只挂一个（被宿主结束、输出里没有 EVENT 行时，退回 Monitor）。Codex 没有后台任务，主会话每收到一条消息先跑一次 <code>board --json</code>，里面要主会话处理的先处理；你说“盯着”时才挂 <code>watch --main --until-event --timeout 600</code> 阻塞等待。</p>
+      <p>要一眼看全部，看主会话旁边的看板 tab，或者问一句“进度怎么样”，主会话把 <code>drover board</code> 的表原样给你。<code>orch-status</code> 还在：列出活着的编排者、herdr 报的原值和按屏幕修正的 <code>screen_status</code>、rollup 状态行，卡在确认框上的列进顶层的 <code>blocked</code>，排障时用。</p>
+    </div>
+    <div class="prose">
+      <h3>确认框从源头少弹：cd+git 拦截 hook</h3>
+      <p><code>cd &lt;目录&gt; &amp;&amp; git …</code> 会触发 Claude Code 内置的安全确认，它不走白名单、没有 “don't ask again”，每条都要人批；编排者和 worker 派出去的子代理（Explore 等）看不到“用 <code>git -C</code>”的规则，最爱这么写。install 往 <code>~/.claude/settings.json</code> 加了一个 PreToolUse hook（<code>hooks/cd_git_guard.py</code>）：拒绝这种命令，把 <code>git -C &lt;目录&gt; …</code> 的改法回给 agent，让它自己改写重试。hook 在内置确认之前执行，对子代理也生效；它自己出任何问题都放行。</p>
+    </div>
+  </div>
+  <div class="prose">
+    <p class="small"><strong>以前的噪声：</strong>11-05 实测，watch 对 working / done 的抖动太敏感，一个编排者一分多钟里报了 8 次，Claude Code 的主会话每次都被 Monitor 叫醒、读一遍 rollup，结果什么也没变；11-18 又看到 Monitor 每 30 分钟到期重挂一次，把当前状态全报一遍。主会话改用 <code>watch --main</code> 之后，working、done 本身不报，读过的 rollup 不重报，这两种噪声都没了。</p>
+  </div>
+  <aside class="bark"><b>汪</b><span>herdr 说这只羊在歇着，不一定真在歇，可能是在等后台的测试跑完。先别把它叫过来问话。</span></aside>
+</section>
+
+<div class="fence" aria-hidden="true"></div>
+
+<!-- ================= 验收 ================= -->
+<section id="accept">
+  <header>
+    <p class="eyebrow">按证据验收</p>
+    <h2>“做完了”？拿证据来</h2>
+  </header>
+  <div class="prose">
+    <p><strong>完成证据</strong>在派发时就定好：编排者给 <code>brief</code> 传 <code>--evidence</code>（必填、可重复），每条写成“跑什么命令、看到什么结果算通过”。写不出来，说明任务还没拆清楚。worker 的报告里 verification 要逐条对应；worker 只要求相关测试、类型检查和 lint，全量测试留到集成时。</p>
+    <p>验收不看 worker 的自述，看 worktree 里的实际改动和脚本重跑的结果。<code>accept</code> 依次做这些事：</p>
+  </div>
+  <ol class="pipe" aria-label="accept 的步骤">
+    <li>记录 <code>git status --porcelain</code></li>
+    <li><code>git add -N .</code> 让新文件进 diff</li>
+    <li>code-review-graph 建图</li>
+    <li><code>detect-changes --brief</code></li>
+    <li><code>git diff &lt;BASE&gt; --stat</code></li>
+    <li>逐条重跑 <code>--verify</code></li>
+  </ol>
+  <div class="cols">
+    <div class="prose">
+      <h3>怎么判</h3>
+      <ul>
+        <li><code>verify_failed: true</code> 就是不通过：把失败的命令和输出尾部发回 worker 修。</li>
+        <li>完成证据逐条核对，缺哪条补哪条。</li>
+        <li>图里改动的文件比报告多：越界改动或临时文件，要说明理由或撤回。</li>
+        <li><code>graph.untested</code> 里的函数连间接测试都没有：补测试，或补一次真实运行的证据。</li>
+        <li>读 diff 看层次与简洁：没改在产生问题的那一层，或新增的分支、特例、兜底、名单、阈值写不出依据（现有调用方、数据），就不通过。</li>
+        <li><code>git add -N</code> 只登记路径、不暂存内容，不算提交。</li>
+      </ul>
+    </div>
+    <div class="prose">
+      <h3>几个省心的机关</h3>
+      <ul>
+        <li><strong>和基线比</strong>：<code>--verify-baseline</code> 的命令失败时，CLI 在 BASE 上临时建一个 worktree，只重跑当前失败所在的文件（tsc 照旧跑整条），按条目比失败集合（vitest / pytest / tsc / eslint），没有新增就算通过；失败的文件 BASE 上没有，直接算新增。基线结果按仓库 + BASE + 命令 + 重跑的文件缓存。</li>
+        <li><strong>负载超时复核</strong>：vitest 的失败全是超时，就把失败文件单独重跑一次，过了判通过，并标出 <code>flaky_timeouts</code>。</li>
+        <li><strong>重命令按资源调度</strong>：<code>--verify</code> 的每条命令和建图都经 <code>heavy</code> 调度，机器还有余量就马上跑，真满了才排队（怎么算见<a href="#ending">结尾</a>）；多条 <code>--verify</code> 默认同时交给调度，结果按传入的顺序排，前后有依赖的加 <code>--serial</code> 逐条跑。worker 的测试、lint、类型检查、构建一律经 <code>drover heavy -- &lt;命令&gt;</code>。</li>
+        <li><strong>可选复审</strong>：带 <code>--review</code> 时，<code>review</code> 一条命令在 worker 旁边分屏起只读 codex 并立刻发出 prompt，<code>collect</code> 存档后关 pane；High / Medium 交回修一轮。</li>
+      </ul>
+    </div>
+  </div>
+  <div class="prose"><p class="small">失败也分原因处理：上下文用满就缩小范围换新 agent，进程退出就 resume，原地打转就换 kind（claude 换 codex 或反过来），理解偏了先分清是 worker 偏了还是任务书偏了。同一个任务两次重试仍失败，就停下重新规划。</p></div>
+</section>
+
+<div class="fence" aria-hidden="true"></div>
+
+<!-- ================= 宿主差异 ================= -->
+<section id="hosts">
+  <header>
+    <p class="eyebrow">宿主差异</p>
+    <h2>换个宿主，差在哪几处</h2>
+  </header>
+  <div class="prose"><p>流程正文 <code>flow/dispatch.md</code> 只写一份，两边共用；宿主不同的做法放在文末附录 A（Claude Code）和附录 B（Codex）。差别集中在这几处：</p></div>
+  <div class="table-wrap">
+    <table class="t-hosts">
+      <thead><tr><th></th><th><span class="host-cc">Claude Code</span>（附录 A）</th><th><span class="host-cx">Codex</span>（附录 B）</th></tr></thead>
+      <tbody>
+        <tr><td>技能入口</td><td>Skill 工具加载 <code>drover</code>（也就是 <code>/drover</code> 命令）和 <code>herdr</code></td><td><code>$drover</code> 只是一层壳，让它去读流程正文；herdr 技能是 <code>$herdr</code></td></tr>
+        <tr><td>规则和记忆</td><td>全局规则、主工作台的 <code>CLAUDE.md</code>（引用 <code>@AGENTS.md</code>）自动加载</td><td><code>AGENTS.md</code> 自动加载；全局规则和记忆索引要开始前先读</td></tr>
+        <tr><td>主会话追踪编排者</td><td>后台 Bash 挂 <code>watch --main --until-event</code>，有事才退出、叫醒主会话，处理完再挂；被宿主结束时退回 Monitor</td><td>没有后台任务：每收到一条消息先跑 <code>board --json</code>，要主会话处理的先处理；你说“盯着”时 <code>watch --main --until-event --timeout 600</code> 阻塞等待（exec_command 启动、write_stdin 轮询到退出）</td></tr>
+        <tr><td>编排者追踪 worker</td><td>Monitor 跑 <code>watch</code>，每来一行 EVENT 被唤醒，到期重新挂</td><td><code>watch --until-event --timeout 1500</code> 阻塞等待，exec_command 启动、write_stdin 轮询到退出</td></tr>
+        <tr><td>看板</td><td>会话开始登记完跑 <code>board --tab</code>，在主对话旁边开同级的“看板”tab</td><td>同左：登记完也跑 <code>board --tab</code></td></tr>
+        <tr><td>自动更新后读新规则</td><td><code>watch --main</code> 报 <code>drover updated</code> 就跑 <code>drover rules</code>；没挂 watch 时，install 装的 UserPromptSubmit hook 在你下一条消息时把改动一起送进来</td><td>不装 hook：每条消息先跑的 <code>board --json</code> 里 <code>rules_changed</code> 为真就跑 <code>drover rules</code>，新规则在你下一条消息时用上</td></tr>
+        <tr><td><code>/clear</code> 之后</td><td>之前挂着的 watch 报 <code>session-restarted</code>，新对话自己接上，不用你先开口</td><td><code>/new</code> 之后要等你第一条消息才接上；看板照常刷新，herdr 清掉的 <code>drover</code> 名字由看板补登记，飞书消息照样送得进来</td></tr>
+        <tr><td>登记主会话</td><td>SessionStart hook 每次会话开始（新开、<code>/clear</code>、resume）跑 <code>drover main-register --hook</code>，在 herdr 里改名为 <code>drover</code></td><td>不装 hook（codex 的新 hook 要手动信任，信任前所有 codex 会话启动都会卡住）；主会话在第一条消息时按路由规则跑 <code>drover main-register</code></td></tr>
+        <tr><td>向用户提问</td><td>主会话用 AskUserQuestion；编排者一律写 rollup</td><td>主会话用 request_user_input_async；编排者一律写 rollup</td></tr>
+        <tr><td>长命令</td><td>Bash 的 <code>run_in_background</code>，完成会通知</td><td>exec_command 启动、write_stdin 轮询，不用 sleep 干等</td></tr>
+        <tr><td>沙箱和权限</td><td>acceptEdits + 白名单前缀；cd+git 拦截 hook 兜住没法加白名单的 <code>cd … &amp;&amp; git …</code>；git 联网用不经沙箱的 Bash</td><td>主会话和编排者要 danger-full-access（workspace-write 连不上 herdr 的 unix socket，也写不了 <code>~/.drover</code>）；worker 仍是 workspace-write</td></tr>
+        <tr><td>只读搜索子代理</td><td>Explore</td><td>spawn_agent；没有就自己 <code>rg</code> / <code>git grep</code></td></tr>
+        <tr><td>当 worker 时</td><td><code>--permission-mode acceptEdits</code>，effort 默认 xhigh</td><td><code>-a on-request -s workspace-write --no-daemon --no-alt-screen</code>，effort 默认 xhigh（不传会继承你 codex config 里的默认 effort，配的是 ultra 就想得太久）</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="swipe">← 表格比屏幕宽，可以左右滑动 →</p>
+</section>
+
+<div class="fence" aria-hidden="true"></div>
+
+<!-- ================= 离开电脑：飞书 oncall ================= -->
+<section id="oncall">
+  <header>
+    <p class="eyebrow">离开电脑 · 飞书 oncall</p>
+    <h2>离开电脑，drover 还在</h2>
+  </header>
+  <div class="prose">
+    <p>审批本来就是一层一层往上交的：worker 的确认框由编排者批，编排者的由主会话批，真正要你点头的只剩主会话自己的那几个。drover 内置的飞书 oncall（底下是 <a href="https://github.com/fulanto/herdr-oncall" target="_blank" rel="noopener">herdr-oncall</a> 插件，选装：装 drover 时加 <code>--oncall</code>）按同样的分工推送，规则只有一句：<strong>只在主会话需要你时才推</strong>。</p>
+    <p>反过来，飞书也是主会话的遥控器：不引用、直接发的消息送进主会话，派活、问进度、拍板都和在终端里说一样。</p>
+    <p>为什么这么定：以前单独用 herdr-oncall 时，它谁弹框都推、每轮回答都推，2 小时 58 条，一大半本来有人接。11-08 集成进 drover 后按角色分：飞书用来接收审批和下达命令，不是把所有对话都转一遍。</p>
+  </div>
+
+  <figure class="fig">
+    <div class="canvas">
+      <svg class="dg w-oncall" viewBox="0 0 1000 556" role="img" aria-label="飞书 oncall 的流程：左边是 herdr 里按名字认出的三层：主会话 drover、编排者 orch-*、worker；中间是 herdr-oncall 插件的规则：只为主会话推确认框、飞书提问那一轮的回答、以【转达】开头的转达，被接口错误打断也推一句，其余不推；你不引用直接发的消息加上 [飞书] 前缀送进主会话；编排者的确认框卡 5 分钟、worker 卡 10 分钟没人批才升级，引用通知回复或点按钮回给对应的 agent；右边是你的飞书。">
+        <defs>
+          <marker id="oc-ah-t" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-terra"/></marker>
+          <marker id="oc-ah-w" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-teal"/></marker>
+          <marker id="oc-ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah"/></marker>
+        </defs>
+        <!-- 列标题 -->
+        <text x="28" y="24" class="tb">herdr 里（按名字认）</text>
+        <text x="312" y="24" class="tb">herdr-oncall 插件的规则</text>
+        <text x="870" y="24" text-anchor="middle" class="tb">你的飞书</text>
+
+        <!-- 左：三层 -->
+        <rect x="16" y="36" width="240" height="500" rx="16" class="frame"/>
+        <rect x="28" y="52" width="216" height="236" rx="12" class="b"/>
+        <text x="136" y="152" text-anchor="middle" class="tt">主会话</text>
+        <text x="136" y="174" text-anchor="middle" class="tm">herdr 名：drover</text>
+        <text x="136" y="196" text-anchor="middle" class="ts">真正要你点头的只有它</text>
+        <line x1="60" y1="306" x2="60" y2="290" class="e" marker-end="url(#oc-ah)"/>
+        <text x="70" y="302" class="ts">它批编排者的确认框</text>
+        <rect x="28" y="308" width="216" height="96" rx="12" class="b-terra"/>
+        <text x="136" y="346" text-anchor="middle" class="tt">编排者</text>
+        <text x="136" y="366" text-anchor="middle" class="tm">orch-*</text>
+        <line x1="60" y1="422" x2="60" y2="406" class="e" marker-end="url(#oc-ah)"/>
+        <text x="70" y="418" class="ts">它批 worker 的确认框</text>
+        <rect x="28" y="424" width="216" height="96" rx="12" class="b-teal"/>
+        <text x="136" y="462" text-anchor="middle" class="tt">worker</text>
+        <text x="136" y="482" text-anchor="middle" class="ts">其他有名字的 agent</text>
+
+        <!-- 中：插件规则 -->
+        <rect x="296" y="36" width="360" height="500" rx="16" class="b-peach"/>
+        <text x="312" y="66" class="tl tb c-terra">推（只为主会话）</text>
+        <text x="312" y="88" class="tl">· 确认框：桌面面板马上弹，一会儿没答再推</text>
+        <text x="312" y="106" class="ts">　这一轮是飞书发起的，直接推带按钮的卡片</text>
+        <text x="312" y="128" class="tl">· 你在飞书里提问的那一轮的回答</text>
+        <text x="312" y="146" class="ts">　挂在你那条消息下面，只发正文</text>
+        <text x="312" y="168" class="tl">· 以【转达】开头的转达</text>
+        <text x="312" y="186" class="ts">　编排者等你决定 / 完成 / 受阻，几个任务的总表</text>
+        <text x="312" y="206" class="tl">· 被接口错误打断，推一句</text>
+        <line x1="306" y1="218" x2="646" y2="218" class="sep"/>
+        <text x="312" y="238" class="ts">不推：追踪叫醒后的内部处理、终端里的普通对话</text>
+        <text x="312" y="262" class="tl tb c-teal">送（你 → 主会话）</text>
+        <text x="312" y="282" class="tl">不引用、直接发 → 加上 <tspan class="tm">[飞书] </tspan>前缀送进主会话</text>
+        <line x1="306" y1="298" x2="646" y2="298" class="sep"/>
+        <text x="312" y="326" class="tl tb">编排者的确认框</text>
+        <text x="312" y="346" class="tl">平时不弹不推，卡 5 分钟没人批才升级</text>
+        <text x="312" y="364" class="ts">主会话跑在 Codex 里时 2 分钟</text>
+        <text x="312" y="392" class="tl c-teal">引用这条通知回复、点按钮 → 回给它</text>
+        <line x1="306" y1="414" x2="646" y2="414" class="sep"/>
+        <text x="312" y="442" class="tl tb">worker 的确认框</text>
+        <text x="312" y="462" class="tl">平时不弹不推，卡 10 分钟没人批才升级</text>
+        <text x="312" y="508" class="tl c-teal">引用这条通知回复、点按钮 → 回给它</text>
+
+        <!-- 右：飞书 -->
+        <rect x="756" y="36" width="228" height="500" rx="26" class="b-mus"/>
+        <text x="870" y="66" text-anchor="middle" class="ts">只认扫码配对的你 · 只认单聊</text>
+        <text x="870" y="122" text-anchor="middle" class="tl">消息 / 带按钮的卡片</text>
+        <text x="870" y="142" text-anchor="middle" class="ts">有选项的，点一下就答了</text>
+        <text x="870" y="268" text-anchor="middle" class="tl">你：“进度怎么样了”</text>
+        <text x="870" y="356" text-anchor="middle" class="tl">升级卡片（带按钮）</text>
+        <text x="870" y="472" text-anchor="middle" class="tl">升级卡片（带按钮）</text>
+        <text x="870" y="520" text-anchor="middle" class="ts"><tspan class="tm">/off</tspan> 停推送和送达 · <tspan class="tm">/on</tspan> 恢复</text>
+
+        <!-- 箭头：推（赤陶）、送（青） -->
+        <line x1="244" y1="128" x2="294" y2="128" class="e e-terra" marker-end="url(#oc-ah-t)"/>
+        <line x1="656" y1="128" x2="754" y2="128" class="e e-terra" marker-end="url(#oc-ah-t)"/>
+        <text x="705" y="120" text-anchor="middle" class="ts c-terra">推送</text>
+        <line x1="754" y1="276" x2="658" y2="276" class="e e-teal" marker-end="url(#oc-ah-w)"/>
+        <text x="705" y="268" text-anchor="middle" class="ts c-teal">直接发</text>
+        <line x1="296" y1="276" x2="246" y2="276" class="e e-teal" marker-end="url(#oc-ah-w)"/>
+        <line x1="244" y1="346" x2="294" y2="346" class="e e-terra dash" marker-end="url(#oc-ah-t)"/>
+        <line x1="656" y1="346" x2="754" y2="346" class="e e-terra" marker-end="url(#oc-ah-t)"/>
+        <text x="705" y="338" text-anchor="middle" class="ts c-terra">升级</text>
+        <line x1="754" y1="388" x2="658" y2="388" class="e e-teal" marker-end="url(#oc-ah-w)"/>
+        <text x="705" y="406" text-anchor="middle" class="ts c-teal">引用 / 按钮</text>
+        <line x1="296" y1="388" x2="246" y2="388" class="e e-teal" marker-end="url(#oc-ah-w)"/>
+        <line x1="244" y1="462" x2="294" y2="462" class="e e-terra dash" marker-end="url(#oc-ah-t)"/>
+        <line x1="656" y1="462" x2="754" y2="462" class="e e-terra" marker-end="url(#oc-ah-t)"/>
+        <text x="705" y="454" text-anchor="middle" class="ts c-terra">升级</text>
+        <line x1="754" y1="504" x2="658" y2="504" class="e e-teal" marker-end="url(#oc-ah-w)"/>
+        <text x="705" y="522" text-anchor="middle" class="ts c-teal">引用 / 按钮</text>
+        <line x1="296" y1="504" x2="246" y2="504" class="e e-teal" marker-end="url(#oc-ah-w)"/>
+      </svg>
+    </div>
+    <p class="swipe">← 图比屏幕宽，可以左右滑动 →</p>
+    <figcaption><b>飞书 oncall 的两个方向。</b>赤陶色是往你手机上推，青色是你从飞书说回来。插件按 herdr 里的名字认角色：叫 <code>drover</code> 的是主会话，<code>orch-</code> 开头的是编排者，其他有名字的是 worker。编排者和 worker 那两条推送是虚线：平时有上一层批，只有同一个确认框卡太久才走。</figcaption>
+  </figure>
+
+  <div class="table-wrap">
+    <table class="t-hosts">
+      <thead><tr><th>谁卡住</th><th>平时谁批</th><th>确认框 / 提问</th><th>回答完一轮</th></tr></thead>
+      <tbody>
+        <tr><td>主会话（<code>drover</code>）</td><td>你</td><td>桌面面板马上弹，一会儿没答再推飞书；这一轮是飞书发起的，直接推带按钮的卡片</td><td>只推两种：你在飞书里提问的那一轮的回答（挂在你那条消息下面），和以 <code>【转达】</code> 开头的转达（等你决定 / 完成 / 受阻）；被接口错误打断也推一句。被追踪叫醒的内部处理、终端里的普通对话不推</td></tr>
+        <tr><td>编排者（<code>orch-*</code>）</td><td>主会话（后台挂着 <code>watch --main</code>；Codex 主会话每条消息先跑 <code>board --json</code>）</td><td>不弹也不推；同一个确认框卡 <b>5 分钟</b>没人批才推（主会话跑在 Codex 里时 2 分钟）</td><td>不推，主会话读 rollup 转达</td></tr>
+        <tr><td>worker</td><td>编排者（<code>watch</code> 报 blocked，读屏后批）</td><td>不弹也不推；卡 <b>10 分钟</b>没人批才推</td><td>不推</td></tr>
+        <tr><td>你自己开的、没名字的 pane</td><td>你</td><td>照插件原来的规则</td><td>照插件原来的规则</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="swipe">← 表格比屏幕宽，可以左右滑动 →</p>
+
+  <div class="prose">
+    <p><strong>要你拍板的事推成带按钮的卡片</strong>：编排者在 rollup 里写了“等你决定”，主会话用提问框把问题转过来，推到飞书就是一张卡片：第一行“主会话在等你确认”，下面是问题和几个选项，再下面是每个选项一个按钮。点一下按钮就答了，也可以引用这张卡片打字回答。</p>
+    <p><strong>在飞书里问“进度怎么样”</strong>：不引用任何通知直接发，机器人先回一句“已送达主会话”，主会话那一轮的回答挂在你那条消息的回复里，一屏讲清几个任务。发“看板”“进度”，回的是纯文字版的看板。</p>
+    <p><strong>以 <code>【转达】</code> 开头的转达</strong>：编排者写了“完成”“等你决定”或“受阻”，主会话转给你时，回复第一行以 <code>【转达】</code> 开头（完成是 <code>【转达】目标：…</code>，等你决定是 <code>【转达】&lt;任务&gt;等你决定：…</code>），插件只把这样开头的回答往外推；要你选的再接着弹提问框，到飞书就是上面那种卡片。每条转达末尾附上其他还在等你的（<code>board --pending</code>，最多 3 条），手机上每推一条都带着全部待定的事，前面的不会被后面的转达冲掉。几个任务一起收尾的总表也是这样推来的。</p>
+    <p><strong>升级卡片</strong>：worker 的确认框平时由编排者批，同一个确认框卡了 10 分钟没人批（编排者是 5 分钟）插件才推给你。点按钮、或者引用这条卡片回复，回给的是那个 agent，不是主会话。</p>
+  </div>
+
+  <div class="borrow">
+    <div>
+      <h3>飞书里怎么说话</h3>
+      <blockquote>不引用直接发 = 跟主会话说话</blockquote>
+      <p>派新活、问“进度怎么样”、回答它的问题、说“提交推送”“收尾”“全部收尾”，都和在终端里说一样，飞书来的不再额外确认。发“看板”“进度”，回的是纯文字版的看板（<code>board --plain</code>），按手机一屏排好，最后一行写能收尾几个。引用某条通知回复、点卡片按钮，才是回给那条通知的 agent。以 <code>/</code> 开头的消息由插件自己处理，不进主会话：<code>/off</code> 停掉所有推送和送达，<code>/on</code> 恢复（终端里是 <code>drover oncall off</code> / <code>on</code>）。</p>
+    </div>
+    <div>
+      <h3>图片、图文也能发</h3>
+      <blockquote>[图片] ~/.drover/oncall-images/…</blockquote>
+      <p>11-18 起，飞书里发给主会话的纯图片、文字加图片都能送到：插件把图片下载到 <code>~/.drover/oncall-images</code>，在原来的位置换成一行 <code>[图片] &lt;本机路径&gt;</code>，和文字一起送进去，主会话自己打开看。放在这个目录，是因为 drover 装的权限规则已经放行读 <code>~/.drover/**</code>，读图不用你逐张批。图片 7 天后自动删。文件、语音、视频、表情包、合并转发暂不支持，会回一句“没送进去”；带图片的消息不能用来回答确认框。</p>
+    </div>
+    <div>
+      <h3>看板上的按钮也走这条路</h3>
+      <blockquote>[看板] 收尾：&lt;代号&gt;</blockquote>
+      <p>在看板 tab 里点 [收尾] / [全部收尾]，看板把这句话交给插件，插件以 <code>[看板] </code> 开头送进主会话；主会话卡在确认框、输入框里有没发的字时，先排队、发完再送。主会话照“一键收尾”处理：只收能收的，全部完成后合成一张总表推给你。插件没装或版本太旧时，按钮提示你在主对话里说“全部收尾”。</p>
+    </div>
+    <div>
+      <h3>为什么要加 <code>[飞书]</code> 前缀</h3>
+      <blockquote>“加了 [飞书] 前缀后都只是普通文字”</blockquote>
+      <p>飞书来的话是输进主会话输入框的。开发时实测：不加前缀，消息开头的 <code>!</code> 会被当成命令直接执行，<code>/clear</code> 会把主会话清空；加了前缀就都只是普通文字。主会话看到前缀，也就知道这句是你从飞书发的，回答要短。</p>
+    </div>
+    <div>
+      <h3>配对：扫一次码</h3>
+      <blockquote>现在用飞书扫码配对吗？[Y/n]</blockquote>
+      <p>在终端里跑 <code>./install.sh --oncall</code>，装完问这一句，回车就配：打印配对链接（装了 <code>qrencode</code> 还会画二维码），Mac 桌面也弹二维码；手机飞书扫码确认，配上后自动发一条测试消息。让 agent 帮装的，它最后会给你配对链接带你配。之后补配用 <code>drover oncall pair [--wait]</code>，看状态 <code>oncall status</code>，发测试 <code>oncall test</code>。每扫一次码，在你的飞书里建一个只属于你的机器人。</p>
+    </div>
+    <div>
+      <h3>主会话怎么被认出来</h3>
+      <blockquote>drover main-register</blockquote>
+      <p>主会话在 herdr 里登记成 <code>drover</code>，编排者是 <code>orch-*</code>，其他有名字的是 worker。herdr 的名字在 <code>/clear</code>、退出重开时会被清掉，所以 Claude Code 由 SessionStart hook 每次会话开始都登记（先等 herdr 换上新 session 再判断），Codex 在第一条消息时按路由规则登记。同一时间只能有一个主会话。</p>
+    </div>
+    <div>
+      <h3>装 drover 时选装</h3>
+      <blockquote>代码独立，交付一体</blockquote>
+      <p>插件仍是独立仓库、能单独用。默认不装；装 drover 时加 <code>--oncall</code>，<code>install.py</code> 才从 GitHub 装好它（之后它每几个小时自己跟 stable 更新），在插件配置目录写一个 <code>drover.env</code>（主会话叫什么、卡多久才升级、只推哪几种回答），不碰你自己的 <code>.env</code>。装上以后不要了就 <code>--no-oncall</code>（已经装上的插件不卸）。要 Node 22+（18～21 能推送，但收不到你的回复）。不配飞书也有：macOS 的桌面面板按同样的规则提醒，只为主会话弹。</p>
+    </div>
+    <div>
+      <h3>剩下的风险由你决定</h3>
+      <blockquote>飞书来的消息不再额外确认</blockquote>
+      <p>插件只认配对时扫码的那个人、只认单聊。飞书账号被别人拿到，就能像你本人一样指挥主会话：派任务、提交推送、收尾删 worktree。手机丢了或觉得不对劲，飞书里发 <code>/off</code>，或者在电脑上 <code>drover oncall off</code>；要彻底解绑，<code>drover oncall unpair</code>。</p>
+    </div>
+  </div>
+  <aside class="bark"><b>汪</b><span>以前我是谁叫都往你手机上报，两个小时叫了 58 声。现在只有主会话找你我才叫；编排者和 worker 那边有人看着，卡久了我才去喊你。</span></aside>
+</section>
+
+<div class="fence" aria-hidden="true"></div>
+
+<!-- ================= 几条原则 ================= -->
+<section id="principles">
+  <header>
+    <p class="eyebrow">几条原则</p>
+    <h2>赶羊的几条规矩</h2>
+  </header>
+  <div class="prose"><p>上面各节的做法，背后是这几条规矩。它们写在编排者的流程正文 <code>flow/dispatch.md</code> 和主会话的路由规则 <code>flow/routing.md</code> 里，编排者、主会话每次都照着做。</p></div>
+  <div class="borrow">
+    <div>
+      <h3>一个任务一个编排者</h3>
+      <blockquote>orch-start：一个任务一个 tab</blockquote>
+      <p>主会话的上下文最稀缺，不在里面分析、派发、验收。每个任务交给一个编排者；跨仓也是一个需求一个编排者，按事分，不按仓库分。某个仓库活太多，再给它起子编排者。</p>
+    </div>
+    <div>
+      <h3>往上只交一页 rollup</h3>
+      <blockquote>rollup.md 不超过 40 行</blockquote>
+      <p>不贴 diff、日志、报告原文，要引用就写文件路径。开头几行给看板读，结论第一行是目标。要细节就问编排者，或者 <code>herdr agent focus</code> 去它的窗口。</p>
+    </div>
+    <div>
+      <h3>复述目标，写进每份任务书和汇报</h3>
+      <blockquote>brief --goal 必填</blockquote>
+      <p>主会话第一条回复就复述你要做成的事；这段目标是每份 worker 任务书的开头、rollup 结论的第一行、转达的第一行。一句话的需求被扩写成几千字任务书时最容易偏，目标一直在最前面，偏了一眼就看得出。</p>
+    </div>
+    <div>
+      <h3>可撤销的不停下来问</h3>
+      <blockquote>复述不等确认</blockquote>
+      <p>能事后纠偏的就接着干：复述不等确认，常规审批编排者自己批。只有不可逆的事（推送、删分支和 worktree、写数据库、部署）才等你点头。</p>
+    </div>
+    <div>
+      <h3>根治三问</h3>
+      <blockquote>应该怎样 · 哪一层偏了 · 改在哪</blockquote>
+      <p>修 bug、做设计先答三问：从目标推出该怎样，不从现有实现推；找出问题在哪一层产生、为什么；改在那一层，能删不加。只在症状处加判断、特例、兜底的是补丁，要么换到源头，要么写明为什么只能这样、交你定。</p>
+    </div>
+    <div>
+      <h3>证据</h3>
+      <blockquote>文件:行 · 实测 · 官方文档</blockquote>
+      <p>每条事实判断都要有证据：那一层的代码或实测，外部平台查官方文档。注释、命名、调用方那一侧、记忆都只算线索。一两次查询能核实的先核实；现象要连原因一起写。</p>
+    </div>
+    <div>
+      <h3>转达前先审</h3>
+      <blockquote>主会话是这一层的审核，不是传声筒</blockquote>
+      <p>编排者的方案和结论先过主会话：证据、跨仓、否决理由、第一性原理四件事，哪条不过就打回去补，打回两轮还不过才转给你，并写明哪几条没核实。</p>
+    </div>
+  </div>
+</section>
+
+<div class="fence" aria-hidden="true"></div>
+
+<!-- ================= 目录与文件 ================= -->
+<section id="files">
+  <header>
+    <p class="eyebrow">目录与文件</p>
+    <h2>东西都放在哪</h2>
+  </header>
+  <div class="cols tree">
+    <div>
+      <h3>包结构</h3>
+      <pre class="code"><code>drover/
+├── bin/drover           <span class="cm"># drover CLI，Python 标准库</span>
+├── flow/
+│   ├── dispatch.md      <span class="cm"># 流程正文 + 附录 A / B</span>
+│   └── routing.md       <span class="cm"># 主工作台路由规则模板</span>
+├── profiles/            <span class="cm"># 团队 profile</span>
+├── codex/skills/drover/
+│   └── SKILL.md         <span class="cm"># Codex 入口壳</span>
+├── hooks/
+│   └── cd_git_guard.py  <span class="cm"># cd+git 拦截 hook</span>
+├── install.sh           <span class="cm"># 一键安装入口：先查 git / python3，再交给 install.py</span>
+├── install.py           <span class="cm"># 安装 / 检查 / 卸载（含飞书 oncall）</span>
+├── tests/               <span class="cm"># install、hook、update 的测试</span>
+├── selftest/            <span class="cm"># CLI 自测，run.py 并行跑</span>
+├── README.md
+├── LICENSE
+└── docs/
+    ├── architecture.html  <span class="cm"># 就是本文</span>
+    ├── agent-install.md   <span class="cm"># 写给 agent 的安装步骤</span>
+    └── images/            <span class="cm"># 插画</span></code></pre>
+    </div>
+    <div>
+      <h3>安装后</h3>
+      <pre class="code"><code>~/.drover/
+├── src/                 <span class="cm"># 默认的 clone 位置</span>
+├── pkg → 包（link 软链到 clone / copy 副本）
+├── bin/drover → pkg/bin/drover
+├── config.json          <span class="cm"># workspace、repo_dirs、oncall、</span>
+│                        <span class="cm">#   auto_update、heavy_* 等</span>
+├── drover-install.json  <span class="cm"># 安装记录，--uninstall 按它撤</span>
+├── oncall-images/       <span class="cm"># 飞书发来的图片，7 天后自动删</span>
+├── backups/  baselines/  locks/
+└── &lt;slug&gt;/             <span class="cm"># 每个任务一个目录</span>
+
+~/.claude/commands/drover.md → 流程正文
+~/.claude/skills/herdr/  <span class="cm"># herdr 技能</span>
+~/.claude/settings.json
+  <span class="cm"># 权限规则，加三个 hook：</span>
+  <span class="cm"># PreToolUse        cd+git 拦截</span>
+  <span class="cm"># SessionStart      主会话登记成 drover</span>
+  <span class="cm"># UserPromptSubmit  读新规则（drover rules --hook）</span>
+~/.codex/skills/drover → 包里的入口壳
+~/.codex/skills/herdr
+
+&lt;herdr 插件配置目录&gt;/drover.env
+  <span class="cm"># 飞书 oncall 的配置（.env 是你的，不碰）</span>
+
+&lt;主工作台&gt;/AGENTS.md
+  <span class="cm">&lt;!-- drover:routing:begin --&gt; … end</span>
+&lt;主工作台&gt;/CLAUDE.md   <span class="cm"># @AGENTS.md</span></code></pre>
+      <p class="small">另外还有 <code>&lt;主工作台&gt;/.claude/settings.local.json</code> 的权限规则、两边的 herdr 状态 hook，以及 herdr-oncall 插件本身（由 herdr 管理）。</p>
+    </div>
+    <div>
+      <h3>运行时：一个任务一个目录</h3>
+      <pre class="code"><code>~/.drover/&lt;slug&gt;/
+├── request.md         <span class="cm"># 主会话写，含“标题：”</span>
+├── orch.json          <span class="cm"># 编排者名、宿主、tab / pane</span>
+├── parent.json        <span class="cm"># 子编排者才有</span>
+├── dispatch.md        <span class="cm"># 状态文件</span>
+├── rollup.md          <span class="cm"># 一页汇报</span>
+├── main-seen.json     <span class="cm"># 主会话读过哪一版 rollup</span>
+├── main-watch.json    <span class="cm"># watch --main 报过的事</span>
+├── agent-state.json   <span class="cm"># 编排者现在的状态、从几点开始</span>
+├── answered.json      <span class="cm"># 主会话最近一次转答复</span>
+├── timeline.jsonl     <span class="cm"># 时间线（统计用，只追加）</span>
+├── wrapup-clicked.json <span class="cm"># 看板上点过收尾</span>
+├── deps-&lt;仓库&gt;.json
+├── &lt;agent&gt;.task.md    <span class="cm"># 任务段</span>
+├── &lt;agent&gt;.prompt.md  <span class="cm"># 任务书</span>
+├── &lt;agent&gt;.survey.md  <span class="cm"># 摸底（可选）</span>
+├── &lt;agent&gt;.md         <span class="cm"># 报告</span>
+├── accept*.json       <span class="cm"># 验收结果（含集成后的整体检查）</span>
+├── &lt;agent&gt;-rev.*      <span class="cm"># 复审（可选）</span>
+├── integrate-&lt;仓库&gt;.json <span class="cm"># 集成状态、rebase 记录</span>
+├── pushes.jsonl       <span class="cm"># 推送账本</span>
+├── carry.jsonl        <span class="cm"># --carry 带上上一轮提交的记录</span>
+├── probe-*.patch      <span class="cm"># 删探测 worktree 前存的改动</span>
+└── wrapup.md          <span class="cm"># 收尾汇总</span>
+
+~/.drover/             <span class="cm"># 不属于哪个任务的</span>
+├── locks/heavy/       <span class="cm"># heavy 调度：排队票、实测历史、校准</span>
+├── locks/update.lock  <span class="cm"># 同一时间只跑一个 update</span>
+├── auto-update.json   <span class="cm"># 最近一次自动更新的结果</span>
+├── auto-update.log
+├── main-session.json  <span class="cm"># 登记上的主会话（session_id、pane）</span>
+├── main-rules.json    <span class="cm"># 主会话载入时的规则，drover rules 拿它比</span>
+├── board-tab.json     <span class="cm"># 看板 tab 是哪个</span>
+├── board-live.json    <span class="cm"># 看板的心跳，认出旧代码的看板</span>
+└── observe-gaps.jsonl <span class="cm"># 没人看着的时段</span></code></pre>
+      <p class="small">worktree 在 <code>~/.herdr/worktrees/&lt;仓库&gt;/…</code>，由 herdr 管理。</p>
+    </div>
+  </div>
+</section>
+
+<div class="fence" aria-hidden="true"></div>
+
+<!-- ================= 安装与使用 ================= -->
+<section id="install">
+  <header>
+    <p class="eyebrow">怎么装、怎么用</p>
+    <h2>领一只牧羊犬回家</h2>
+  </header>
+  <div class="cols">
+    <div>
+      <h3>安装</h3>
+      <p>把下面这段话发给你正在用的 Claude Code 或 Codex：</p>
+      <pre class="code wrap"><code>帮我安装 drover：https://github.com/fulanto/drover 。先 clone 到临时目录里读说明，按仓库 README 开头给 agent 的说明来，问完问题先停下等我回答，安装前把演练结果原样给我看。</code></pre>
+      <p class="small">为什么要整段发：实测 Claude Code 只给地址也能按说明装好；Codex 不带后半句，容易不等你确认就装。它会按 <code>docs/agent-install.md</code> 先检查环境，再问你几个问题（drover 默认放在 <code>~/.drover/src</code>；以后在哪个文件夹打开 agent 提需求，会让你选），把演练（dry-run）结果原样给你看，你确认后才装。</p>
+      <p class="small"><strong>也可以自己在终端装：</strong>默认 clone 到 <code>~/.drover/src</code>（可以换），link 模式下装完别挪、别删。</p>
+      <pre class="code"><code>git clone https://github.com/fulanto/drover.git ~/.drover/src
+cd ~/.drover/src
+./install.sh --dry-run   <span class="cm"># 先看计划</span>
+./install.sh             <span class="cm"># 正式安装</span></code></pre>
+      <p class="small">第一次安装会问主工作台：用你放代码仓库的那个上级目录（比如 <code>~/code</code>），没有默认值，不能是家目录。<code>./install.sh</code> 是一层很薄的入口：先检查是不是 macOS / Linux、有没有 git 和 python3（3.9 及以上），缺了就打印官方装法后停下；都在就把参数原样交给 <code>python3 install.py</code>。其他参数（<code>--check</code>、<code>--host</code>、<code>--mode copy</code>、<code>--uninstall</code> 等）见 README 第 2 节。</p>
+      <p class="small"><strong>没装 herdr 也不怕：</strong>让 agent 装时，它先检查，缺了把官方装法告诉你。自己在终端装时，install 计划的第一项就是“安装 herdr”（官方的 <code>curl -fsSL https://herdr.dev/install.sh | sh</code>），会先问一句 <code>[Y/n]</code>；加 <code>--install-deps</code> 就不问直接装。claude / codex 没装时只给官方安装命令，不替你装。</p>
+      <p class="small"><strong>要飞书就加 <code>--oncall</code>：</strong>飞书 oncall 是选装的，默认不装。在终端里跑 <code>./install.sh --oncall</code> 的，汇总之后会问一句“现在用飞书扫码配对吗？[Y/n]”，回车就配，扫完自动发一条测试消息（见<a href="#oncall">离开电脑</a>）；让 agent 帮你装的，跟它说要飞书，它最后会给配对链接带你配。之后补配是 <code>~/.drover/bin/drover oncall pair</code>。</p>
+      <p class="small">依赖：herdr、git、python3，claude 和 / 或 codex；选装的飞书 oncall 要 Node 22+（装的时候加 <code>--oncall</code> 才装插件和配对）；可选 code-review-graph、uv、bun、pnpm。</p>
+      <p class="small"><strong>装好之后自己更新：</strong>主会话活着时，drover 每 30 分钟在后台查一次新版本，能快进就装，新规则不用重开会话就读进来（<code>drover rules</code>），看板 tab 也自己换成新代码。clone 里有本地改动、和上游分叉时什么都不动，只告诉主会话一次。<code>~/.drover/config.json</code> 里写 <code>"auto_update": false</code> 可以关掉。想马上更新就跑 <code>~/.drover/bin/drover update</code>：拉新代码、按原来的模式重跑安装、检查，告诉你下一步。</p>
+    </div>
+    <div class="prose">
+      <h3>日常用法</h3>
+      <ul>
+        <li>在主工作台的会话里直接说需求，不用写 <code>/drover</code>。可以带 <code>@仓库</code>、<code>--agent codex</code>、<code>--orch codex</code>、<code>--review</code>、<code>--effort</code>；<code>--agent</code> / <code>--orch</code> 不写就跟主会话用同一个宿主。调研、排查、写方案也直接说，一样交给编排者。</li>
+        <li>主会话第一条回复就是它对目标的复述，看到不对直接纠正，它会转给编排者。</li>
+        <li>想直接跟编排者聊：<code>herdr agent focus orch-xxx</code>。</li>
+        <li>看进度：主会话旁边有个“看板”tab，tab 名就是汇总（比如“看板·等你2·完成1”），点进去是一行一个任务的表；问一句“进度怎么样”，主会话把 <code>drover board</code> 的表原样给你。</li>
+        <li>编排者“等你决定”时，主会话审过再转给你，你的回答会原样转过去。</li>
+        <li>说“提交推送”进入集成和推送；说“收尾”先出收尾汇总（变更、提交、数据库、配置、上线），再用 <code>drover cleanup</code> 核实后清理 worktree、分支、pane 和 tab。看板上点 [收尾] / [全部收尾]，或者说“全部收尾”，能收的一起收。只说“清理”就只清理。</li>
+        <li>离开电脑（选装）：装的时候加 <code>--oncall</code>、扫码配对一次，之后主会话需要你会推到飞书，飞书里不引用直接发就是在跟主会话说话（见<a href="#oncall">离开电脑</a>）。</li>
+      </ul>
+      <p class="small">参数、各子命令和排错见包里的 README，<code>~/.drover/bin/drover &lt;子命令&gt; --help</code> 能查每条命令的参数。</p>
+    </div>
+  </div>
+</section>
+
+<div class="fence" aria-hidden="true"></div>
+
+<!-- ================= 结尾 ================= -->
+<section id="ending">
+  <header>
+    <p class="eyebrow">结尾</p>
+    <h2>瓶颈三连</h2>
+  </header>
+  <figure class="story-fig">
+    <div class="img-box"><img src="images/08-bottleneck.jpg" loading="lazy" alt="插画：打破人的瓶颈"></div>
+    <figcaption>打破人的瓶颈：人不用再盯过程，任务自己往下流。</figcaption>
+  </figure>
+  <div class="prose">
+    <p>一路改下来，人终于不再是瓶颈了。那瓶颈去哪了？我们一共见过三个。</p>
+  </div>
+  <ol class="triple" aria-label="瓶颈三连">
+    <li>
+      <span class="tn">瓶颈 1</span>
+      <h3>agent</h3>
+      <p>一个 agent 一个终端，人盯着它干等。它慢，人就跟着慢。</p>
+      <p class="tw">阶段 ①</p>
+    </li>
+    <li>
+      <span class="tn">瓶颈 2</span>
+      <h3>人</h3>
+      <p>切窗口、批弹窗、当调度员、对结果、守在电脑前、追问依据、翻聊天记录找进度。herdr、worktree、派发脚本、编排者、飞书 oncall、转达前先审、任务看板，一步步把这些活从人手里挪走。</p>
+      <p class="tw">阶段 ② 到 ⑨</p>
+    </li>
+    <li class="now">
+      <span class="tn">瓶颈 3</span>
+      <h3>电脑</h3>
+      <p>几个任务一起跑的时候，系统监控上 10 个核全部 100%，77°。agent 和人都在等它。</p>
+      <p class="tw">现在</p>
+    </li>
+  </ol>
+  <figure class="story-fig">
+    <div class="img-box"><img src="images/11-cpu-bottleneck.jpg" loading="lazy" alt="插画：电脑性能成了瓶颈"></div>
+    <figcaption>瓶颈最后落到了电脑身上。</figcaption>
+  </figure>
+  <div class="prose">
+    <p>瓶颈到了电脑身上，先别急着换，先把手上这台用足：</p>
+    <ul>
+      <li><strong>满了才排队，空了不白等</strong>：11-04 几个 worktree 同时跑全量测试，把机器打满、用例超时，于是全量测试挪到集成时只跑一次，build 和大批测试进 <code>drover heavy</code> 的一把机器级锁，同一时间只跑一个。可这把锁不看命令占多少：11-18 翻验收存档，0.2～1.9 秒的命令排在全量测试后面等了 3～19 分钟，worker 那边最长等了 50 分钟。现在 heavy 按资源调度：容量从本机硬件起步（Apple 芯片按性能核数，其他机器按逻辑核数），按真实命令同时跑和单独跑的快慢自动校准；按整机实测的 CPU 放行，机器还有余量就马上跑，真满了才排队；没跑过的命令先按 1 核算，全量测试收尾、CPU 空出来时就放别的进来。设计底线：CPU 空着的时候不能让命令干等。</li>
+      <li><strong>验证和自测并行</strong>：accept 的多条验证同时交给调度；drover 自己的自测按用例分给多个进程跑，约 7.4 分钟 → 约 52 秒（11-18 本机实测，520 个用例）。</li>
+      <li><strong>用完的 worktree 清掉</strong>：11-19 实测，两个在跑的任务一共堆了 34 个 worktree、19 个 worker 进程，约占 2.9GB 内存。现在你说“清理”或“收尾”，<code>drover cleanup</code> 核实 worker 没在干活、内容都在推过的远端分支里，才删 worktree 和分支；探测用的 worktree 报告记下就删，改动先存成 patch。</li>
+    </ul>
+    <p class="punch">再往下的优化方向：换电脑。（狗头）</p>
+  </div>
+</section>
+
+<footer class="end">
+  <span>drover · 技术架构与流程说明 · 11-19 更新</span>
+  <span>插画只是比喻，没有羊在制作过程中受到伤害。</span>
+  <a href="#top">回到开头</a>
+</footer>
+
+</main>
+</div>
+
+<script>
+(function () {
+  var links = Array.prototype.slice.call(document.querySelectorAll('.toc a'));
+  if (!links.length || !('IntersectionObserver' in window)) return;
+  var byId = {};
+  links.forEach(function (a) { byId[a.getAttribute('href').slice(1)] = a; });
+  var io = new IntersectionObserver(function (entries) {
+    entries.forEach(function (e) {
+      if (!e.isIntersecting) return;
+      links.forEach(function (a) { a.removeAttribute('aria-current'); });
+      var a = byId[e.target.id];
+      if (a) a.setAttribute('aria-current', 'true');
+    });
+  }, { rootMargin: '-20% 0px -70% 0px' });
+  Object.keys(byId).forEach(function (id) {
+    var s = document.getElementById(id);
+    if (s) io.observe(s);
+  });
+})();
+</script>
