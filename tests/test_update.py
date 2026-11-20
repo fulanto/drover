@@ -91,7 +91,7 @@ class UpdateTestBase(InstallTestBase):
         self.env.update(DROVER_STATE_DIR=str(self.state_home), GIT_CONFIG_NOSYSTEM="1")
         self.remote = self.tmp / "remote.git"
         shutil.copytree(self.template, self.remote, symlinks=True)
-        self.clone = self.state_home / "src"  # README 2.1 里默认 clone 的位置
+        self.clone = self.state_home / "src"  # README「安装」里默认 clone 的位置
         self.git(self.tmp, "clone", "-q", str(self.remote), str(self.clone))
         self.dev = self.tmp / "dev"  # 往"远端"推新提交用的另一份 clone
         self.git(self.tmp, "clone", "-q", str(self.remote), str(self.dev))
@@ -116,7 +116,7 @@ class UpdateTestBase(InstallTestBase):
         return self.head(self.dev)
 
     def clone_install(self, *args: str) -> dict:
-        """从 clone 安装（照 README 2.1 装的那样）。"""
+        """从 clone 安装（照 README「安装」装的那样）。"""
         p = subprocess.run([sys.executable, str(self.clone / "install.py"), *args, *self.ws_args(), "--json"],
                            env=self.env, cwd=str(self.tmp), stdin=subprocess.DEVNULL, capture_output=True, text=True,
                            timeout=300)
@@ -394,10 +394,10 @@ class UpdateBlockedTests(UpdateTestBase):
         self.assertEqual(self.head(self.clone), head)
 
     def test_not_installed(self) -> None:
-        """没有安装记录也没有 ~/.drover/pkg：报没装过、指向 README 2.1"""
+        """没有安装记录也没有 ~/.drover/pkg：报没装过、指向 README 的「安装」一节"""
         p = self.update(rc=1, cli=PKG / "bin" / "drover")
         self.assertIn("没装过 drover", p.stdout)
-        self.assertIn("README 2.1", p.stdout)
+        self.assertIn("README 的「安装」一节", p.stdout)
 
 
 # ---------------------------------------------------------------- --dry-run

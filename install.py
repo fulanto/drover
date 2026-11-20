@@ -31,7 +31,7 @@ PKG_ROOT = Path(__file__).resolve().parent
 HOME = Path.home()
 # drover 的状态目录：config.json、安装记录、任务目录、备份、基线缓存、heavy 锁都在这里（和 bin/drover 的默认值一致）。
 STATE_HOME = HOME / ".drover"
-# 安装布局（和 README、分享材料一致）：包放在固定位置，其他入口都经它指过去，link / copy 两种模式下路径都不变。
+# 安装布局（和 docs/install.md、分享材料一致）：包放在固定位置，其他入口都经它指过去，link / copy 两种模式下路径都不变。
 INSTALL_ROOT = STATE_HOME / "pkg"
 BIN_LINK = STATE_HOME / "bin" / "drover"
 BIN_TARGET = INSTALL_ROOT / "bin" / "drover"
@@ -121,8 +121,8 @@ PROMPT_HOOK_EVENT = "UserPromptSubmit"
 PROMPT_HOOK_ARGS = "rules --hook"
 PROMPT_HOOK_TIMEOUT = 10  # 秒
 
-# 飞书 oncall：drover 内置的 herdr-oncall 插件（代码在独立仓库，交付上随 drover 一起装）。和插件的约定见 README
-# "离开电脑：飞书 oncall"一节：主会话在 herdr 里叫 drover；drover 的配置写在插件配置目录的 drover.env（插件只读、
+# 飞书 oncall：drover 内置的 herdr-oncall 插件（代码在独立仓库，交付上随 drover 一起装）。和插件的约定见 docs/oncall.md
+# （离开电脑：飞书 oncall）：主会话在 herdr 里叫 drover；drover 的配置写在插件配置目录的 drover.env（插件只读、
 # 优先级最低），用户自己的 .env（飞书配对的密钥在里面）drover 不读不写。bin/drover 里有同样的几个常量（自测断言两边一样）。
 ONCALL_PLUGIN_ID = "com.codreamer.herdr.oncall"
 ONCALL_REPO = "fulanto/herdr-oncall"
@@ -2605,7 +2605,7 @@ def next_steps(ctx: Ctx) -> list:
                      "（不配也行，macOS 上桌面面板照样提醒）")
     elif not ctx.oncall and oncall_choice(ctx) is None:  # 没选过（--no-oncall 过的不再提）
         lines.append("  7. 飞书 oncall 没装（选装）：想离开电脑时在飞书里收主会话的提问、给它下命令，重跑 install 加 "
-                     f"--oncall（要 Node {ONCALL_NODE_MIN}+，见 README 4.9）")
+                     f"--oncall（要 Node {ONCALL_NODE_MIN}+，见 docs/oncall.md）")
     return lines
 
 

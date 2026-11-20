@@ -9,7 +9,7 @@
 - **会改用户机器的每一步都要用户点头**：clone、往 `AGENTS.md` 加标记、装依赖、正式安装。只读的检查可以直接做，做完报告。
 - 和预期不一样、拿不准、任何一步失败：停下，把原始输出给用户看，等用户定。
 - **对用户说大白话，用用户说话的语言**（用户说中文就用中文）。用户多半不知道"工作台"是什么。下表左边的术语只在你自己心里用；对用户说的话里不出现，非出现不可时马上用右边的话解释。
-- 细节以 [README](../README.md) 和 `python3 install.py --help` 为准，这里只写顺序和边界。
+- 细节以 [install.md](install.md) 和 `python3 install.py --help` 为准，这里只写顺序和边界。
 
 | 术语（只给你看） | 对用户这样说 |
 |---|---|
@@ -40,10 +40,10 @@
 
 缺东西时：
 
-- **系统不是 macOS / Linux（比如 Windows）**：告诉用户这一版不支持原生 Windows，可以在 WSL2 的 Ubuntu 里按 Linux 的方式试（没有实测，README 第 1 节"支持哪些系统"），不要往下装。Linux：告诉用户能装、但没有实测过。
+- **系统不是 macOS / Linux（比如 Windows）**：告诉用户这一版不支持原生 Windows，可以在 WSL2 的 Ubuntu 里按 Linux 的方式试（没有实测，见 [install.md 的"依赖"](install.md#依赖)里"支持哪些系统"），不要往下装。Linux：告诉用户能装、但没有实测过。
 - **git、python3 缺（或 python3 低于 3.9）**：install.sh 会停下，要用户先装，你不替用户装。
   - macOS：跑 `git --version` 时会弹出"安装命令行开发者工具"的系统框（没弹就跑 `xcode-select --install`）。请用户在框里点"安装"、等它装完（git 和 python3 都在里面），再告诉你继续。框要用户自己点，你不要想办法绕过。
-  - Linux：把装法给用户（比如 `sudo apt-get install git python3`，其他发行版见 README 第 1 节），**请用户自己在终端里跑**：要 sudo 的命令你不跑。
+  - Linux：把装法给用户（比如 `sudo apt-get install git python3`，其他发行版见 [install.md 的"依赖"](install.md#依赖)），**请用户自己在终端里跑**：要 sudo 的命令你不跑。
 - **herdr、claude / codex（用户选的那个）、飞书要的 Node 缺了**：不用让用户先装。正式安装时加 `--install-deps`，install 会用官方安装脚本把它们装到用户的家目录（都不用 sudo），dry-run 里写清每一样要跑的命令、装到哪、改不改 shell 配置（第 5 步）；用户看过 dry-run 说"装"，就算同意了。
 - herdr 在 `~/.local/bin` 但不在 PATH：算已装，记下来，最后交代时提醒用户（见第 7 步）。
 - 有 Node 但低于 18（或 18～21）：install 不替换用户已有的 Node（飞书插件先用 PATH 上的那个，另装一个也用不上）。告诉用户升级的办法（`brew install node`，或 nodejs.org），装不装由用户定。只影响飞书 oncall（第 3 步第 7 项），drover 本身不需要 Node。
@@ -55,7 +55,7 @@
 - 提示仓库不存在、或者要输入账号密码：多半是地址写错了，核对是不是 `https://github.com/fulanto/drover.git`。这是公开仓库，clone 不需要登录。
 - 你已经 clone 过一份（比如为了读这份文档），这一项就算通过。
 
-已经装过（有 `config.json`）：这是重装或升级。把 config.json 的内容给用户看，读 README 2.6；沿用现有配置时不传 `--workspace` / `--repo-dir`。里面的 `workspace` 是家目录时 install 会拒绝，按第 3 步第 2 项和用户重新定一个。
+已经装过（有 `config.json`）：这是重装或升级。把 config.json 的内容给用户看，读 [install.md 的"检查、更新、卸载"](install.md#检查更新卸载)；沿用现有配置时不传 `--workspace` / `--repo-dir`。里面的 `workspace` 是家目录时 install 会拒绝，按第 3 步第 2 项和用户重新定一个。
 
 ## 2. 摸底（只读）
 
@@ -79,7 +79,7 @@
 
 1. **clone 位置**：默认 `~/.drover/src`，问用户要不要换。
    - 这是 drover 自己的目录 `~/.drover`（以后的配置和任务记录也放在这里），隐藏目录，访达里默认看不到，不占用户的代码文件夹。它不是 `~/.drover/pkg`（那是 install 自己建的包入口：link 模式下软链到这份 clone，copy 模式下是副本）。
-   - 默认的 link 模式软链到这份 clone，装完不能挪、不能删。用户想放进自己的代码文件夹也可以；不想一直留着就用 `--mode copy`（README 2.3）。
+   - 默认的 link 模式软链到这份 clone，装完不能挪、不能删。用户想放进自己的代码文件夹也可以；不想一直留着就用 `--mode copy`（[选安装方式](install.md#选安装方式--mode-linkcopy)）。
    - 读文档用的临时 clone 不能当正式位置（link 模式软链到它，临时目录一清就断）。用户确认位置后在那里重新 clone；想从临时目录挪过去，先问。不想留 clone 的，也可以用 copy 模式从临时 clone 装。
    - 你已经 clone 进了用户的家目录或代码目录：告诉用户在哪，问是留着当正式位置，还是换到 `~/.drover/src`。
 2. **主工作台 `--workspace`：不给默认值，也不直接问"工作台选哪个"。** 先拿扫描结果问"你平时把代码仓库放在哪个文件夹"，再由你推出来：
@@ -93,9 +93,9 @@
    - 首次安装必须显式传 `--workspace`，dry-run 也一样：你的 shell 不是交互终端，不传会直接退出码 2。
 3. **仓库目录 `--repo-dir`**：默认就是主工作台，不用传。只在上面说的分散情况才列，按查找顺序。
 4. **宿主 `--host`**：用户没说用哪个（包括回"按你推荐的来"）时，**只装你自己**：你是 Claude Code 就 `--host claude`，是 Codex 就 `--host codex`。告诉用户以后要加另一个，用 `--host both` 重跑就行。用户说两个都用才 `both`。用户选的那个电脑上还没装的，install 会一起装上（官方安装脚本，装在用户的家目录）；**登录要用户自己来**：Claude Code 第一次运行 `claude` 时按浏览器提示登录，Codex 先跑 `codex login`。
-5. **团队 profile `--profile`（可选）**：用户的团队有 drover 的团队规则（profile，比如推送前确认分支、改表结构要核对，README 3.1）时，用户给出名字或目录就加上；没有或不确定就不加，以后 `./install.sh --profile <名字或目录>` 单独加，不用重装。
-6. **主工作台里已经有 `AGENTS.md`、没有 drover 标记**：区块会追加到末尾（先备份），可能和已有内容重复。建议先在用户想要的位置放一对空标记（README 2.5）。问用户要不要、放在哪；用户同意后你加，或者用户自己加。
-7. **要不要装飞书 oncall**（README 4.9）：默认不装，用户说要才装。它从 GitHub 装一个 herdr 插件（herdr-oncall，要 Node 18+，收飞书回复要 22+）：离开电脑时，主会话需要用户的事（卡在确认框上；转达编排者要用户拍板、做完了、卡住了）会推到飞书，用户在飞书里收提问、直接给主会话下命令（它对飞书消息的回答挂回那条消息下面）；别的对话不推。用户要，就加 `--oncall`（会记住，以后重跑、更新都照旧），装完在第 7 步配对；没有 Node、公司网络访问不了 GitHub 时先跟用户说清楚。重装 / 升级时以前已经装上的不用加，install 照旧保留、照旧更新；用户这次说不要了，加 `--no-oncall`（已装的插件不卸）。
+5. **团队 profile `--profile`（可选）**：用户的团队有 drover 的团队规则（profile，比如推送前确认分支、改表结构要核对，[团队 profile 和 playbook](configuration.md#团队-profile-和-playbook)）时，用户给出名字或目录就加上；没有或不确定就不加，以后 `./install.sh --profile <名字或目录>` 单独加，不用重装。
+6. **主工作台里已经有 `AGENTS.md`、没有 drover 标记**：区块会追加到末尾（先备份），可能和已有内容重复。建议先在用户想要的位置放一对空标记（[install 会改哪些地方](install.md#install-会改哪些地方)）。问用户要不要、放在哪；用户同意后你加，或者用户自己加。
+7. **要不要装飞书 oncall**（[oncall.md](oncall.md)）：默认不装，用户说要才装。它从 GitHub 装一个 herdr 插件（herdr-oncall，要 Node 18+，收飞书回复要 22+）：离开电脑时，主会话需要用户的事（卡在确认框上；转达编排者要用户拍板、做完了、卡住了）会推到飞书，用户在飞书里收提问、直接给主会话下命令（它对飞书消息的回答挂回那条消息下面）；别的对话不推。用户要，就加 `--oncall`（会记住，以后重跑、更新都照旧），装完在第 7 步配对；没有 Node、公司网络访问不了 GitHub 时先跟用户说清楚。重装 / 升级时以前已经装上的不用加，install 照旧保留、照旧更新；用户这次说不要了，加 `--no-oncall`（已装的插件不卸）。
 
 ## 4. clone（用户确认位置后）
 
@@ -135,7 +135,7 @@
 - 路径不是用户说的那个；
 - 要把一个已有的实体文件或目录换成软链（会先备份）：说明用户在那里有自己的东西；
 - `AGENTS.md` 已有内容、没有标记，用户还没同意追加到末尾；
-- 计划里出现 README 2.5 之外的位置；
+- 计划里出现 [install 会改哪些地方](install.md#install-会改哪些地方)之外的位置；
 - 汇总里有"失败"，或者退出码不是 0（比如主工作台是家目录，install 拒绝）。验收工具那几项（"验收工具…"）在 dry-run 里只是列出要装，不算这一条。
 
 依赖那几项（herdr、Claude Code / Codex 命令、Node）的动作是"没自动装（不是交互终端，也没加 --install-deps）"：是 dry-run 漏了 `--install-deps`，加上重跑 dry-run。动作是"官方安装脚本只支持 macOS / Linux""要用 curl"：停下，把原话告诉用户。
@@ -153,13 +153,13 @@
 - herdr 没装上（网络、下载失败）：其余项已经装好，用到 herdr 的几项（herdr 技能、状态 hook）报失败。把失败原因给用户看；网络好了用同一组参数再跑一次。重跑是幂等的，装对的项会跳过，已经装上的依赖不会重装。
 - Claude Code / Codex 命令没装上：只记警告，退出码照样是 0，drover 这边已经装好。把原因和官方命令（提示里有）给用户看，装好之后不用重跑 install。
 - 飞书 oncall 那一项失败（访问不了 GitHub、Node 没装上、herdr 没在运行）：其余项已经装好。把失败原因给用户看，问用户是处理好后重跑，还是加 `--no-oncall` 重跑（会记住）。
-- 汇总里"只记警告"的（验收工具 crapper、dryer 或它们要的 Python 3.11+ 没装上）：不算失败，退出码照样是 0，drover 能正常用，只是验收时少了复杂度和重复代码的检查（报"测不了"）。把提示里的原因告诉用户，网络好了重跑 install 或 `~/.drover/bin/drover update` 会补装；用户不想要，就在 `~/.drover/config.json` 写 `"quality_tools": false`（用户让你改你才改，README 2.8）。
+- 汇总里"只记警告"的（验收工具 crapper、dryer 或它们要的 Python 3.11+ 没装上）：不算失败，退出码照样是 0，drover 能正常用，只是验收时少了复杂度和重复代码的检查（报"测不了"）。把提示里的原因告诉用户，网络好了重跑 install 或 `~/.drover/bin/drover update` 会补装；用户不想要，就在 `~/.drover/config.json` 写 `"quality_tools": false`（用户让你改你才改，[验收工具](quality-tools.md)）。
 
 ## 7. 检查和交代
 
-跑 `./install.sh --check`，结果给用户。`✓` 装对，`!` 只是提示，`✗` 没装对（README 2.6）。
+跑 `./install.sh --check`，结果给用户。`✓` 装对，`!` 只是提示，`✗` 没装对（[检查、更新、卸载](install.md#检查更新卸载)）。
 
-- `!` codex 的 `sandbox_mode` 不是 `danger-full-access`：告诉用户原因（README 第 7 节），不要改 `~/.codex/config.toml`。
+- `!` codex 的 `sandbox_mode` 不是 `danger-full-access`：告诉用户原因（[Codex 注意事项](usage.md#codex-注意事项)），不要改 `~/.codex/config.toml`。
 - herdr、claude 不在 PATH：汇总里"把装依赖的目录加进 PATH"那一项完成了的，告诉用户开一个新终端就好（install 已经把 `~/.local/bin` 加进了那一项写的 shell 启动文件）。那一项只是提示的（用户的 shell 认不出等），告诉用户把 `export PATH="$HOME/.local/bin:$PATH"` 加进自己 shell 的启动文件，再开新终端；用户让你改，你才改。
 - `!` Node 低于 22：告诉用户能收到飞书推送，但飞书里的回复送不回来，升级 Node 就好。
 - `!` 验收工具没装上、或者没有 Python 3.11+：只是提示，处理办法同第 6 步"只记警告"那一条。
@@ -169,7 +169,7 @@
 1. 跑 `~/.drover/bin/drover oncall pair`（要等插件这次的动作跑完，可能二三十秒）。输出里的 `link` 是配对链接，原样告诉用户："Mac 桌面上会弹出一个二维码，用手机飞书扫一下、按提示确认；没弹出来的话，在手机飞书里打开这个链接：<link>。"输出里 `already_paired` 是 `true` 就是已经配过了，告诉用户"飞书已配对"，跳到第 3 步。
 2. 用户说扫好了，跑 `~/.drover/bin/drover oncall status`，看 `plugin_status.channels.feishu.paired` 是不是 `true`。还是 `false`：问用户是不是还没在飞书里点确认；链接十来分钟就过期，过期了重跑第 1 步。
 3. 已配对后跑 `~/.drover/bin/drover oncall test`，问用户飞书收到测试消息没有。
-4. 没收到、`link` 是空的、`pair` 报错：`still_running` 是 `true` 的是插件还没跑完，过一会儿看 `herdr plugin log list --plugin com.codreamer.herdr.oncall --limit 5` 里 `open:` 后面的链接；其他情况把 `hints`、`plugin_message` 和这条命令的输出给用户看（README 第 8 节"飞书收不到消息""飞书配对失败"）。飞书租户不让建个人机器人时，按 README 第 8 节告诉用户，不要自己想办法绕过。
+4. 没收到、`link` 是空的、`pair` 报错：`still_running` 是 `true` 的是插件还没跑完，过一会儿看 `herdr plugin log list --plugin com.codreamer.herdr.oncall --limit 5` 里 `open:` 后面的链接；其他情况把 `hints`、`plugin_message` 和这条命令的输出给用户看（排障里的[飞书收不到消息](troubleshooting.md#飞书收不到消息)、[飞书配对失败](troubleshooting.md#飞书配对失败)）。飞书租户不让建个人机器人时，按[排障](troubleshooting.md#飞书租户不让建个人机器人)告诉用户，不要自己想办法绕过。
 5. 这几条命令要连 herdr：herdr 没在运行（报 `herdr plugin list 失败`）时，请用户先在终端里运行 `herdr`，再重试。
 - `drover oncall pair --wait` 会一直等到配上（最多 5 分钟）再自动发测试消息，适合用户就在旁边、扫完不想再回话的情况；它会阻塞，平时按上面一步一步来。
 
@@ -177,15 +177,15 @@
 
 最后照附 B 用大白话交代：以后去哪个文件夹开 agent、怎么提需求、怎么看进度、出问题怎么卸载、备份在哪。给你的要点：
 
-- 开主会话（新手照着做得下来，附 B 第 1 条就是这几步；README 4.1）：
+- 开主会话（新手照着做得下来，附 B 第 1 条就是这几步；[开主会话](usage.md#开主会话)）：
   1. 打开 Herdr：开一个新终端，运行 `herdr`（install 把 `~/.local/bin` 加进了 shell 配置，新开的终端里才生效）。那一项没做成的，用完整路径 `~/.local/bin/herdr`，并请用户把 `export PATH="$HOME/.local/bin:$PATH"` 加进 shell 的启动文件、再开一个新终端（drover 在 Herdr 里按名字调用 herdr、claude，不加会报找不到；用户让你改，你才改）。
   2. 第一次启动会自动开一个 workspace：点一下 pane 就能输入，然后 `cd <主工作台>`。
-  3. 启动 `claude`，第一次按浏览器提示登录；Codex 先跑 `codex login`，再 `codex -s danger-full-access`（README 第 7 节）。
-  4. 把信任框、MCP 弹窗点掉（README 第 8 节"启动卡在信任 / MCP 弹窗"），以后起编排者（orchestrator，drover 给每个任务起的会话）才不会卡住。
+  3. 启动 `claude`，第一次按浏览器提示登录；Codex 先跑 `codex login`，再 `codex -s danger-full-access`（[Codex 注意事项](usage.md#codex-注意事项)）。
+  4. 把信任框、MCP 弹窗点掉（[启动卡在信任 / MCP 弹窗](troubleshooting.md#启动卡在信任--mcp-弹窗)），以后起编排者（orchestrator，drover 给每个任务起的会话）才不会卡住。
   5. 离开时按 `ctrl+b` 再按 `q`，agent 会接着跑；下次再运行 `herdr` 就回来了；`herdr server stop` 才是全部停掉。
-- 备份和卸载：备份是 install 输出里"备份："列出的 `*.bak-drover-*`（Codex 技能的在 `~/.drover/backups/codex-skills/`），卸载不会自动还原；卸载先 `./install.sh --uninstall --dry-run`，再 `./install.sh --uninstall`（README 2.6）。install 替用户装的 herdr、Claude Code / Codex、Node 卸载时不删，输出里会列出手动删法。
+- 备份和卸载：备份是 install 输出里"备份："列出的 `*.bak-drover-*`（Codex 技能的在 `~/.drover/backups/codex-skills/`），卸载不会自动还原；卸载先 `./install.sh --uninstall --dry-run`，再 `./install.sh --uninstall`（[检查、更新、卸载](install.md#检查更新卸载)）。install 替用户装的 herdr、Claude Code / Codex、Node 卸载时不删，输出里会列出手动删法。
 - link 模式：clone 不能挪、不能删。
-- 更新：`~/.drover/bin/drover update`（拉新代码、按原来的模式重跑安装、检查，最后告诉你要不要 /clear），在主会话里说"更新 drover"也行；copy 模式没留 clone 的，它会给出手动步骤（README 2.6）。
+- 更新：`~/.drover/bin/drover update`（拉新代码、按原来的模式重跑安装、检查，最后告诉你要不要 /clear），在主会话里说"更新 drover"也行；copy 模式没留 clone 的，它会给出手动步骤（[检查、更新、卸载](install.md#检查更新卸载)）。
 - **你这个会话不会加载新的路由规则**，要用 drover 得在 Herdr 里新开一个会话。
 
 ## 8. 不要做的事

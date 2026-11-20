@@ -196,7 +196,7 @@ HEAVY_CPU_WINDOW = 2.0      # 整机、进程树的实测 CPU 取最近几秒的
 HEAVY_CPU_MIN_SPAN = 0.5    # 两次采样至少隔这么久才算数（刚开始排队、--status 现采时最多多等这么久）
 HEAVY_UNKNOWN_CORES = 1.0   # 没有历史的命令先按几核（一个进程最多占满一核；本机实测的单条测试命令多在 0.4～0.9 核），跑起来按实测
 HEAVY_KILL_GRACE = 5        # 被中断时转发信号后等子进程自己退出的秒数，到了补 SIGKILL；capture_run 超时停子进程也用它
-# config.json 可覆盖的阈值（README 第 3 节）；容量 heavy_cpu_capacity 见 heavy_capacity。
+# config.json 可覆盖的阈值（docs/configuration.md）；容量 heavy_cpu_capacity 见 heavy_capacity。
 HEAVY_SETTINGS = {
     "heavy_small_seconds": 10.0,   # 历史上最长也在这么多秒内跑完的小命令不排队、不计入占用
     "heavy_starve_seconds": 120.0,  # 排头等了这么久还没放行，后来的只放能在它开跑前跑完的（防饿死，见 heavy_plan）
@@ -221,7 +221,7 @@ HEX_REV_RE = re.compile(r"^[0-9a-f]{7,40}$")
 # 就等于白名单放行了任意命令（git push、rm、bash -c …）。所以跳过开头的 env 和 VAR=值 之后，程序名（取 basename，
 # ./mvnw、./.venv/bin/python 都认）必须在这张表里；python 带版本号（python3.12）也算。jest、vue-tsc 是在建议名单上
 # 补的：和 vitest、tsc 同类。node 是后补的：文档的 CDP 检查（verify-*-cdp.mjs）一直用 heavy -- node 排队。
-# 名单里的 python / node / npx / bun / make 本身能跑任意代码，这里挡的是把 heavy 当通用执行器。crapper、mutator 是 README 写的
+# 名单里的 python / node / npx / bun / make 本身能跑任意代码，这里挡的是把 heavy 当通用执行器。crapper、mutator 是 docs/quality-tools.md 写的
 # 手动跑法（带覆盖率的 crapper 会跑全量测试，mutator 一跑就是每核一个 worker），要经调度。
 HEAVY_TOOLS = frozenset({
     "mvn", "mvnw", "gradle", "gradlew",
@@ -9394,7 +9394,7 @@ def cmd_cleanup(a: argparse.Namespace) -> dict:
 
 
 # ---------------------------------------------------------------- update：一条命令更新 drover
-# 以前更新要按 README 2.6 自己跑 git pull、重跑 install（copy 模式还得带 --mode copy）、--check，再自己判断要不要让主会话
+# 以前更新要按 docs/install.md 自己跑 git pull、重跑 install（copy 模式还得带 --mode copy）、--check，再自己判断要不要让主会话
 # 重读 AGENTS.md，步骤多、容易漏。update 把这几步收成一条：fetch + 只快进 clone → 每次都重跑 clone 里的新 install.py
 # （幂等，顺带修好以前只 pull 没重跑 install 留下的过期区块）→ 跑装好那份的 --check → 一两句话说结果和下一步。
 # 快进到哪按更新通道（config.json 的 update_channel，见 update_sync）：release（默认，没写也是它）跟发布的
@@ -9443,7 +9443,7 @@ def update_target() -> dict:
     marker = read_json_dict(INSTALL_PKG / COPY_MARKER)
     if not state and not (INSTALL_PKG.exists() or INSTALL_PKG.is_symlink()):
         raise DroverError(f"没装过 drover（没有安装记录 {home_path(INSTALL_STATE_FILE)}，也没有 {home_path(INSTALL_PKG)}），"
-                          "按 README 2.1 安装")
+                          "按 README 的「安装」一节安装")
     mode = state.get("mode") or ("copy" if (INSTALL_PKG / COPY_MARKER).is_file() else "link")
     if mode == "link":
         clone = os.path.realpath(INSTALL_PKG) if INSTALL_PKG.is_symlink() else state.get("source")
@@ -9466,11 +9466,11 @@ def update_clone_problem(clone: Optional[str], mode: str, hosts: list) -> Option
             return None
     if mode == "link" and clone:
         return (f"{home_path(INSTALL_PKG)} 指向的 {home_path(clone)} 不是 git 仓库（clone 挪了或删了），没法自动更新。"
-                "clone 挪了：在新位置里跑 python3 install.py（link 模式会改指过去）；删了：按 README 2.1 重新 clone 再装")
+                "clone 挪了：在新位置里跑 python3 install.py（link 模式会改指过去）；删了：按 README 的「安装」一节重新 clone 再装")
     where = f"{home_path(clone)} 不是 git 仓库" if clone else "安装记录和 .drover-copy 里都没记 clone 在哪"
     install_cmd = shlex.join(["python3", f"{UPDATE_TMP_CLONE}/install.py", "--mode", "copy", *update_host_args(hosts)])
     return (f"找不到 drover 的 clone（{where}，copy 模式多半是装完把 clone 删了），没法自动更新。手动更新："
-            f"git clone <drover 仓库地址，见 {home_path(INSTALL_PKG / 'README.md')} 第 2.1 节> {UPDATE_TMP_CLONE}，"
+            f"git clone <drover 仓库地址，见 {home_path(INSTALL_PKG / 'README.md')} 的「安装」一节> {UPDATE_TMP_CLONE}，"
             f"再 {install_cmd}，跑完删掉 {UPDATE_TMP_CLONE}")
 
 
@@ -9481,7 +9481,7 @@ def update_fetch_error(command: str, tries: int, stderr: str) -> str:
 
 
 def update_channel() -> str:
-    """config.json 的 update_channel（README 2.7）：没写是 release；不认识的值报错（不猜成哪个通道）。"""
+    """config.json 的 update_channel（docs/auto-update.md）：没写是 release；不认识的值报错（不猜成哪个通道）。"""
     channel = CONFIG.get("update_channel") or UPDATE_CHANNELS[0]
     if channel not in UPDATE_CHANNELS:
         raise DroverError(f'{home_path(CONFIG_FILE)} 里的 "update_channel" 是 {json.dumps(channel, ensure_ascii=False)}，'
@@ -9830,7 +9830,7 @@ def cmd_update(a: argparse.Namespace) -> int:
 #   无人值守：只试 1 次、fetch 最多 AUTO_UPDATE_NET_TIMEOUT 秒、不弹密码和主机确认；没有新提交时不重跑 install。
 # - 主会话怎么用上新规则：main-rules.json 记"载入时"的区块，drover rules 给差别。Claude Code：watch --main 报
 #   EVENT drover updated(…)，UserPromptSubmit hook（rules --hook）在用户下一条消息时也带上；Codex：board --json 的 drover 字段。
-# - 正在跑的编排者和 worker：link 模式下它们下一条 drover 命令就是新代码，CLI 要保持向后兼容（README 第 10 节的开发约定）。
+# - 正在跑的编排者和 worker：link 模式下它们下一条 drover 命令就是新代码，CLI 要保持向后兼容（docs/development.md 的开发约定）。
 #
 # AUTO_UPDATE_FILE（原子写；读-改-写拿 AUTO_UPDATE_STATE_LOCK，后台更新、tick、watch --main、drover rules 都会写）：
 #   last_attempt / finished  最近一次尝试开始 / 结束的时间（epoch 秒；tick 起后台进程前先写 last_attempt，算间隔用）

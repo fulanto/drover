@@ -1,0 +1,267 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="dg w-arch" width="1000" height="846" viewBox="0 0 1000 846" role="img" aria-label="总体架构：用户对主会话说需求；主会话用 orch-start 起编排者，用 watch --main 追踪，只读 rollup、先审再转；编排者通过 drover CLI 和 herdr server 在各自的 worktree 里起 worker；改动经 integrate 归集到集成 worktree 后 push 到上游；右侧是任务目录里的文件。左上角：主会话旁边的看板 tab 和后台自动更新。右上角：herdr-oncall 插件跑在 herdr 里，主会话需要你时推到飞书，你在飞书里发的消息、看板上点的收尾送进主会话，编排者和 worker 卡久了才升级。">
+        <!-- 抽自 docs/architecture.html「牧场全景：谁跟谁说话」一节的总体架构图（svg class dg w-arch）。改图时两处一起改：这个文件和 architecture.html 里那段 svg。 -->
+<style>
+:root {
+  --bg: #FBF6EC;          /* 奶油纸 */
+  --surface: #FFFDF8;     /* 卡片、图里的框 */
+  --sunk: #F4EBDB;        /* 内嵌块、图里的院子 */
+  --ink: #2E2A25;         /* 正文 */
+  --muted: #6B6153;       /* 次要文字 */
+  --line: #E5D8C2;
+  --line-strong: #CBB894;
+  --terra: #B4502C;       /* 赤陶：主强调，编排者 */
+  --terra-soft: #F8DFD2;
+  --mustard: #D9A21B;     /* 芥末黄：用户、脚本 */
+  --mustard-ink: #8A6400;
+  --mustard-soft: #FBEDC6;
+  --teal: #2C8174;        /* 浅青：herdr、worker */
+  --teal-soft: #D9EEEA;
+  --peach: #EDB894;
+  --peach-soft: #FBE6D6;
+  --cc: #C8642F;          /* Claude Code 标记色 */
+  --code-bg: #F3EAD9;
+  --font-body: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", "Noto Sans SC", system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1C1915; --surface: #27221C; --sunk: #2F2922; --ink: #F0E7D8; --muted: #B6A993;
+    --line: #3B342B; --line-strong: #5E523F;
+    --terra: #EE8E68; --terra-soft: #4A2B1F;
+    --mustard: #E6B845; --mustard-ink: #F0C860; --mustard-soft: #42351A;
+    --teal: #6CC5B7; --teal-soft: #1E3A35;
+    --peach: #9A6646; --peach-soft: #3B2A20;
+    --cc: #F09A62; --code-bg: #2C2620;
+  }
+}
+.dg { display: block; width: 100%; height: auto; font-family: var(--font-body); color: var(--ink); }
+.dg.w-timeline { min-width: 940px; }
+.dg.w-arch { min-width: 780px; }
+.dg.w-seq { min-width: 820px; }
+.dg.w-int { min-width: 800px; }
+.dg text { fill: var(--ink); font-size: 13px; }
+.dg .tt { font-size: 15px; font-weight: 700; }
+.dg .ts { font-size: 12px; fill: var(--muted); }
+.dg .tm { font-family: var(--font-mono); font-size: 11.5px; }
+.dg .tmb { font-family: var(--font-mono); font-size: 13px; font-weight: 600; }
+.dg .tl { font-size: 12.5px; }
+.dg .tb { font-weight: 700; }
+.dg .c-terra { fill: var(--terra); }
+.dg .c-teal { fill: var(--teal); }
+.dg .c-mus { fill: var(--mustard-ink); }
+.dg .c-muted { fill: var(--muted); }
+.dg .b { fill: var(--surface); stroke: var(--line-strong); stroke-width: 1.5; }
+.dg .b-terra { fill: var(--terra-soft); stroke: var(--terra); stroke-width: 1.5; }
+.dg .b-teal { fill: var(--teal-soft); stroke: var(--teal); stroke-width: 1.5; }
+.dg .b-mus { fill: var(--mustard-soft); stroke: var(--mustard); stroke-width: 1.5; }
+.dg .b-peach { fill: var(--peach-soft); stroke: var(--peach); stroke-width: 1.5; }
+.dg .dash { stroke-dasharray: 6 5; }
+.dg .frame { fill: var(--sunk); stroke: var(--line-strong); stroke-width: 1.2; stroke-dasharray: 6 5; }
+.dg .tab { fill: var(--sunk); stroke: var(--line-strong); stroke-width: 1.2; }
+.dg .tab-on { fill: var(--terra-soft); stroke: var(--terra); stroke-width: 1.5; }
+.dg .chip-cc { fill: var(--surface); stroke: var(--cc); stroke-width: 1.5; }
+.dg .chip-cx { fill: var(--surface); stroke: var(--teal); stroke-width: 1.5; }
+.dg .c-cc { fill: var(--cc); }
+.dg .e { fill: none; stroke: var(--ink); stroke-width: 1.6; }
+.dg .e-terra { stroke: var(--terra); }
+.dg .e-teal { stroke: var(--teal); }
+.dg .ah { fill: var(--ink); }
+.dg .ah-terra { fill: var(--terra); }
+.dg .ah-teal { fill: var(--teal); }
+.dg .life { stroke: var(--line-strong); stroke-width: 1.3; stroke-dasharray: 4 5; fill: none; }
+.dg .road { fill: var(--peach-soft); stroke: var(--peach); stroke-width: 1.5; }
+.dg .stop1 { fill: var(--teal-soft); stroke: var(--teal); stroke-width: 2; }
+.dg .stop2 { fill: var(--mustard-soft); stroke: var(--mustard); stroke-width: 2; }
+.dg .stop3 { fill: var(--terra-soft); stroke: var(--terra); stroke-width: 2; }
+.dg .bracket1 { stroke: var(--teal); stroke-width: 2; fill: none; }
+.dg .bracket2 { stroke: var(--mustard); stroke-width: 2; fill: none; }
+.dg .bracket3 { stroke: var(--terra); stroke-width: 2; fill: none; }
+.dg .commit { fill: var(--terra); stroke: var(--surface); stroke-width: 2; }
+.dg .commit-base { fill: var(--ink); stroke: var(--surface); stroke-width: 2; }
+.dg .commit-item { fill: var(--teal); stroke: var(--surface); stroke-width: 2; }
+.dg .note { fill: var(--sunk); stroke: var(--line-strong); stroke-width: 1.2; }
+.dg.w-evo { min-width: 720px; }
+.dg .ev-n { fill: var(--terra-soft); stroke: var(--terra); stroke-width: 1.8; }
+.dg .ev-o { fill: var(--surface); stroke: var(--line-strong); stroke-width: 1.3; }
+.dg .evf-n { fill: var(--sunk); stroke: var(--terra); stroke-width: 1.5; stroke-dasharray: 6 5; }
+.dg .evf-o { fill: var(--sunk); stroke: var(--line-strong); stroke-width: 1.2; stroke-dasharray: 6 5; }
+.dg .evchip-n { fill: var(--surface); stroke: var(--terra); stroke-width: 1.5; }
+.dg .evchip-o { fill: var(--surface); stroke: var(--line-strong); stroke-width: 1.2; }
+.dg .evt-n { fill: var(--ink); }
+.dg .evt-o { fill: var(--muted); }
+.dg .evt-c { fill: var(--terra); }
+.dg .eva-n { fill: none; stroke: var(--terra); stroke-width: 1.8; }
+.dg .eva-o { fill: none; stroke: var(--line-strong); stroke-width: 1.5; }
+.dg .evm-n { fill: var(--terra); }
+.dg .evm-o { fill: var(--line-strong); }
+.dg .ev-g { fill: none; stroke: var(--line-strong); stroke-width: 1.1; stroke-dasharray: 2 5; opacity: .7; }
+.dg .ev-badge { fill: var(--terra); }
+.dg .ev-badge-t { fill: var(--surface); font-family: var(--font-mono); font-size: 9.5px; font-weight: 700; letter-spacing: .05em; }
+.dg.w-oncall { min-width: 820px; }
+.dg .sep { stroke: var(--peach); stroke-width: 1.2; stroke-dasharray: 4 5; }
+.dg .bg { fill: var(--surface); stroke: var(--line); stroke-width: 1; }
+</style>
+        <rect class="bg" x="0.5" y="0.5" width="999" height="845" rx="18"/>
+        <defs>
+          <marker id="ar-ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah"/></marker>
+          <marker id="ar-ah-t" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-terra"/></marker>
+        </defs>
+
+        <!-- L1 用户 -->
+        <rect x="240" y="16" width="200" height="52" rx="26" class="b-mus"/>
+        <text x="340" y="40" text-anchor="middle" class="tt">用户</text>
+        <text x="340" y="58" text-anchor="middle" class="ts">提需求 · 看一页 · 拍板</text>
+        <line x1="310" y1="68" x2="310" y2="110" class="e" marker-end="url(#ar-ah)"/>
+        <text x="302" y="94" text-anchor="end" class="tl">说需求</text>
+        <line x1="370" y1="110" x2="370" y2="70" class="e" marker-end="url(#ar-ah)"/>
+        <text x="378" y="94" class="tl">转达结论（开头是目标）</text>
+
+        <!-- 飞书 oncall：离开电脑时 -->
+        <rect x="530" y="16" width="176" height="52" rx="12" class="b-peach"/>
+        <text x="618" y="39" text-anchor="middle" class="tt">飞书（手机）</text>
+        <text x="618" y="58" text-anchor="middle" class="ts">只响该你的事</text>
+        <line x1="442" y1="42" x2="528" y2="42" class="e e-terra dash" marker-start="url(#ar-ah-t)" marker-end="url(#ar-ah-t)"/>
+        <text x="485" y="34" text-anchor="middle" class="ts c-terra">离开电脑时</text>
+        <rect x="530" y="112" width="176" height="88" rx="12" class="b-peach"/>
+        <text x="618" y="134" text-anchor="middle" class="tmb">herdr-oncall</text>
+        <text x="618" y="153" text-anchor="middle" class="ts">herdr 插件 · 按名字认角色</text>
+        <text x="618" y="172" text-anchor="middle" class="ts">编排者 / worker 的确认框</text>
+        <text x="618" y="191" text-anchor="middle" class="ts">卡 5 / 10 分钟才升级</text>
+        <line x1="618" y1="70" x2="618" y2="110" class="e e-terra" marker-start="url(#ar-ah-t)" marker-end="url(#ar-ah-t)"/>
+        <text x="626" y="94" class="ts c-terra">推送 · 送达</text>
+        <line x1="528" y1="140" x2="492" y2="140" class="e e-terra" marker-end="url(#ar-ah-t)"/>
+        <text x="510" y="132" text-anchor="middle" class="tm c-terra">[飞书]</text>
+        <text x="510" y="158" text-anchor="middle" class="tm c-terra">[看板]</text>
+        <line x1="492" y1="176" x2="528" y2="176" class="e e-terra" marker-end="url(#ar-ah-t)"/>
+        <text x="510" y="194" text-anchor="middle" class="ts c-terra">推送</text>
+        <path d="M694,200 V514 H666" class="e e-terra dash" marker-start="url(#ar-ah-t)"/>
+        <text x="700" y="232" class="ts c-terra" transform="rotate(90 700 232)">读 agent 状态</text>
+
+        <!-- 主会话旁边：自动更新、看板 tab -->
+        <rect x="16" y="16" width="168" height="76" rx="12" class="b-mus"/>
+        <text x="100" y="38" text-anchor="middle" class="tb">后台自动更新</text>
+        <text x="100" y="57" text-anchor="middle" class="tm">update --auto</text>
+        <text x="100" y="76" text-anchor="middle" class="ts">每 30 分钟 · drover rules</text>
+        <path d="M184,54 H214 V110" class="e dash" marker-end="url(#ar-ah)"/>
+        <rect x="16" y="112" width="168" height="88" rx="12" class="b-mus"/>
+        <text x="100" y="135" text-anchor="middle" class="tt">看板 tab</text>
+        <text x="100" y="154" text-anchor="middle" class="tm">board --live</text>
+        <text x="100" y="172" text-anchor="middle" class="ts">等你 / 进行中 / 完成</text>
+        <text x="100" y="190" text-anchor="middle" class="ts">[收尾] → herdr-oncall</text>
+
+        <!-- L2 主会话 -->
+        <rect x="190" y="112" width="300" height="88" rx="14" class="b"/>
+        <text x="340" y="138" text-anchor="middle" class="tt">主会话</text>
+        <text x="340" y="157" text-anchor="middle" class="ts">主工作台 · 路由 / 问答 / 审核 / 转达</text>
+        <rect x="246" y="168" width="92" height="22" rx="11" class="chip-cc"/>
+        <text x="292" y="183" text-anchor="middle" class="tm c-cc">Claude Code</text>
+        <rect x="346" y="168" width="88" height="22" rx="11" class="chip-cx"/>
+        <text x="390" y="183" text-anchor="middle" class="tm c-teal">Codex</text>
+
+        <!-- L2 ↔ L3 -->
+        <line x1="262" y1="200" x2="262" y2="276" class="e" marker-end="url(#ar-ah)"/>
+        <text x="254" y="221" text-anchor="end" class="tm">orch-start</text>
+        <text x="254" y="237" text-anchor="end" class="ts">写 request.md 后启动</text>
+        <line x1="312" y1="278" x2="312" y2="202" class="e e-terra dash" marker-end="url(#ar-ah-t)"/>
+        <text x="320" y="221" class="tm c-terra">rollup.md<tspan class="ts"> 只读这一页，≤ 40 行</tspan></text>
+        <text x="320" y="237" class="ts"><tspan class="tm">watch --main</tspan> 叫醒，先审再转</text>
+
+        <!-- L3 orch workspace -->
+        <rect x="16" y="244" width="664" height="180" rx="16" class="frame"/>
+        <text x="32" y="266" class="tm c-muted">herdr · orch workspace（一个任务一个 tab）</text>
+        <rect x="232" y="278" width="100" height="24" rx="6" class="tab-on"/>
+        <text x="282" y="295" text-anchor="middle" class="tm c-terra">orch-a</text>
+        <rect x="336" y="278" width="100" height="24" rx="6" class="tab"/>
+        <text x="386" y="295" text-anchor="middle" class="tm c-muted">orch-b</text>
+        <rect x="440" y="278" width="100" height="24" rx="6" class="tab"/>
+        <text x="490" y="295" text-anchor="middle" class="tm c-muted">orch-c</text>
+        <rect x="32" y="306" width="400" height="104" rx="10" class="b-terra"/>
+        <text x="52" y="334" class="tt">编排者（orchestrator）</text>
+        <text x="52" y="357" class="tl">拆条目 · 派 worker · 追踪 · 按证据验收</text>
+        <text x="52" y="377" class="tl">在集成 worktree 里统一检查和推送</text>
+        <text x="52" y="398" class="ts">宿主：Claude Code 或 Codex（--kind）</text>
+        <rect x="456" y="306" width="208" height="104" rx="10" class="b dash"/>
+        <text x="560" y="334" text-anchor="middle" class="tb">子编排者（可选）</text>
+        <text x="560" y="356" text-anchor="middle" class="ts">某个仓库活太多时</text>
+        <text x="560" y="376" text-anchor="middle" class="tm">orch-start --parent</text>
+        <text x="560" y="397" text-anchor="middle" class="ts">也只往上交 rollup</text>
+        <line x1="432" y1="358" x2="454" y2="358" class="e" marker-end="url(#ar-ah)"/>
+
+        <!-- L3 → L4 -->
+        <line x1="232" y1="410" x2="232" y2="466" class="e" marker-end="url(#ar-ah)"/>
+        <text x="242" y="444" class="tl">单条命令 · 读 JSON</text>
+
+        <!-- L4 脚本 + herdr -->
+        <rect x="32" y="468" width="400" height="112" rx="10" class="b-mus"/>
+        <text x="52" y="489" class="tmb">bin/drover（drover CLI）</text>
+        <text x="52" y="506" class="ts">Python 标准库 · 每个子命令输出一个 JSON</text>
+        <text x="52" y="524" class="tm">wt · deps · agent-start · brief · watch · accept</text>
+        <text x="52" y="540" class="tm">review · integrate · push · heavy · orch-start</text>
+        <text x="52" y="556" class="tm">wrapup · orch-status · oncall · main-register</text>
+        <text x="52" y="572" class="tm">board · rollup · rules · update · cleanup</text>
+        <rect x="488" y="468" width="176" height="92" rx="10" class="b"/>
+        <text x="576" y="494" text-anchor="middle" class="tt">herdr server</text>
+        <text x="576" y="514" text-anchor="middle" class="ts">unix socket · agent 状态</text>
+        <text x="576" y="535" text-anchor="middle" class="tm">working / idle</text>
+        <text x="576" y="552" text-anchor="middle" class="tm">blocked / done</text>
+        <line x1="432" y1="514" x2="486" y2="514" class="e" marker-end="url(#ar-ah)"/>
+        <text x="459" y="506" text-anchor="middle" class="tm">CLI</text>
+
+        <!-- L4 → L5 -->
+        <line x1="576" y1="560" x2="576" y2="602" class="e" marker-end="url(#ar-ah)"/>
+        <text x="566" y="597" text-anchor="end" class="tl">开 pane · 起 agent · 发任务书 · 读屏幕和状态</text>
+
+        <!-- L5 workers -->
+        <rect x="16" y="604" width="664" height="124" rx="16" class="frame"/>
+        <text x="32" y="626" class="tm c-muted">herdr · worktree workspaces（一个条目一个 worktree + 一个 worker）</text>
+        <rect x="32" y="638" width="200" height="78" rx="10" class="b-teal"/>
+        <text x="48" y="661" class="tb">worker · <tspan class="c-cc">claude</tspan></text>
+        <text x="48" y="682" class="tm">task/&lt;slug&gt;-api</text>
+        <text x="48" y="702" class="ts">自己的 pane + worktree</text>
+        <rect x="248" y="638" width="200" height="78" rx="10" class="b-teal"/>
+        <text x="264" y="661" class="tb">worker · <tspan class="c-teal">codex</tspan></text>
+        <text x="264" y="682" class="tm">task/&lt;slug&gt;-ui</text>
+        <text x="264" y="702" class="ts">自己的 pane + worktree</text>
+        <rect x="464" y="638" width="200" height="78" rx="10" class="b-teal"/>
+        <text x="480" y="661" class="tb">worker · <tspan class="c-cc">claude</tspan></text>
+        <text x="480" y="682" class="tm">task/&lt;slug&gt;-docs</text>
+        <text x="480" y="702" class="ts">自己的 pane + worktree</text>
+
+        <!-- L5 → L6 -->
+        <line x1="232" y1="728" x2="232" y2="770" class="e" marker-end="url(#ar-ah)"/>
+        <text x="242" y="754" class="tl"><tspan class="tm">integrate</tspan>（按顺序 cherry-pick 各条目）</text>
+
+        <!-- L6 集成 + 上游 -->
+        <rect x="32" y="772" width="416" height="56" rx="10" class="b-terra dash"/>
+        <text x="48" y="796" class="tb">集成 worktree（编排者的，每个仓库一个）</text>
+        <text x="48" y="816" class="tm">task/&lt;slug&gt; · 整体检查一次 · 迁移</text>
+        <rect x="496" y="776" width="168" height="48" rx="24" class="b"/>
+        <text x="580" y="805" text-anchor="middle" class="tm">origin/&lt;上游&gt;</text>
+        <line x1="448" y1="800" x2="494" y2="800" class="e" marker-end="url(#ar-ah)"/>
+        <text x="471" y="792" text-anchor="middle" class="tm">push</text>
+
+        <!-- 文件列 -->
+        <rect x="716" y="100" width="268" height="736" rx="16" class="frame"/>
+        <text x="732" y="124" class="tmb">~/.drover/&lt;slug&gt;/</text>
+        <rect x="732" y="146" width="236" height="52" rx="8" class="b"/>
+        <text x="746" y="167" class="tm tb">request.md</text>
+        <text x="746" y="187" class="ts">主会话写：原话 + 目标 + 上下文</text>
+        <rect x="732" y="256" width="236" height="52" rx="8" class="b-terra"/>
+        <text x="746" y="277" class="tm tb">rollup.md</text>
+        <text x="746" y="297" class="ts">编排者写，主会话只读这一页</text>
+        <rect x="732" y="318" width="236" height="52" rx="8" class="b"/>
+        <text x="746" y="339" class="tm tb">dispatch.md（状态文件）</text>
+        <text x="746" y="359" class="ts">计划、ID、决定，断了靠它接上</text>
+        <rect x="732" y="400" width="236" height="52" rx="8" class="b"/>
+        <text x="746" y="421" class="tm tb">timeline.jsonl</text>
+        <text x="746" y="441" class="ts">时间线：看板的“状态持续”按它算</text>
+        <rect x="732" y="488" width="236" height="52" rx="8" class="b"/>
+        <text x="746" y="509" class="tm tb">&lt;agent&gt;.prompt.md（任务书）</text>
+        <text x="746" y="529" class="ts">brief 按模板生成，发给 worker</text>
+        <rect x="732" y="644" width="236" height="52" rx="8" class="b"/>
+        <text x="746" y="665" class="tm tb">&lt;agent&gt;.md（报告）</text>
+        <text x="746" y="685" class="ts">worker 写，编排者拿去验收</text>
+        <rect x="732" y="772" width="236" height="52" rx="8" class="b"/>
+        <text x="746" y="793" class="tm tb">pushes.jsonl · accept*.json</text>
+        <text x="746" y="813" class="ts">推送账本、验收结果</text>
+      </svg>

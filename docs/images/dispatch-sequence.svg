@@ -1,0 +1,197 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="dg w-seq" width="1000" height="902" viewBox="0 0 1000 902" role="img" aria-label="一次派发的时序图：用户说需求，主会话复述后用 orch-start 起编排者，后台挂着 watch --main；编排者分析后对每个条目执行 wt、deps、agent-start、brief --send，watch 追踪，worker 写报告，accept 验收，rollup 交回主会话；主会话先审，再以【转达】开头转给用户；用户说提交推送后编排者执行 integrate、accept、push。">
+        <!-- 抽自 docs/architecture.html「一句需求，从说出口到推上远端」一节的时序图（svg class dg w-seq）。改图时两处一起改：这个文件和 architecture.html 里那段 svg。 -->
+<style>
+:root {
+  --bg: #FBF6EC;          /* 奶油纸 */
+  --surface: #FFFDF8;     /* 卡片、图里的框 */
+  --sunk: #F4EBDB;        /* 内嵌块、图里的院子 */
+  --ink: #2E2A25;         /* 正文 */
+  --muted: #6B6153;       /* 次要文字 */
+  --line: #E5D8C2;
+  --line-strong: #CBB894;
+  --terra: #B4502C;       /* 赤陶：主强调，编排者 */
+  --terra-soft: #F8DFD2;
+  --mustard: #D9A21B;     /* 芥末黄：用户、脚本 */
+  --mustard-ink: #8A6400;
+  --mustard-soft: #FBEDC6;
+  --teal: #2C8174;        /* 浅青：herdr、worker */
+  --teal-soft: #D9EEEA;
+  --peach: #EDB894;
+  --peach-soft: #FBE6D6;
+  --cc: #C8642F;          /* Claude Code 标记色 */
+  --code-bg: #F3EAD9;
+  --font-body: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", "Noto Sans SC", system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1C1915; --surface: #27221C; --sunk: #2F2922; --ink: #F0E7D8; --muted: #B6A993;
+    --line: #3B342B; --line-strong: #5E523F;
+    --terra: #EE8E68; --terra-soft: #4A2B1F;
+    --mustard: #E6B845; --mustard-ink: #F0C860; --mustard-soft: #42351A;
+    --teal: #6CC5B7; --teal-soft: #1E3A35;
+    --peach: #9A6646; --peach-soft: #3B2A20;
+    --cc: #F09A62; --code-bg: #2C2620;
+  }
+}
+.dg { display: block; width: 100%; height: auto; font-family: var(--font-body); color: var(--ink); }
+.dg.w-timeline { min-width: 940px; }
+.dg.w-arch { min-width: 780px; }
+.dg.w-seq { min-width: 820px; }
+.dg.w-int { min-width: 800px; }
+.dg text { fill: var(--ink); font-size: 13px; }
+.dg .tt { font-size: 15px; font-weight: 700; }
+.dg .ts { font-size: 12px; fill: var(--muted); }
+.dg .tm { font-family: var(--font-mono); font-size: 11.5px; }
+.dg .tmb { font-family: var(--font-mono); font-size: 13px; font-weight: 600; }
+.dg .tl { font-size: 12.5px; }
+.dg .tb { font-weight: 700; }
+.dg .c-terra { fill: var(--terra); }
+.dg .c-teal { fill: var(--teal); }
+.dg .c-mus { fill: var(--mustard-ink); }
+.dg .c-muted { fill: var(--muted); }
+.dg .b { fill: var(--surface); stroke: var(--line-strong); stroke-width: 1.5; }
+.dg .b-terra { fill: var(--terra-soft); stroke: var(--terra); stroke-width: 1.5; }
+.dg .b-teal { fill: var(--teal-soft); stroke: var(--teal); stroke-width: 1.5; }
+.dg .b-mus { fill: var(--mustard-soft); stroke: var(--mustard); stroke-width: 1.5; }
+.dg .b-peach { fill: var(--peach-soft); stroke: var(--peach); stroke-width: 1.5; }
+.dg .dash { stroke-dasharray: 6 5; }
+.dg .frame { fill: var(--sunk); stroke: var(--line-strong); stroke-width: 1.2; stroke-dasharray: 6 5; }
+.dg .tab { fill: var(--sunk); stroke: var(--line-strong); stroke-width: 1.2; }
+.dg .tab-on { fill: var(--terra-soft); stroke: var(--terra); stroke-width: 1.5; }
+.dg .chip-cc { fill: var(--surface); stroke: var(--cc); stroke-width: 1.5; }
+.dg .chip-cx { fill: var(--surface); stroke: var(--teal); stroke-width: 1.5; }
+.dg .c-cc { fill: var(--cc); }
+.dg .e { fill: none; stroke: var(--ink); stroke-width: 1.6; }
+.dg .e-terra { stroke: var(--terra); }
+.dg .e-teal { stroke: var(--teal); }
+.dg .ah { fill: var(--ink); }
+.dg .ah-terra { fill: var(--terra); }
+.dg .ah-teal { fill: var(--teal); }
+.dg .life { stroke: var(--line-strong); stroke-width: 1.3; stroke-dasharray: 4 5; fill: none; }
+.dg .road { fill: var(--peach-soft); stroke: var(--peach); stroke-width: 1.5; }
+.dg .stop1 { fill: var(--teal-soft); stroke: var(--teal); stroke-width: 2; }
+.dg .stop2 { fill: var(--mustard-soft); stroke: var(--mustard); stroke-width: 2; }
+.dg .stop3 { fill: var(--terra-soft); stroke: var(--terra); stroke-width: 2; }
+.dg .bracket1 { stroke: var(--teal); stroke-width: 2; fill: none; }
+.dg .bracket2 { stroke: var(--mustard); stroke-width: 2; fill: none; }
+.dg .bracket3 { stroke: var(--terra); stroke-width: 2; fill: none; }
+.dg .commit { fill: var(--terra); stroke: var(--surface); stroke-width: 2; }
+.dg .commit-base { fill: var(--ink); stroke: var(--surface); stroke-width: 2; }
+.dg .commit-item { fill: var(--teal); stroke: var(--surface); stroke-width: 2; }
+.dg .note { fill: var(--sunk); stroke: var(--line-strong); stroke-width: 1.2; }
+.dg.w-evo { min-width: 720px; }
+.dg .ev-n { fill: var(--terra-soft); stroke: var(--terra); stroke-width: 1.8; }
+.dg .ev-o { fill: var(--surface); stroke: var(--line-strong); stroke-width: 1.3; }
+.dg .evf-n { fill: var(--sunk); stroke: var(--terra); stroke-width: 1.5; stroke-dasharray: 6 5; }
+.dg .evf-o { fill: var(--sunk); stroke: var(--line-strong); stroke-width: 1.2; stroke-dasharray: 6 5; }
+.dg .evchip-n { fill: var(--surface); stroke: var(--terra); stroke-width: 1.5; }
+.dg .evchip-o { fill: var(--surface); stroke: var(--line-strong); stroke-width: 1.2; }
+.dg .evt-n { fill: var(--ink); }
+.dg .evt-o { fill: var(--muted); }
+.dg .evt-c { fill: var(--terra); }
+.dg .eva-n { fill: none; stroke: var(--terra); stroke-width: 1.8; }
+.dg .eva-o { fill: none; stroke: var(--line-strong); stroke-width: 1.5; }
+.dg .evm-n { fill: var(--terra); }
+.dg .evm-o { fill: var(--line-strong); }
+.dg .ev-g { fill: none; stroke: var(--line-strong); stroke-width: 1.1; stroke-dasharray: 2 5; opacity: .7; }
+.dg .ev-badge { fill: var(--terra); }
+.dg .ev-badge-t { fill: var(--surface); font-family: var(--font-mono); font-size: 9.5px; font-weight: 700; letter-spacing: .05em; }
+.dg.w-oncall { min-width: 820px; }
+.dg .sep { stroke: var(--peach); stroke-width: 1.2; stroke-dasharray: 4 5; }
+.dg .bg { fill: var(--surface); stroke: var(--line); stroke-width: 1; }
+</style>
+        <rect class="bg" x="0.5" y="0.5" width="999" height="901" rx="18"/>
+        <defs>
+          <marker id="sq-ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah"/></marker>
+          <marker id="sq-ah-t" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-terra"/></marker>
+          <marker id="sq-ah-w" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-teal"/></marker>
+        </defs>
+
+        <!-- 片段框 -->
+        <rect x="392" y="390" width="592" height="232" rx="10" class="note dash"/>
+        <rect x="826" y="390" width="158" height="24" rx="6" class="b-peach"/>
+        <text x="905" y="407" text-anchor="middle" class="tl tb">每个条目一份 · 并行</text>
+        <rect x="16" y="718" width="772" height="178" rx="10" class="note dash"/>
+        <rect x="608" y="718" width="180" height="24" rx="6" class="b-peach"/>
+        <text x="698" y="735" text-anchor="middle" class="tl tb">用户说“提交推送”之后</text>
+
+        <!-- 生命线 -->
+        <line x1="90" y1="66" x2="90" y2="896" class="life"/>
+        <line x1="280" y1="66" x2="280" y2="896" class="life"/>
+        <line x1="480" y1="66" x2="480" y2="896" class="life"/>
+        <line x1="690" y1="66" x2="690" y2="896" class="life"/>
+        <line x1="900" y1="66" x2="900" y2="896" class="life"/>
+
+        <!-- 头部 -->
+        <rect x="15" y="16" width="150" height="50" rx="12" class="b-mus"/>
+        <text x="90" y="39" text-anchor="middle" class="tt">用户</text>
+        <text x="90" y="57" text-anchor="middle" class="ts">提需求、拍板</text>
+        <rect x="205" y="16" width="150" height="50" rx="12" class="b"/>
+        <text x="280" y="39" text-anchor="middle" class="tt">主会话</text>
+        <text x="280" y="57" text-anchor="middle" class="ts">路由 / 审核 / 转达</text>
+        <rect x="405" y="16" width="150" height="50" rx="12" class="b-terra"/>
+        <text x="480" y="39" text-anchor="middle" class="tt">编排者</text>
+        <text x="480" y="57" text-anchor="middle" class="tm c-muted">orch-xxx</text>
+        <rect x="615" y="16" width="150" height="50" rx="12" class="b"/>
+        <text x="690" y="39" text-anchor="middle" class="tmb">drover</text>
+        <text x="690" y="57" text-anchor="middle" class="ts">CLI + herdr</text>
+        <rect x="825" y="16" width="150" height="50" rx="12" class="b-teal"/>
+        <text x="900" y="39" text-anchor="middle" class="tt">worker</text>
+        <text x="900" y="57" text-anchor="middle" class="ts">条目 worktree 里</text>
+
+        <!-- 1 -->
+        <line x1="90" y1="104" x2="278" y2="104" class="e" marker-end="url(#sq-ah)"/>
+        <text x="185" y="96" text-anchor="middle" class="tl">说需求（可带 @仓库 …）</text>
+        <!-- 2 -->
+        <line x1="280" y1="140" x2="92" y2="140" class="e" marker-end="url(#sq-ah)"/>
+        <text x="185" y="132" text-anchor="middle" class="tl">复述目标，不等确认</text>
+        <!-- 3 -->
+        <line x1="280" y1="176" x2="688" y2="176" class="e" marker-end="url(#sq-ah)"/>
+        <text x="485" y="168" text-anchor="middle" class="tm">orch-start --request-file request.md</text>
+        <!-- 4 -->
+        <line x1="690" y1="212" x2="482" y2="212" class="e" marker-end="url(#sq-ah)"/>
+        <text x="585" y="204" text-anchor="middle" class="tl">新 tab + 开场 prompt</text>
+        <!-- 5 -->
+        <line x1="280" y1="248" x2="92" y2="248" class="e" marker-end="url(#sq-ah)"/>
+        <text x="185" y="240" text-anchor="middle" class="tl">“已交给 orch-xxx”</text>
+        <!-- 6 -->
+        <line x1="280" y1="284" x2="688" y2="284" class="e" marker-end="url(#sq-ah)"/>
+        <text x="485" y="276" text-anchor="middle" class="tm">watch --main（后台挂着）</text>
+        <!-- 7 -->
+        <line x1="480" y1="326" x2="688" y2="326" class="e e-terra" marker-end="url(#sq-ah-t)"/>
+        <text x="585" y="318" text-anchor="middle" class="tm">preflight · history</text>
+        <!-- 8 自己 -->
+        <rect x="382" y="344" width="196" height="30" rx="8" class="b-terra"/>
+        <text x="480" y="364" text-anchor="middle" class="tl">读代码 · 拆条目 · 写状态文件</text>
+
+        <!-- 9..14 每个条目 -->
+        <line x1="480" y1="432" x2="688" y2="432" class="e e-terra" marker-end="url(#sq-ah-t)"/>
+        <text x="585" y="424" text-anchor="middle" class="tm">wt → deps → agent-start</text>
+        <line x1="480" y1="468" x2="688" y2="468" class="e e-terra" marker-end="url(#sq-ah-t)"/>
+        <text x="585" y="460" text-anchor="middle" class="tm">brief --send</text>
+        <line x1="690" y1="504" x2="898" y2="504" class="e" marker-end="url(#sq-ah)"/>
+        <text x="795" y="496" text-anchor="middle" class="tl">任务书（目标打头）</text>
+        <line x1="690" y1="540" x2="482" y2="540" class="e" marker-end="url(#sq-ah)"/>
+        <text x="585" y="532" text-anchor="middle" class="tl"><tspan class="tm">watch</tspan>：EVENT 状态变化</text>
+        <line x1="900" y1="576" x2="482" y2="576" class="e e-teal dash" marker-end="url(#sq-ah-w)"/>
+        <text x="690" y="568" text-anchor="middle" class="tl">报告 <tspan class="tm">&lt;agent&gt;.md</tspan>（DONE / NEED_INPUT …）</text>
+        <line x1="480" y1="606" x2="688" y2="606" class="e e-terra" marker-end="url(#sq-ah-t)"/>
+        <text x="585" y="598" text-anchor="middle" class="tm">accept --verify（+ review）</text>
+
+        <!-- 15 16 -->
+        <line x1="480" y1="660" x2="282" y2="660" class="e e-terra dash" marker-end="url(#sq-ah-t)"/>
+        <text x="380" y="652" text-anchor="middle" class="tl"><tspan class="tm">rollup.md</tspan>：完成 / 等你决定</text>
+        <line x1="280" y1="696" x2="92" y2="696" class="e" marker-end="url(#sq-ah)"/>
+        <text x="185" y="688" text-anchor="middle" class="tl">先审，再【转达】（开头是目标）</text>
+
+        <!-- 17..20 提交推送 -->
+        <line x1="90" y1="768" x2="278" y2="768" class="e" marker-end="url(#sq-ah)"/>
+        <text x="185" y="760" text-anchor="middle" class="tl">“提交推送”</text>
+        <line x1="280" y1="804" x2="478" y2="804" class="e" marker-end="url(#sq-ah)"/>
+        <text x="380" y="796" text-anchor="middle" class="tl"><tspan class="tm">prompt</tspan> 转达原话</text>
+        <line x1="480" y1="840" x2="688" y2="840" class="e e-terra" marker-end="url(#sq-ah-t)"/>
+        <text x="585" y="832" text-anchor="middle" class="tm">integrate → accept → push</text>
+        <line x1="480" y1="876" x2="282" y2="876" class="e e-terra dash" marker-end="url(#sq-ah-t)"/>
+        <text x="380" y="868" text-anchor="middle" class="tl"><tspan class="tm">rollup.md</tspan>：完成</text>
+      </svg>

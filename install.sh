@@ -23,7 +23,7 @@ case "$os" in
     # 变量后面紧跟中文标点时要写 ${os}：macOS 的 /bin/sh（bash 3.2）会把后面的字节也当成变量名。
     say "install.sh：drover 这一版只支持 macOS（Linux 能装，但未实测），当前系统是 ${os}。"
     say "Windows 暂不支持：原生 Windows 上 drover 起不来（用到了只有 Unix 才有的文件锁和终端控制），herdr 的插件在 Windows 上也还是预览。"
-    say "想先试的，可以在 WSL2 的 Ubuntu 里按 Linux 的方式装（未实测，出了问题欢迎反馈），见 README 第 1 节。"
+    say "想先试的，可以在 WSL2 的 Ubuntu 里按 Linux 的方式装（未实测，出了问题欢迎反馈），见 docs/install.md 的「依赖」一节。"
     exit 1
     ;;
 esac
