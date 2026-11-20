@@ -229,11 +229,14 @@ class ReadOnlyGitIndexTests(DroverTestCase):
         return [c for c in calls if c["cmd"] == "detect-changes"]
 
     def test_accept(self) -> None:
-        """accept 开头的 git status --porcelain、最后的 git diff <base> --stat（中间的 git add -N .、update-index --refresh
-        本来就要写 index，不在此列）；detect-changes 也带 GIT_OPTIONAL_LOCKS=0（它改动为空时退回 git status）"""
+        """accept 开头的 git status --porcelain、git diff <base> --stat、算改动行的 git diff -U0 <base>（复杂度检查用；
+        中间的 git add -N .、update-index --refresh 本来就要写 index，不在此列）；detect-changes 也带 GIT_OPTIONAL_LOCKS=0
+        （它改动为空时退回 git status）"""
         probe = ReadOnlyGitProbe(self.gitdir(self.repo), self.repo / "stale.txt")
         res = self.accept(setup=probe.install)
-        self.assert_read_only(probe, [["status", "--porcelain"], [*NO_REFRESH, "diff", self.base, "--stat"]])
+        self.assert_read_only(probe, [["status", "--porcelain"], [*NO_REFRESH, "diff", self.base, "--stat"],
+                                      [*NO_REFRESH, "-c", "core.quotePath=false", "diff", "--no-color", "--no-ext-diff",
+                                       "-U0", self.base]])
         self.assertEqual(res["status_porcelain"], [" M edit.txt", "?? new.txt"])
         self.assertEqual(res["intent_to_add"], ["new.txt"])
         self.assertIn("edit.txt", res["diff_stat"])

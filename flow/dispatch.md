@@ -389,11 +389,11 @@ agent 名：`[a-z][a-z0-9_-]{0,31}`，在 `herdr agent list` 中唯一。用 `<�
 ~/.drover/bin/drover accept --wt <WT_PATH> --base <BASE_SHA> --save ~/.drover/<slug>/accept.json --brief --verify "./.venv/bin/python -m pytest tests/test_x.py -q" [--verify "<命令 2>"]...
 ```
 
-`--brief` 只在屏幕上打印摘要：文件数、删除数、新文件数、diff 汇总、图谱风险和无测试覆盖的函数、每条 verify 的结果。完整结果在 `--save` 的文件里，要看改动清单、图谱全文或 verify 的输出尾部时再去读，不要整份读进上下文。
+`--brief` 只在屏幕上打印摘要：文件数、删除数、新文件数、diff 汇总、图谱风险和无测试覆盖的函数、复杂度要处理的函数、每条 verify 的结果。完整结果在 `--save` 的文件里，要看改动清单、图谱全文或 verify 的输出尾部时再去读，不要整份读进上下文。
 
 仓库基线本来就有失败的命令（全量测试、全量 lint）放 `--verify-baseline` 和上游比失败条目，这是集成检查的用法，说明在第 9.1 节第 3 步；条目验收只跑相关命令，一般用不到它（相关测试碰上了主干本来就失败的用例，把这条相关测试命令改放 `--verify-baseline` 就行，不要因此换成全量）。
 
-脚本依次执行：记录 `git status --porcelain` → `git add -N .` 把新文件纳入 diff → 在 worktree 里全量建图 → `detect-changes --brief` → `git diff <BASE_SHA> --stat` → 在 worktree 里重跑 `--verify`（shlex 拆分、不经 shell，所以不能用管道、`&&`、重定向；每条默认超时 1800 秒，`--verify-timeout` 可改，只算执行、不算排队）。多条 `--verify` / `--verify-baseline` 默认同时交给调度，结果按传入顺序；前后有依赖的（先 build 再查产物、两条命令写同一个产物目录）加 `--serial` 逐条跑。图谱步骤失败不影响其他输出（`graph.ok: false` 并带 `error`）；带 `--no-graph` 时不建图（`graph.skipped: true`，集成检查用，条目验收不要加）。`--save` 把结果存成 JSON，第 8 节的 `review` 从这里取图谱摘要和验证结果。
+脚本依次执行：记录 `git status --porcelain` → `git add -N .` 把新文件纳入 diff → 在 worktree 里全量建图 → `detect-changes --brief` → `git diff <BASE_SHA> --stat` → crapper 算这次改动碰到的函数的圈复杂度 → 在 worktree 里重跑 `--verify`（shlex 拆分、不经 shell，所以不能用管道、`&&`、重定向；每条默认超时 1800 秒，`--verify-timeout` 可改，只算执行、不算排队）。多条 `--verify` / `--verify-baseline` 默认同时交给调度，结果按传入顺序；前后有依赖的（先 build 再查产物、两条命令写同一个产物目录）加 `--serial` 逐条跑。图谱步骤失败不影响其他输出（`graph.ok: false` 并带 `error`）；带 `--integration` 时是集成检查（第 9.1 节第 3 步）：不建图（`graph.skipped: true`）、不跑 crapper、改跑 dryer，条目验收不要加。`--save` 把结果存成 JSON，第 8 节的 `review` 从这里取图谱摘要和验证结果。
 
 verify 命令在脚本里跑，不会触发审批；但测试多的命令（比如集成检查的全量测试）可能超过宿主单条命令的时长上限（Claude Code 的 Bash 是 10 分钟），预计会超时就放后台执行 accept（见附录），等完成再读结果。
 
@@ -424,13 +424,18 @@ verify 命令在脚本里跑，不会触发审批；但测试多的命令（比�
    - `graph.changed_files` 比 changed_files 多：多出来的是越界改动或临时文件，让 agent 说明理由或撤回。
    - `graph.untested` 里的函数连间接调用到它的测试都没有。对照 verification：既没有测试、也没有实际运行覆盖到的，让 agent 补测试，或补一次真实运行的证据（命令和输出）。
    - `graph.risk_score` 只用来排阅读顺序，不当作通过与否的阈值。
-   - `graph.ok: false` → 状态文件记 `[图谱不可用: <error>]`，用其他几项完成验收，不阻断。`graph.skipped: true` 是 `--no-graph` 跳过的（集成检查），不是不可用。
-6. **读 diff**：先看 `diff_stat` 全貌，再用 `git -C <WT_PATH> diff <BASE_SHA> -- <文件>` 读 `graph.untested` 里的函数和核心改动的 diff 本身。
-7. **层次与简洁**：读 diff 时按根治三问看：改在产生问题的那一层了吗？新增的分支、特例、兜底、回落、兼容字段、名单、阈值，每一处能不能删掉或换成现有链路，写得出依据吗（现有调用方、数据）？答不上就不通过：发回 worker，或按"编排者模式"里 rollup 的写法交用户定。报告里的已知限制和目标冲突的（比如目标覆盖 10 种语言、判定只覆盖中英），也算答不上。
-8. **客观核对**：只核对下面这些能对上证据的；"最小改动""先定数据结构"这类靠判断的原则写在编码规范里给 worker 照做，不当验收门槛。编码规范的文件见第 2 节 `drover playbook` 输出的 `coding_rules`：包默认的 `flow/coding-rules.md` 开着时（`default_coding_rules.enabled`）排第一，按整份核对（`default_coding_rules.sections` 只说明任务书带了哪几节，没带的那节照样核）；团队 profile、个人覆盖的排在后面，冲突时按后面的和仓库自己的规范（`AGENTS.md` / `CLAUDE.md`）。
+   - `graph.ok: false` → 状态文件记 `[图谱不可用: <error>]`，用其他几项完成验收，不阻断。`graph.skipped: true` 是 `--integration`（或 `--no-graph`）跳过的，不是不可用。
+6. **复杂度**（`complexity`，crapper 只算圈复杂度、不跑测试）：只看这次改动碰到的函数，圈复杂度 ≥ 10 的分两类。依据：crapper 的 CRAP = CC² × (1 − 覆盖率)³ + CC，覆盖率 100% 时 CRAP 就是 CC，所以 CC ≥ 10 的函数测试写得再全也到不了编码规范要的"CRAP 10 以下"。
+   - `complexity.over`：新函数，或者比 BASE 上同名函数更复杂（`base_complexity` 是 BASE 上的值）。worker 要么拆开，要么在报告里写不拆的理由（和第 5 项"没测试的函数要么补测试、要么写理由"同一种约束）；两样都没有就发回。
+   - `complexity.already_complex`：本来就这么复杂、这次没变得更复杂，只作参考，不要求处理。
+   - `complexity.skipped_files`：crapper 不分析的文件（文档、测试、没有扩展名的脚本），不用管。
+   - `complexity.ok: false` 带 `error`（"测不了：…"：没装、语法包下不来、出错）→ 状态文件记一行，**不算不通过**；`skipped: true` 是开关关了（config 的 `quality_tools`）。
+7. **读 diff**：先看 `diff_stat` 全貌，再用 `git -C <WT_PATH> diff <BASE_SHA> -- <文件>` 读 `graph.untested`、`complexity.over` 里的函数和核心改动的 diff 本身。
+8. **层次与简洁**：读 diff 时按根治三问看：改在产生问题的那一层了吗？新增的分支、特例、兜底、回落、兼容字段、名单、阈值，每一处能不能删掉或换成现有链路，写得出依据吗（现有调用方、数据）？答不上就不通过：发回 worker，或按"编排者模式"里 rollup 的写法交用户定。报告里的已知限制和目标冲突的（比如目标覆盖 10 种语言、判定只覆盖中英），也算答不上。
+9. **客观核对**：只核对下面这些能对上证据的；"最小改动""先定数据结构"这类靠判断的原则写在编码规范里给 worker 照做，不当验收门槛。编码规范的文件见第 2 节 `drover playbook` 输出的 `coding_rules`：包默认的 `flow/coding-rules.md` 开着时（`default_coding_rules.enabled`）排第一，按整份核对（`default_coding_rules.sections` 只说明任务书带了哪几节，没带的那节照样核）；团队 profile、个人覆盖的排在后面，冲突时按后面的和仓库自己的规范（`AGENTS.md` / `CLAUDE.md`）。
    - **改 bug 的**：报告的 verification 里有回归测试"改之前失败、改之后通过"的命令和结果。
    - **测试测的是行为**：像使用者那样调用代码、检查使用者看得到的结果；每个函数都返回空时还能通过的就是假测试（编码规范通用原则的"测行为，不测实现"）。
-   - **没有只为躲崩溃的兜底**：第 7 项已经查过，不重复。
+   - **没有只为躲崩溃的兜底**：第 8 项已经查过，不重复。
    - **没留死代码和注释掉的代码**。
    - **含 DDL 的改动**（手写 SQL、迁移文件、ORM 模型、启动期自动建列脚本）：按编码规范的 MySQL 一节和仓库规范逐条核对：表名列名不用关键字、每列 COMMENT 和 DEFAULT、表 COMMENT、唯一索引 `uniq_` 前缀且手写 SQL 和 ORM 一致。
    - **改了 Java 的**：按编码规范的 Java 一节核对：不内联全限定类名、不用嵌套类和内部类。
@@ -547,9 +552,10 @@ worktree、workspace 保留到用户说"清理"或"收尾"（下面"任务收尾
 
    脚本先 fetch，再从最新的 `origin/<上游分支>` 建集成 worktree（已有就复用），按 `--from` 的顺序 cherry-pick 每个条目分支里还没应用的提交（`git cherry` 按 patch-id 判断，加上状态文件 `<slug>/integrate-<仓库名>.json` 的记录），最后装依赖。可以重复执行。遇到冲突就停下，返回冲突文件：在集成 worktree 里解完 → `git -C <集成WT> add <文件>` → `git -C <集成WT> -c core.editor=true cherry-pick --continue` → 再跑一次同样的 integrate。不要 `--abort`，要放弃某个提交先写明理由。cherry-pick 没能开始（git 直接拒绝、没有冲突文件，比如集成 worktree 里有会被覆盖的未跟踪文件）时状态记 `failed`、报错带 git 的输出：把挡路的原因处理掉后重跑同样的 integrate，会重试这个提交。新建集成 worktree 时 `wt` 同样会快进源仓库主检出（目标分支已经 fetch 过，不重复；主检出停在上游已被删的旧分支上也不影响集成），返回里的 `source_sync` / `warnings` 和第 3.1 节一样看。返回值里的 `base` 是下一步整体检查的 `--base`；`source_workspace_opened` 记进状态文件。
    新建集成 worktree 时同样核实起点含这个任务上一轮推到远端的提交（第 3.1 节"新一轮的起点"，返回里有 `round_check`）；`--from` 的条目分支里已有的不算缺（integrate 会把它们摘进来：一轮推两条分支时第二条集成的就是同一批条目提交，条目 worktree 用 `--carry` 带上过的也在条目分支里）。还缺 → `ok: false`、不建，交用户定：加 `--carry "<理由>"` 先带上再摘条目，或者 `--target` 改回上一轮的分支。
-3. **整体检查一次**：`drover accept --wt <集成WT> --base <base> --save <slug>/accept-integrate-<仓库名>.json --brief --no-graph --verify "<tsc>" --verify "<build>" --verify-baseline "<全量测试>" [--verify-baseline "<lint>"] [--verify "<i18n 等仓库门禁>"]`，放后台跑（见附录）。全量测试只在这里跑；负载超时会自动复核（第 6.1 节）。`--no-graph` 不建图：图谱结论（风险、无测试覆盖的函数）只在条目验收时用，大仓库建一次要几十秒。通过后把返回的 `head`（这次全量通过的提交）记进状态文件，下面"再跑检查"要用。
-   - 这几条默认同时交给 heavy 调度：轻的（tsc、lint、i18n）一起跑，全量测试这类占满机器的等实测空出来再跑、它收尾时别的也能进来（严格串行的话，三条各占半个核的集成检查也要串行跑 7.4 分钟）。
+3. **整体检查一次**：`drover accept --wt <集成WT> --base <base> --save <slug>/accept-integrate-<仓库名>.json --brief --integration --verify "<tsc>" --verify "<build>" --verify-baseline "<全量测试>" [--verify-baseline "<lint>"] [--verify "<i18n 等仓库门禁>"]`，放后台跑（见附录）。全量测试只在这里跑；负载超时会自动复核（第 6.1 节）。`--integration` 不建图（图谱结论只在条目验收时用，大仓库建一次要几十秒）、不跑 crapper，改由 dryer 扫全仓找重复。通过后把返回的 `head`（这次全量通过的提交）记进状态文件，下面"再跑检查"要用。
+   - 这几条默认同时交给 heavy 调度：轻的（tsc、lint、i18n）一起跑，全量测试这类占满机器的等实测空出来再跑、它收尾时别的也能进来（严格串行的话，三条各占半个核的集成检查也要串行跑 7.4 分钟）。dryer 也一起交给调度（大仓库单核约 85 秒）。
    - 有前后依赖的加 `--serial` 逐条跑，比如某条门禁要读 build 的产物，或者两条命令会写同一个产物目录。
+   - **重复**（`duplicates`，dryer，相似度 ≥ 0.8）：只留至少一边碰到这次改动行的重复对（`duplicates.pairs`，`文件:起-止` 两两一对；`candidates` 是全仓一共几对）。每一对要么合并，要么在汇报里写不合并的理由，发回对应条目的 worker 改或让它补理由；没碰到改动的旧重复不管。`duplicates.ok: false` 带 `error`（"测不了：…"）**不算不通过**，状态文件记一行；`skipped: true` 是开关关了。
 
    **和基线比**（`--verify-baseline`）：仓库基线本来就有失败的命令（常见是全量测试、lint；具体哪些，看仓库规范或 playbook）放 `--verify-baseline`，不放 `--verify`。命令通过就和普通 verify 一样；失败时脚本和 `--base` 比失败条目，只看有没有新增：
    - 基线上只重跑当前失败所在的文件：vitest / pytest 按失败用例所在的测试文件，eslint 按报错的文件（选项保留，原来的目录参数去掉；vitest 的 `--changed` 也去掉）；tsc 没法拆，和拆不出文件的命令（经 make 之类包装、失败路径对不上 worktree 里的文件）一样跑整条。在 `--base` 上临时建一个 detached worktree（`~/.drover/baselines/` 下，复制 .env、装依赖，跑完就删）。`baseline.targets` 是基线上跑了的文件（没有这个字段就是跑了整条）；当前失败的文件 BASE 上没有（新加的测试）的列在 `baseline.not_on_base`，不放进基线命令、失败直接算新增，一个都不剩就不建基线 worktree。

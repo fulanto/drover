@@ -27,6 +27,9 @@ INSTALL = PKG / "install.py"
 INSTALL_SH = PKG / "install.sh"
 ROUTING = PKG / "flow" / "routing.md"
 INSTALLER_ENV = "DROVER_HERDR_INSTALLER"
+UV_INSTALLER_ENV = "DROVER_UV_INSTALLER"
+QUALITY_SOURCE_ENV = "DROVER_QUALITY_TOOLS_SOURCE"
+QUALITY_SWITCH_ENV = "DROVER_QUALITY_TOOLS"
 HERDR_OFFICIAL = "curl -fsSL https://herdr.dev/install.sh | sh"
 CLAUDE_OFFICIAL = "curl -fsSL https://claude.ai/install.sh | bash"
 CODEX_OFFICIAL = "curl -fsSL https://chatgpt.com/codex/install.sh | sh"
@@ -212,12 +215,17 @@ class InstallTestBase(unittest.TestCase):
         self.set_herdr(claude="not installed", codex="not installed")
         self.env = {k: v for k, v in os.environ.items()
                     if k not in ("CODEX_HOME", "CLAUDE_CONFIG_DIR", "HERDR_INSTALL_DIR", INSTALLER_ENV,
-                                 "XDG_STATE_HOME", "XDG_CONFIG_HOME", "DROVER_STATE_DIR")}
+                                 "XDG_STATE_HOME", "XDG_CONFIG_HOME", "DROVER_STATE_DIR", QUALITY_SOURCE_ENV,
+                                 UV_INSTALLER_ENV)}
         self.env.update(HOME=str(self.home), PATH=f"{self.fakebin}{os.pathsep}{os.environ.get('PATH', '')}",
                         PYTHONDONTWRITEBYTECODE="1")
-        # 保险：默认把 herdr 的安装命令换成"禁止安装"，哪个用例意外触发安装都会记下来、用例报错，绝不联网。
+        # 保险：默认把 herdr、uv 的安装命令换成"禁止安装"，哪个用例意外触发安装都会记下来、用例报错，绝不联网。
         self.forbidden_log = self.tmp / "forbidden-installer.log"
         self.env[INSTALLER_ENV] = f"echo forbidden >> '{self.forbidden_log}'; exit 97"
+        self.env[UV_INSTALLER_ENV] = f"echo forbidden-uv >> '{self.forbidden_log}'; exit 97"
+        # 验收工具（crapper、dryer）默认不装：要从 GitHub clone、建 .venv。测它们的用例（QualityToolsTests）自己打开，
+        # 工具源换成本地仓库、python 换成假的。
+        self.env[QUALITY_SWITCH_ENV] = "0"
         self.addCleanup(self.assert_no_forbidden_install)
         d = self.home / ".drover"
         self.state_home = d
@@ -240,7 +248,7 @@ class InstallTestBase(unittest.TestCase):
     # ---- 工具
 
     def assert_no_forbidden_install(self) -> None:
-        self.assertFalse(self.forbidden_log.exists(), "有用例意外执行了 herdr 的安装命令")
+        self.assertFalse(self.forbidden_log.exists(), "有用例意外执行了 herdr / uv 的安装命令")
 
     def set_herdr(self, **states) -> None:
         """改假 herdr 的状态（合并进已有的状态：插件列表等不会被冲掉）。"""
@@ -2546,6 +2554,220 @@ class RoutingHostKindTests(InstallTestBase):
         self.assertIn("编排者和 worker 默认跟主会话的宿主", conventions)
         resume = next(line for line in block.splitlines() if line.startswith("- **已有任务的后续**"))
         self.assertIn("显式传 `--kind", resume)
+
+
+# ---- 验收工具（crapper、dryer）：假 python、假 uv，工具源是本地仓库，不联网
+
+QUALITY_TOOL_NAMES = ("crapper", "dryer")
+PYTHON_NAMES = ("python3.14", "python3.13", "python3.12", "python3.11", "python3")
+# 假 python：版本是同目录 python-version.txt 写的；-m venv <目录> 建一个假 .venv（bin/python 是同目录 venv-python 的副本）。
+FAKE_PYTHON = '''#!{python}
+import shutil, sys
+from pathlib import Path
+HERE = Path(__file__).resolve().parent
+args = sys.argv[1:]
+if args[:1] == ["-c"]:
+    print((HERE / "python-version.txt").read_text().strip())
+elif args[:2] == ["-m", "venv"]:
+    (Path(args[2]) / "bin").mkdir(parents=True)
+    shutil.copy2(HERE / "venv-python", Path(args[2]) / "bin" / "python")
+else:
+    sys.exit(2)
+'''
+# 假 .venv 里的 python：pip install 在设了 FAKE_PIP_FAIL 时失败；-m <工具> --help 打印用法。调用记进工具目录的 venv-calls.log。
+FAKE_VENV_PYTHON = '''#!{python}
+import os, sys
+from pathlib import Path
+args = sys.argv[1:]
+with (Path(__file__).parent.parent.parent / "venv-calls.log").open("a") as f:
+    f.write(" ".join(args) + "\\n")
+if args[:3] == ["-m", "pip", "install"]:
+    if os.environ.get("FAKE_PIP_FAIL"):
+        print("ERROR: No matching distribution found for setuptools>=68")
+        sys.exit(1)
+elif args[:1] == ["-m"] and args[2:] == ["--help"]:
+    print("Usage: " + args[1])
+else:
+    sys.exit(2)
+'''
+# 假 uv：python find 找 $UV_PYTHON_INSTALL_DIR/cpython-fake/bin/python3.12（没有退出码 2）；python install 把 $FAKE_PY_SRC 里的
+# 假 python 放进 --install-dir（版本 3.12）。调用记进 $FAKE_UV_LOG。
+FAKE_UV = '''#!{python}
+import os, shutil, sys
+from pathlib import Path
+args = sys.argv[1:]
+with open(os.environ["FAKE_UV_LOG"], "a") as f:
+    f.write(" ".join(args) + " | UV_PYTHON_INSTALL_DIR=" + os.environ.get("UV_PYTHON_INSTALL_DIR", "") + "\\n")
+if args[:2] == ["python", "find"]:
+    exe = Path(os.environ.get("UV_PYTHON_INSTALL_DIR", "/nonexistent")) / "cpython-fake" / "bin" / "python3.12"
+    if not exe.exists():
+        print("error: No interpreter found", file=sys.stderr)
+        sys.exit(2)
+    print(exe)
+elif args[:2] == ["python", "install"]:
+    d = Path(args[args.index("--install-dir") + 1]) / "cpython-fake" / "bin"
+    d.mkdir(parents=True)
+    src = Path(os.environ["FAKE_PY_SRC"])
+    shutil.copy2(src / "python3.11", d / "python3.12")
+    shutil.copy2(src / "venv-python", d / "venv-python")
+    (d / "python-version.txt").write_text("3.12\\n")
+else:
+    sys.exit(2)
+'''
+
+
+class QualityToolsTests(InstallTestBase):
+    """验收工具默认装进 ~/.drover/tools：装成功、装失败只记警告（install 退出码不变）、卸载删掉、--check 只提示、开关关掉不装；
+    本机没有 Python 3.11+ 时装一份 drover 私有的 uv、再用它装 Python。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.env.pop(QUALITY_SWITCH_ENV)
+        self.tools = self.state_home / "tools"
+        # PATH 最前面放假的 python3.14 … python3（盖住机器上真的），版本由 set_python 定。
+        self.pybin = self.tmp / "pybin"
+        self.pybin.mkdir()
+        for name in PYTHON_NAMES:
+            place_fake(self.pybin / name, FAKE_PYTHON.replace("{python}", sys.executable))
+        place_fake(self.pybin / "venv-python", FAKE_VENV_PYTHON.replace("{python}", sys.executable))
+        self.set_python("3.11")
+        self.env["PATH"] = f"{self.pybin}{os.pathsep}{self.env['PATH']}"
+        # 工具源：本地仓库，钉的提交是它们的 HEAD
+        self.pins = {}
+        git_env = {**self.env, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+                   "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
+        for name in QUALITY_TOOL_NAMES:
+            repo = self.tmp / "tool-src" / name
+            self.write(repo / "pyproject.toml", f'[project]\nname = "{name}"\n')
+            for args in (["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", "init"]):
+                subprocess.run(["git", "-C", str(repo), *args], env=git_env, check=True, capture_output=True)
+            sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], env=git_env, check=True,
+                                 capture_output=True, text=True).stdout.strip()
+            self.pins[name] = [str(repo), sha]
+        self.env[QUALITY_SOURCE_ENV] = json.dumps(self.pins)
+
+    def set_python(self, version: str) -> None:
+        (self.pybin / "python-version.txt").write_text(version + "\n")
+
+    def head(self, name: str) -> str:
+        return subprocess.run(["git", "-C", str(self.tools / name), "rev-parse", "HEAD"], capture_output=True,
+                              text=True).stdout.strip()
+
+    def venv_calls(self, name: str) -> list:
+        log = self.tools / name / "venv-calls.log"
+        return log.read_text().splitlines() if log.exists() else []
+
+    def install(self, *args: str, rc: int = 0, env: dict = None) -> dict:
+        return self.install_json("--host", "claude", *self.ws_args(), *args, rc=rc, env=env)
+
+    def no_python_env(self) -> dict:
+        """机器上没有 3.11+（假 python 都报 3.9）也没有 uv；假 uv 的源和日志。"""
+        self.set_python("3.9")
+        dirs = [d for d in self.env["PATH"].split(os.pathsep) if d and not os.path.exists(os.path.join(d, "uv"))]
+        env = {**self.env, "PATH": os.pathsep.join(dirs), "FAKE_UV_LOG": str(self.tmp / "uv.log"),
+               "FAKE_PY_SRC": str(self.pybin)}
+        self.assertIsNone(shutil.which("uv", path=env["PATH"]))
+        return env
+
+    def test_install_check_rerun_uninstall(self) -> None:
+        """装成功：clone、切到钉的提交、建 .venv、pip install -e、--help；重跑什么都不动；--check 是 ✓；卸载删掉 ~/.drover/tools"""
+        out = self.install()
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(self.step(out, "tools-python")["state"], "Python 3.11")
+        for name in QUALITY_TOOL_NAMES:
+            self.assertTrue(self.step(out, f"tool-{name}")["result"].startswith("完成"), out)
+            self.assertEqual(self.head(name), self.pins[name][1])
+            self.assertTrue((self.tools / name / ".venv" / "bin" / "python").is_file())
+            self.assertEqual(self.venv_calls(name)[:2], [f"-m pip install --quiet -e {self.tools / name}",
+                                                         f"-m {name} --help"])
+        again = self.install()
+        for name in QUALITY_TOOL_NAMES:
+            step = self.step(again, f"tool-{name}")
+            self.assertEqual((step["changes"], step["state"]), (False, f"已装 {self.pins[name][1][:12]}"))
+        self.assertEqual(self.step(again, "tools-python")["state"], "用不着（两个工具都装好了）")
+        check = self.install_json("--check")
+        verdicts = dict(zip([s["key"] for s in check["steps"]], check["verdicts"]))
+        self.assertEqual([verdicts[f"tool-{n}"] for n in QUALITY_TOOL_NAMES], ["ok", "ok"])
+        un = self.install_json("--uninstall")
+        self.assertTrue(self.step(un, "quality-tools")["result"].startswith("完成"), un)
+        self.assertFalse(self.tools.exists())
+
+    def test_failure_only_warns(self) -> None:
+        """pip install 失败：只记警告、退出码 0（汇总写"只记警告"），半截的 .venv 删掉，提示里有原因和怎么补；--check 只提示（!），
+        修好后重跑就装上"""
+        env = {**self.env, "FAKE_PIP_FAIL": "1"}
+        p = self.run_install("--host", "claude", *self.ws_args(), env=env)
+        self.assertIn(f"只记警告 {len(QUALITY_TOOL_NAMES)} 项", p.stdout)
+        self.assertNotIn("有失败项", p.stdout)
+        out = self.install(env=env)
+        self.assertTrue(out["ok"], out)
+        for name in QUALITY_TOOL_NAMES:
+            step = self.step(out, f"tool-{name}")
+            self.assertTrue(step["result"].startswith("警告"), step)
+            self.assertIn("pip install -e 退出码 1", step["note"])
+            self.assertIn("No matching distribution", step["note"])
+            self.assertIn("重跑 install", step["note"])
+            self.assertFalse((self.tools / name / ".venv").exists())
+        self.assertTrue(any("验收工具 crapper：" in n for n in out["notes"]), out["notes"])
+        check = self.install_json("--check")
+        verdicts = dict(zip([s["key"] for s in check["steps"]], check["verdicts"]))
+        self.assertEqual(verdicts["tool-crapper"], "warn")
+        self.assertTrue(check["ok"])
+        fixed = self.install()
+        self.assertTrue(all(self.step(fixed, f"tool-{n}")["result"].startswith("完成") for n in QUALITY_TOOL_NAMES), fixed)
+
+    def test_no_python311_installs_private_uv(self) -> None:
+        """本机没有 3.11+、也没有 uv：用 uv 官方脚本（这里换成假的）装一份到 ~/.drover/tools/bin（UV_NO_MODIFY_PATH=1），
+        再 uv python install 3.12 进 ~/.drover/tools/python（--no-bin），用它给两个工具建 .venv；~/.local/bin 不碰"""
+        env = self.no_python_env()
+        installer_log = self.tmp / "uv-installer.log"
+        uv_src = self.tmp / "uv-src" / "uv"
+        uv_src.parent.mkdir()
+        uv_src.write_text(FAKE_UV.replace("{python}", sys.executable))
+        uv_src.chmod(0o755)
+        env[UV_INSTALLER_ENV] = (f'mkdir -p "$UV_INSTALL_DIR" && cp \'{uv_src}\' "$UV_INSTALL_DIR/uv" && '
+                                 f'echo "$UV_INSTALL_DIR $UV_NO_MODIFY_PATH" >> \'{installer_log}\'')
+        out = self.install(env=env)
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(installer_log.read_text().split(), [str(self.tools / "bin"), "1"])
+        self.assertIn(f"python install 3.12 --install-dir {self.tools / 'python'} --no-bin",
+                      (self.tmp / "uv.log").read_text())
+        self.assertTrue(self.step(out, "tools-python")["result"].startswith("完成：Python 3.12"), out)
+        for name in QUALITY_TOOL_NAMES:
+            self.assertTrue(self.step(out, f"tool-{name}")["result"].startswith("完成"), out)
+        self.assertFalse((self.home / ".local" / "bin").exists())
+
+    def test_no_python311_and_uv_fails(self) -> None:
+        """没有 3.11+、装 uv 也失败：Python 那一项和两个工具都只记警告，退出码 0，不 clone、不建 .venv"""
+        env = {**self.no_python_env(), UV_INSTALLER_ENV: "echo no network; exit 7"}
+        out = self.install(env=env)
+        self.assertTrue(out["ok"], out)
+        py = self.step(out, "tools-python")
+        self.assertTrue(py["result"].startswith("警告"), py)
+        self.assertIn("退出码 7", py["note"])
+        self.assertIn("python@3.12", py["note"])
+        for name in QUALITY_TOOL_NAMES:
+            self.assertIn("没有 Python 3.11+", self.step(out, f"tool-{name}")["note"])
+        self.assertFalse(self.tools.joinpath("crapper").exists())
+
+    def test_dry_run_and_switch_off(self) -> None:
+        """--dry-run 列出要做的（clone、切提交、--help）但不建目录；config.json 写 quality_tools: false 就不装、--check 不提示"""
+        out = self.install("--dry-run")
+        step = self.step(out, "tool-crapper")
+        self.assertTrue(step["changes"])
+        self.assertIn(f"clone {self.pins['crapper'][0]}", step["action"])
+        self.assertIn("--help", step["action"])
+        self.assertFalse(self.tools.exists())
+        self.write_json(self.config, {"workspace": str(self.ws), "repo_dirs": [str(self.ws)], "quality_tools": False})
+        out = self.install_json("--host", "claude")
+        self.assertTrue(out["ok"], out)
+        for key in ("tools-python", "tool-crapper", "tool-dryer"):
+            self.assertFalse(self.step(out, key)["changes"])
+            self.assertIn("quality_tools", self.step(out, key)["state"])
+        self.assertFalse(self.tools.exists())
+        check = self.install_json("--check")
+        verdicts = dict(zip([s["key"] for s in check["steps"]], check["verdicts"]))
+        self.assertEqual(verdicts["tool-crapper"], "ok")
 
 
 if __name__ == "__main__":

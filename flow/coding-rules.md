@@ -9,7 +9,7 @@
      标记本身是 HTML 注释、不进任务书。判断错了只是多带或少带一节；验收按整份核对。
      config.json 写 "default_coding_rules": false 时整份不追加（团队 profile、个人覆盖照旧）；不执行迁移这类安全和流程规则
      在 bin/drover 的任务书模板和 flow/dispatch.md 里，不跟着关。
-     编排者验收时也按这份核对（dispatch.md 第 6.1 节第 8 项；路径见 drover playbook 输出的 coding_rules）。
+     编排者验收时也按这份核对（dispatch.md 第 6.1 节第 9 项；路径见 drover playbook 输出的 coding_rules）。
      只放和团队、机器无关的；每条一行，专项的每条开头写清适用条件。 -->
 
 这是 drover 默认的编码规范，只在改到相关代码时适用；仓库自己的 `AGENTS.md` / `CLAUDE.md`、团队 profile、个人覆盖和这里冲突时按它们的。
@@ -43,7 +43,7 @@
 - **控制复杂度**（Crapper）：函数复杂到难测，就拆开、补测试，或者两样都做；case 语句值不值得减，掂量一下。
 - **消除重复**（Dryer）：改到的地方不留重复。
 - **补覆盖、删死代码**（Mutator）：没被测试覆盖的补上；死代码删掉。
-- 装了 unclebob/crapper、dryer、mutator 的，按原阈值：CRAP < 10、相似度 ≥ 0.8 的重复要消掉、变异测试的存活者要杀掉。
+- drover 默认装了 unclebob/crapper、dryer，验收时自动跑：条目验收查这次改动碰到的函数的圈复杂度（≥ 10 的新函数、或比原来更复杂的，要么拆、要么在报告里写理由），集成检查查碰到改动的重复（相似度 ≥ 0.8，要么合并、要么写理由）。mutator 和带覆盖率的 crapper 不默认跑，手动跑法见 README；手动跑的按原阈值：CRAP < 10、变异测试的存活者要杀掉。
 - **重构**（Refactoring）：先钉住代码现在的行为，再改结构，最后证明行为没变。
 
 <!-- drover:section mysql -->

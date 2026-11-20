@@ -183,6 +183,37 @@ AGENT_INSTALL = {
 }
 GIT_HINT = {"Darwin": "xcode-select --install（或 brew install git）", "Linux": "sudo apt-get install git / sudo dnf install git"}
 
+# 验收工具：Robert C. Martin 的 crapper（圈复杂度）和 dryer（重复代码），都是 0BSD。条目验收跑 crapper（只算复杂度，不跑测试），
+# 集成检查跑 dryer（扫全仓，只留碰到改动的重复）。装在 drover 自己的目录，钉提交；装不上只记警告（不挡安装、退出码不变），
+# 验收时报"测不了"。config.json 写 "quality_tools": false（或环境变量 DROVER_QUALITY_TOOLS=0）就不装、验收也不跑。
+# 换版本时要核对：bin/drover 的 CRAP_SPANS_SCRIPT 直接调 crapper 的内部接口（crapper.discover.language_of / is_test_file、
+# crapper.languages.functions_in_file，Function 的 name、namespace、complexity、start_line、end_line），dryer 读的是
+# <root>/.metrics/dry.edn 的格式（:candidates，:left / :right 的 :file、:start-line、:end-line）。两样的格式自测里都有。
+TOOLS_DIR = STATE_HOME / "tools"
+QUALITY_TOOLS = {
+    "crapper": ("https://github.com/unclebob/crapper.git", "c757ec79a6c15dc815238bbd9c2f4601eb54d3cc"),
+    "dryer": ("https://github.com/unclebob/dryer.git", "66ff6d21a42c04afcad89c78a80066176d1294b0"),
+}
+QUALITY_TOOLS_ENV = "DROVER_QUALITY_TOOLS_SOURCE"  # 自测用：JSON {"工具": ["clone 地址", "提交"]} 代替上面的表，不联网
+QUALITY_SWITCH_ENV = "DROVER_QUALITY_TOOLS"         # 0 / false / off：和 config 的 quality_tools: false 一样（和 bin/drover 一致）
+QUALITY_OFF = "关了（config.json 的 quality_tools 是 false，或 DROVER_QUALITY_TOOLS=0）：不装、不查，验收也不跑"
+# 两个工具要 Python 3.11+（它们的 pyproject 都是 requires-python >= 3.11）；macOS 自带的 /usr/bin/python3 是 3.9。
+# 先找本机已有的，再问 uv（也找得到 drover 自己装进 TOOLS_PYTHON_DIR 的那份），都没有才用 uv 装一份进 drover 的目录：
+# --install-dir 放在 ~/.drover/tools/python，--no-bin 不往 ~/.local/bin 放 python 可执行文件（uv python install --help）。
+TOOLS_PYTHON_MIN = (3, 11)
+TOOLS_PYTHON_NAMES = ["python3.14", "python3.13", "python3.12", "python3.11", "python3"]
+TOOLS_PYTHON_VERSION = "3.12"
+TOOLS_PYTHON_DIR = TOOLS_DIR / "python"
+# 没有 uv 时装一份 drover 私有的：官方安装脚本（https://docs.astral.sh/uv/getting-started/installation/），UV_INSTALL_DIR
+# 指到 ~/.drover/tools/bin（脚本把 uv 直接放进这个目录），UV_NO_MODIFY_PATH=1 不改 shell 配置
+# （https://docs.astral.sh/uv/reference/installer/）。卸载时随 ~/.drover/tools 一起删。
+TOOLS_UV = TOOLS_DIR / "bin" / "uv"
+UV_INSTALL_CMD = "curl -LsSf https://astral.sh/uv/install.sh | sh"
+UV_INSTALLER_ENV = "DROVER_UV_INSTALLER"  # 自测用：换成别的安装命令（照样交给 sh -c）
+TOOLS_TIMEOUT = 600  # 秒：clone、装 uv / Python、pip install 每一步的上限
+TOOLS_MANUAL = ("重跑 install（或 ~/.drover/bin/drover update）会按钉的版本补装；不要验收工具就在 ~/.drover/config.json 写 "
+                "\"quality_tools\": false。没装上时验收里 crapper、dryer 报\"测不了\"，drover 其余功能不受影响")
+
 TS = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
@@ -194,6 +225,10 @@ class InstallError(Exception):
         super().__init__(message)
         self.rc = rc
         self.extra = extra
+
+
+class StepWarning(Exception):
+    """计划项没做成，但只记警告：不算失败，install 退出码不变（验收工具这类装不上也不影响 drover 本身的东西）。"""
 
 
 # ---------------------------------------------------------------- 路径与内容工具
@@ -373,6 +408,8 @@ class Ctx:
     oncall_env_path: Optional[str] = None  # drover.env 的路径（知道了就写进安装记录，--uninstall 按它删）
     node: Optional[tuple] = None         # (node 路径, 版本)；找不到是 (None, None)
     feishu: Optional[str] = None         # 交互终端装完时飞书配没配：paired / unpaired；不查或查不了是 None
+    quality_tools: bool = True           # 装不装验收工具（make_ctx 里按 quality_tools_enabled 算）
+    tools_python: Optional[str] = None   # 给验收工具建 .venv 用的 Python 3.11+（找到或装上之后才有）
 
     @property
     def workspace_path(self) -> Path:
@@ -1575,6 +1612,197 @@ def plan_oncall_env(ctx: Ctx, plugin_step: Step) -> Step:
                 run=lambda: write_oncall_env(ctx, path), level="warn")
 
 
+# ---------------------------------------------------------------- 计划项：验收工具（crapper、dryer）
+
+
+def quality_tools_enabled(config: Optional[dict]) -> bool:
+    """装不装验收工具：DROVER_QUALITY_TOOLS=0 / false / off，或 config.json 的 quality_tools 是 false 时不装（默认装）。"""
+    if os.environ.get(QUALITY_SWITCH_ENV, "").strip().lower() in ("0", "false", "off", "no"):
+        return False
+    return (config or {}).get("quality_tools") is not False
+
+
+def quality_tools_spec() -> dict:
+    """{工具名: (clone 地址, 钉的提交)}；自测时由 DROVER_QUALITY_TOOLS_SOURCE 换成本地仓库。"""
+    raw = os.environ.get(QUALITY_TOOLS_ENV)
+    return {name: tuple(v) for name, v in json.loads(raw).items()} if raw else QUALITY_TOOLS
+
+
+def tool_cmd(cmd: list, what: str, env: Optional[dict] = None, timeout: float = TOOLS_TIMEOUT) -> str:
+    """装工具的一步：成功返回输出；失败、超时、跑不起来都抛 RuntimeError（带最后几行输出）。"""
+    try:
+        res = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                             timeout=timeout, env={**os.environ, "GIT_TERMINAL_PROMPT": "0", **(env or {})})
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"{what} 超过 {timeout} 秒没跑完")
+    except OSError as exc:
+        raise RuntimeError(f"{what} 跑不起来：{exc}")
+    if res.returncode != 0:
+        last = "；".join(line.strip() for line in res.stdout.strip().splitlines()[-3:] if line.strip())
+        raise RuntimeError(f"{what} 退出码 {res.returncode}：{last[:300]}")
+    return res.stdout
+
+
+def python_version(exe: str) -> Optional[tuple]:
+    try:
+        res = subprocess.run([exe, "-c", "import sys; print('%d.%d' % sys.version_info[:2])"], stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.fullmatch(r"(\d+)\.(\d+)", res.stdout.strip()) if res.returncode == 0 else None
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def uv_bin() -> Optional[str]:
+    """drover 自己装的那份 uv 优先，再找 PATH。"""
+    return str(TOOLS_UV) if os.access(str(TOOLS_UV), os.X_OK) else shutil.which("uv")
+
+
+def uv_python_env() -> dict:
+    return {"UV_PYTHON_INSTALL_DIR": str(TOOLS_PYTHON_DIR)}
+
+
+def find_tools_python() -> Optional[tuple]:
+    """(路径, (主, 次)) of 第一个 3.11+ 的 python：先 PATH 上的 python3.14…python3.11、python3，再问 uv（uv python find，
+    它也找 drover 装进 ~/.drover/tools/python 的那份）。都没有返回 None。"""
+    candidates = [shutil.which(name) for name in TOOLS_PYTHON_NAMES]
+    uv = uv_bin()
+    if uv:
+        with contextlib.suppress(RuntimeError):
+            candidates.append(tool_cmd([uv, "python", "find", ">=3.11"], "uv python find", env=uv_python_env(),
+                                       timeout=30).strip())
+    for exe in filter(None, candidates):
+        ver = python_version(exe)
+        if ver and ver >= TOOLS_PYTHON_MIN:
+            return exe, ver
+    return None
+
+
+def uv_install_cmd() -> str:
+    return os.environ.get(UV_INSTALLER_ENV) or UV_INSTALL_CMD
+
+
+def install_tools_python(ctx: Ctx) -> str:
+    """本机没有 3.11+：没有 uv 先装 drover 私有的一份，再 uv python install 进 drover 的目录。失败只记警告。"""
+    try:
+        uv = uv_bin()
+        if not uv:
+            tool_cmd(["sh", "-c", uv_install_cmd()], f"装 uv（{uv_install_cmd()}）",
+                     env={"UV_INSTALL_DIR": str(TOOLS_UV.parent), "UV_NO_MODIFY_PATH": "1"})
+            uv = uv_bin()
+            if not uv:
+                raise RuntimeError(f"uv 的安装脚本跑完了，但 {disp(TOOLS_UV)} 不在")
+        tool_cmd([uv, "python", "install", TOOLS_PYTHON_VERSION, "--install-dir", str(TOOLS_PYTHON_DIR), "--no-bin"],
+                 f"uv python install {TOOLS_PYTHON_VERSION}", env=uv_python_env())
+        found = find_tools_python()
+        if not found:
+            raise RuntimeError(f"uv python install 跑完了，但还是找不到 3.11+ 的 python（{disp(TOOLS_PYTHON_DIR)}）")
+    except RuntimeError as exc:
+        raise StepWarning(f"{exc}。也可以自己装一个 Python 3.11+（brew install python@3.12，或 python.org）；{TOOLS_MANUAL}")
+    ctx.tools_python = found[0]
+    return f"Python {found[1][0]}.{found[1][1]}：{disp(found[0])}"
+
+
+def tool_head(d: Path) -> str:
+    with contextlib.suppress(RuntimeError):
+        return tool_cmd(["git", "-C", str(d), "rev-parse", "HEAD"], "git rev-parse", timeout=30).strip()
+    return ""
+
+
+def has_commit(d: Path, pin: str) -> bool:
+    with contextlib.suppress(RuntimeError):
+        return tool_cmd(["git", "-C", str(d), "cat-file", "-t", pin], "git cat-file", timeout=30).strip() == "commit"
+    return False
+
+
+def tool_state(name: str, pin: str) -> tuple:
+    """(现状, 能不能用)：目录在、HEAD 是钉的提交、.venv 里 python -m <工具> --help 跑得通才算能用。"""
+    d = TOOLS_DIR / name
+    if not d.exists():
+        return "没装", False
+    head = tool_head(d)
+    if head != pin:
+        return f"版本不对（{head[:12] or '不是 git 仓库'}，要 {pin[:12]}）", False
+    try:
+        tool_cmd([str(d / ".venv" / "bin" / "python"), "-m", name, "--help"], f"{name} --help", timeout=60)
+    except RuntimeError as exc:
+        return f".venv 用不了（{exc}）", False
+    return f"已装 {pin[:12]}", True
+
+
+def ensure_tool(ctx: Ctx, name: str, url: str, pin: str) -> str:
+    """clone（或 fetch）→ 切到钉的提交 → 用 3.11+ 的 python 重建 .venv、pip install -e（同工具自带入口脚本的装法）→ --help。
+    哪一步失败都删掉半截的 .venv（工具的入口脚本只看 .venv/bin/python 在不在，留着就一直坏），只记警告。"""
+    d, venv = TOOLS_DIR / name, TOOLS_DIR / name / ".venv"
+    try:
+        if not ctx.tools_python:
+            raise RuntimeError("没有 Python 3.11+（见上一项）")
+        if not (d / ".git").exists():
+            shutil.rmtree(d, ignore_errors=True)
+            tool_cmd(["git", "clone", "--quiet", url, str(d)], f"git clone {url}")
+        if not has_commit(d, pin):
+            tool_cmd(["git", "-C", str(d), "fetch", "--quiet", "origin"], "git fetch")
+        tool_cmd(["git", "-C", str(d), "checkout", "--quiet", "--detach", pin], f"git checkout {pin[:12]}")
+        shutil.rmtree(venv, ignore_errors=True)
+        tool_cmd([ctx.tools_python, "-m", "venv", str(venv)], f"{ctx.tools_python} -m venv")
+        tool_cmd([str(venv / "bin" / "python"), "-m", "pip", "install", "--quiet", "-e", str(d)], "pip install -e")
+        tool_cmd([str(venv / "bin" / "python"), "-m", name, "--help"], f"{name} --help", timeout=60)
+    except RuntimeError as exc:
+        shutil.rmtree(venv, ignore_errors=True)
+        raise StepWarning(f"{name} 没装上：{exc}；{TOOLS_MANUAL}")
+    return f"装好了 {pin[:12]}"
+
+
+def plan_tools_python(ctx: Ctx, needed: bool) -> Step:
+    """验收工具用的 Python 3.11+。needed：有工具要（重）装。"""
+    key, label = "tools-python", "验收工具用的 Python 3.11+"
+    if not ctx.quality_tools:
+        return Step(key, label, "python3.11+", QUALITY_OFF)
+    if not needed:
+        return Step(key, label, "python3.11+", "用不着（两个工具都装好了）")
+    found = find_tools_python()
+    if found:
+        ctx.tools_python = found[0]
+        return Step(key, label, disp(found[0]), f"Python {found[1][0]}.{found[1][1]}")
+    uv = uv_bin()
+    if not uv and not os.environ.get(UV_INSTALLER_ENV) and not shutil.which("curl"):
+        return Step(key, label, disp(TOOLS_PYTHON_DIR), "没找到 3.11+，也没有 uv、curl", level="warn",
+                    action="只提示", note=f"验收工具要 Python 3.11+：装一个（brew install python@3.12，或 python.org）；{TOOLS_MANUAL}")
+    first = "" if uv else (f"先装 uv：{uv_install_cmd()}（UV_INSTALL_DIR={disp(TOOLS_UV.parent)}、UV_NO_MODIFY_PATH=1："
+                           "drover 私有的一份，不改 shell 配置），再 ")
+    return Step(key, label, disp(TOOLS_PYTHON_DIR), "没找到 3.11+（PATH 上的版本不够，uv 也没找到）",
+                action=f"{first}uv python install {TOOLS_PYTHON_VERSION} --install-dir {disp(TOOLS_PYTHON_DIR)} --no-bin"
+                       "（只装进 drover 的目录，不改 PATH）；装不上只记警告",
+                run=lambda: install_tools_python(ctx), level="warn")
+
+
+def plan_quality_tools(ctx: Ctx) -> list:
+    """验收工具：先 Python 3.11+，再每个工具一项。装不上都只记警告；--check 里缺了只算提示。"""
+    if not ctx.quality_tools:
+        return [plan_tools_python(ctx, False)] + [Step(f"tool-{name}", f"验收工具 {name}", disp(TOOLS_DIR / name), QUALITY_OFF)
+                                                  for name in quality_tools_spec()]
+    tools = []
+    for name, (url, pin) in quality_tools_spec().items():
+        state, ok = tool_state(name, pin)
+        d = TOOLS_DIR / name
+        step = Step(f"tool-{name}", f"验收工具 {name}", disp(d), state)
+        if not ok:
+            step.action = (f"{'' if d.exists() else f'clone {url}，'}切到 {pin[:12]}，用 Python 3.11+ 重建 .venv、"
+                           "pip install -e，跑一次 --help；装不上只记警告")
+            step.run, step.level = (lambda n=name, u=url, p=pin: ensure_tool(ctx, n, u, p)), "warn"
+        tools.append(step)
+    return [plan_tools_python(ctx, any(s.run for s in tools))] + tools
+
+
+def unplan_tools() -> Step:
+    """卸载：~/.drover/tools 整个是 drover 的（两个工具、它们用的 Python / uv、语法包），一起删。"""
+    key, label = "quality-tools", "验收工具（crapper、dryer）"
+    if not TOOLS_DIR.exists():
+        return Step(key, label, disp(TOOLS_DIR), "不存在")
+    return Step(key, label, disp(TOOLS_DIR), "在", action="删除整个目录（两个工具、它们用的 Python / uv、语法包）",
+                run=lambda: shutil.rmtree(TOOLS_DIR))
+
+
 # ---------------------------------------------------------------- 装完当场引导配对飞书（只在交互终端里）
 
 
@@ -1826,6 +2054,8 @@ def build_plan(ctx: Ctx) -> list:
     # 飞书 oncall（宿主无关）：插件失败只记这一项失败，其余照装（和没装 herdr 时一样）。
     plugin_step = plan_oncall_plugin(ctx)
     steps += [plan_oncall_node(ctx), plugin_step, plan_oncall_env(ctx, plugin_step)]
+    # 验收工具（宿主无关）：装不上只记警告（StepWarning），不影响退出码。
+    steps += plan_quality_tools(ctx)
     steps.append(plan_routing(ctx) if has_ws else plan_no_workspace("routing", "主工作台路由区块", "AGENTS.md"))
     share_backups(steps)
     if ctx.checking:
@@ -1848,6 +2078,22 @@ def do_backup(ctx: Ctx, st: Step) -> None:
     ctx.backups.append(st.backup)
 
 
+def run_step(ctx: Ctx, st: Step) -> bool:
+    """执行一项（先备份）：成功、只记警告都返回 True，失败返回 False。一项失败不影响后面的项，最后整体报失败。"""
+    try:
+        if st.backup:
+            do_backup(ctx, st)
+        msg = st.run()
+        st.result = "完成" + (f"：{msg}" if isinstance(msg, str) and msg else "")
+    except StepWarning as exc:  # 没做成、只记警告：不算失败，原因和手动补法进提示（--json 的 notes、update 都读它）
+        st.result, st.level = "警告：没做成，不影响安装（原因和手动补法见提示）", "warn"
+        st.note = "；".join(filter(None, [st.note, str(exc)]))
+    except Exception as exc:
+        st.result = f"失败：{exc}"
+        return False
+    return True
+
+
 def execute(ctx: Ctx, steps: list, quiet: bool) -> bool:
     ok = True
     for i, st in enumerate(steps, 1):
@@ -1857,14 +2103,7 @@ def execute(ctx: Ctx, steps: list, quiet: bool) -> bool:
         elif ctx.dry_run:
             st.result = "（dry-run，没执行）"
         else:
-            try:
-                if st.backup:
-                    do_backup(ctx, st)
-                msg = st.run()
-                st.result = "完成" + (f"：{msg}" if isinstance(msg, str) and msg else "")
-            except Exception as exc:  # 一项失败不影响后面的项，最后整体报失败
-                st.result = f"失败：{exc}"
-                ok = False
+            ok = run_step(ctx, st) and ok
         if not quiet:
             print_step(i, len(steps), st, show_result=not ctx.dry_run)
     return ok
@@ -1898,15 +2137,21 @@ def print_header(title: str, ctx: Ctx, host_why: str) -> None:
     print()
 
 
+def outcome_counts(steps: list) -> str:
+    """汇总行末尾：失败几项、只记警告几项（都没有是空串）。"""
+    failed = sum(1 for s in steps if s.result.startswith(("失败", "没法处理")))
+    warned = sum(1 for s in steps if s.result.startswith("警告"))
+    return (f"，失败 {failed} 项" if failed else "") + (f"，只记警告 {warned} 项" if warned else "")
+
+
 def summarize(ctx: Ctx, steps: list, ok: bool) -> None:
     changed = [s for s in steps if s.run is not None]
     backups = [s.backup for s in steps if s.run is not None and s.backup]
     notes = [f"{s.label}：{s.note}" for s in steps if s.note]
     print()
     verb = "将改动" if ctx.dry_run else "改动"
-    failed = [s for s in steps if s.result.startswith(("失败", "没法处理"))]
     print(f"汇总：{verb} {len(changed)} 项（其中 {len(backups)} 项先备份），无需改动 {len(steps) - len(changed)} 项"
-          + (f"，失败 {len(failed)} 项" if failed else ""))
+          + outcome_counts(steps))
     for b in backups:
         print(f"  备份：{disp(b)}")
     for n in notes:
@@ -1971,6 +2216,7 @@ def make_ctx(args: argparse.Namespace, hosts: list, mode: str, checking: bool = 
               dry_run=args.dry_run or checking, checking=checking, state=load_state(),
               deps_mode="no" if checking else deps_mode_of(args))
     ctx.oncall = oncall_enabled(ctx)
+    ctx.quality_tools = quality_tools_enabled(existing)
     return ctx
 
 
@@ -2422,6 +2668,7 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     if not remaining:
         steps += [unplan_routing(ws, state) for ws in workspaces]
         steps += [unplan_oncall_env(ctx, state), unplan_oncall_plugin(ctx, state)]
+        steps.append(unplan_tools())
         steps.append(unplan_bin(state))
         steps.append(unplan_pkg(state))
         steps.append(Step("config", "本机配置", disp(CONFIG_FILE), "存在" if CONFIG_FILE.exists() else "不存在",
@@ -2547,6 +2794,16 @@ EPILOG = """\
     配上后发一条测试消息。已经配对过的只说一句"飞书已配对"。非交互（agent 帮装、管道、--json）不问，只在"下一步"里
     提示 ~/.drover/bin/drover oncall pair；没接飞书、也没选过的，"下一步"里提示可以加 --oncall
   ~/.claude/commands/、~/.codex/skills/ 下别的命令和技能（包括你自己写的）install 和 --uninstall 都不碰，也不备份。
+  验收工具（默认装；config.json 写 "quality_tools": false 或环境变量 DROVER_QUALITY_TOOLS=0 就不装、验收也不跑）：
+    ~/.drover/tools/crapper、dryer       Robert C. Martin 的 crapper（圈复杂度）、dryer（重复代码），0BSD，钉提交：git clone 后切到
+                                         钉的提交，用 Python 3.11+ 建 .venv、pip install -e，跑一次 --help。条目验收跑 crapper，
+                                         集成检查（accept --integration）跑 dryer。每个约 18MB；第一次分析某种语言时再下载它的
+                                         tree-sitter 语法包到 ~/.drover/tools/grammars
+    Python 3.11+                         先找 PATH 上的 python3.14…python3.11、python3，再 uv python find；都没有就
+                                         uv python install 3.12 --install-dir ~/.drover/tools/python --no-bin（不改 PATH）；
+                                         连 uv 也没有就用官方脚本装一份到 ~/.drover/tools/bin（UV_NO_MODIFY_PATH=1，不改 shell 配置）
+    装不上（没网、没 Python、pip 失败）只记警告：删掉半截的 .venv，install 退出码不变，验收时报"测不了"；重跑 install 或
+    drover update 会按钉的版本补装。
 
 --host 不给时自动判断：PATH 里有 claude 命令、或 ~/.claude 存在 → claude；PATH 里有 codex 命令、或 $CODEX_HOME
   （默认 ~/.codex）存在 → codex；都满足就都装。--check 不给 --host 时按安装记录里的宿主查。
@@ -2568,7 +2825,8 @@ EPILOG = """\
 --check：检查每一项装没装对，以及依赖（必需 herdr、git、python3，claude / codex 至少一个；可选 code-review-graph、
   uv、bun、pnpm）、herdr integration 状态、codex sandbox_mode、配置的 profile 能不能解析到目录（解析不到算没装对：
   团队规则会丢）、cd+git 拦截 hook、主会话登记 hook、读新规则 hook（没有、命令指向不对、脚本不在都算没装对）、飞书 oncall（接了的才查：没有
-  Node、插件没装、drover.env 不在算没装对；Node 低于 22、插件版本低、被禁用、开关关着、drover.env 过期只提示；没接的不查、不算失败）。
+  Node、插件没装、drover.env 不在算没装对；Node 低于 22、插件版本低、被禁用、开关关着、drover.env 过期只提示；没接的不查、不算失败）、
+  验收工具（没装、版本不对、.venv 坏了、没有 Python 3.11+ 只提示）。
   必需依赖缺失或有项没装对时退出码 1；
   没有 config.json（没装过）时主工作台里的几项报"查不了"、算没装对；
   路由区块过期、copy 副本过期、沙箱设置、主工作台是家目录只算提示。
@@ -2576,7 +2834,7 @@ EPILOG = """\
   CLAUDE.md（内容没改过时）一并删；~/.drover/bin 删完是空目录时一并删；权限规则只删安装记录里 install 加的那几条，
   原来就有的不删；cd+git 拦截 hook、主会话登记 hook、读新规则 hook 也只删安装记录里的那一项（别的 hook 不动，PreToolUse、
   SessionStart、UserPromptSubmit、hooks 撤空了就去掉）。飞书 oncall：删 drover.env；插件只在安装记录里记着是 drover 装的才
-  herdr plugin uninstall，原来就有的不动；插件的 .env（飞书配对）不删。
+  herdr plugin uninstall，原来就有的不动；插件的 .env（飞书配对）不删。验收工具：删整个 ~/.drover/tools。
   主工作台按安装记录和 config.json 找，都没有时不碰任何主工作台。保留：~/.drover/config.json、
   任务记录 ~/.drover/<slug>/、worktree、herdr 的 agent 状态 hook。.bak-drover-* 备份不自动还原，只列出来。
   带 --host 时只撤那个宿主的项；另一个宿主还装着时，共用的包、CLI 入口、路由区块保留。

@@ -75,6 +75,7 @@ drover 是一套多 agent 派发体系，跑在 [Herdr](https://herdr.dev) 上�
 | 飞书 oncall 要（选装，`--oncall`） | `node`（22+） | 内置的飞书 oncall（herdr-oncall 插件）跑在 Node 上：18～21 能推送，但收不到你在飞书里的回复；没有或低于 18 插件跑不起来 | 接了飞书时 install 只检查不安装：不满足时插件这一项报失败、其余照装；装好 Node 再重跑，或者 `--no-oncall` 不接了 |
 | 可选 | Xcode 命令行工具（macOS） | 飞书 oncall 的桌面面板（弹框提醒、扫码配对的二维码）装插件时现场编译，要用到它 | 没有时只是没有桌面面板，飞书照常 |
 | 可选 | `code-review-graph` | 验收时建图：看改动的风险、找出没有测试覆盖的函数。没装时验收照常，只是少了图谱这一项 | 不管 |
+| 默认装（不用你装） | 验收工具 crapper、dryer | 条目验收查改动函数的复杂度、集成检查查碰到改动的重复（2.8）。要 Python 3.11+：本机没有时 install 用 uv 装一份进 `~/.drover/tools`，连 uv 也没有就先装一份 drover 私有的 uv | install 装；装不上只记警告、不影响安装，验收时报"测不了" |
 | 可选 | `uv` | Python 仓库在 worktree 里装依赖（有 `uv.lock` 用 `uv sync --frozen`，否则复刻源仓库的 `.venv`） | 不管 |
 | 可选 | `bun` / `pnpm` | JS 仓库按 lockfile 在 worktree 里装依赖（`yarn`、`npm` 的 lockfile 也认） | 不管 |
 
@@ -135,6 +136,8 @@ cd ~/.drover/src
 - 选了不装、或者装失败了：不需要 herdr 的项（软链、配置、权限规则、路由区块）照样装好，用到 herdr 的几项（herdr 技能、状态 hook）报失败。装好 herdr 后重跑一次就行，已经装对的项会跳过。
 
 **没装 claude / codex 时**：install 不替你装，只给官方命令（上表）。两个都没检测到、又没传 `--host` 时，退出码 2，提示里列出两个的官方安装命令；传了 `--host`（比如先装好 Claude Code 这一套）但命令还没装时，只提示一句，drover 的入口照样装，之后装好命令不用重跑 install。
+
+**验收工具**：install 默认还会装两个工具 crapper、dryer 到 `~/.drover/tools`（每个约 18MB，十几秒），要从 GitHub clone、从 PyPI 装依赖，要 Python 3.11+（本机没有时自动用 uv 装一份进同一个目录）。装不上（没网、pip 失败）只记警告，不影响 drover 本身，也不改 install 的退出码；不想要就在 `~/.drover/config.json` 写 `"quality_tools": false`。详见 2.8。
 
 **装完之后**，汇总的"下一步"会提醒你：drover 只能在 Herdr 的 pane 里用，所以要在 Herdr 里开主会话：终端里运行 `herdr`，在它的 pane 里 `cd` 到主工作台，再启动 `claude`（或 `codex -s danger-full-access`），见第 4.1 节。
 
@@ -208,7 +211,8 @@ python3 install.py --workspace ~/work --repo-dir ~/work/company --repo-dir ~/wor
 
 **两边共用**
 
-- 没装 herdr、而且你同意（或带了 `--install-deps`）时：用官方安装脚本装到 `~/.local/bin/herdr`（见 2.1）。这是 install 唯一会替你装的依赖
+- 没装 herdr、而且你同意（或带了 `--install-deps`）时：用官方安装脚本装到 `~/.local/bin/herdr`（见 2.1）。这是 install 唯一会往 `~/.drover` 以外装的依赖
+- `~/.drover/tools/`：验收工具 crapper、dryer（钉提交，各自一个 `.venv`），本机没有 Python 3.11+ 时还有 uv 装的 `python/`（没有 uv 时还有 drover 私有的 `bin/uv`），第一次分析某种语言时下载的 tree-sitter 语法包 `grammars/`。装不上只记警告（见 2.8）；`"quality_tools": false` 时不装
 - `~/.drover/pkg` → 包根目录（link：软链；copy：副本）
 - `~/.drover/bin/drover` → `~/.drover/pkg/bin/drover`（所有文档和权限规则里写的都是这个路径）
 - `~/.drover/config.json`：`workspace`、`repo_dirs`，传了 `--profile` 时还有 `profile`，传了 `--oncall` / `--no-oncall` 时还有 `oncall: true` / `false`（见第 3 节）
@@ -279,7 +283,7 @@ python3 ~/.drover/pkg/install.py --check    # 装好以后在哪都能这样跑
 - 逐项列出装没装对（`✓` 对、`!` 提示、`✗` 没装对），以及依赖齐不齐。缺必需依赖时，那一行下面给出官方装法（`装法：…`）；herdr 装了但不在 PATH 里也算缺，会告诉你把哪个目录加进 PATH。
 - 不给 `--host` 时，按安装记录里的宿主查。
 - 必需依赖缺失，或者有项没装对，退出码 1。飞书 oncall 这几项：没有 Node、插件没装、`drover.env` 不在算没装对（没接飞书的不查，不算失败）。
-- 下面几种只算提示，不影响退出码：路由区块过期（和当前的 `flow/routing.md` 渲染结果不同）、copy 副本过期、codex 的 `sandbox_mode` 不是 `danger-full-access`、Node 低于 22、插件版本低于 0.7.0、插件在 herdr 里被禁用或自己的开关关着、`drover.env` 内容过期。
+- 下面几种只算提示，不影响退出码：路由区块过期（和当前的 `flow/routing.md` 渲染结果不同）、copy 副本过期、codex 的 `sandbox_mode` 不是 `danger-full-access`、Node 低于 22、插件版本低于 0.7.0、插件在 herdr 里被禁用或自己的开关关着、`drover.env` 内容过期、验收工具没装 / 版本不对 / `.venv` 坏了 / 没有 Python 3.11+。
 
 **更新**
 
@@ -315,6 +319,7 @@ python3 install.py --uninstall --host codex # 只撤 Codex 那一套
   - 权限规则里 install 加的那几条（你原来就有的不删）；
   - install 加的 cd+git 拦截 hook、主会话登记 hook、读新规则 hook（只撤安装记录里的这几项，别的 hook 不动；`PreToolUse`、`SessionStart`、`UserPromptSubmit`、`hooks` 撤空了就去掉）；
   - 飞书 oncall 的 `drover.env`；插件本身只在安装记录里记着"是 drover 装的"时才 `herdr plugin uninstall`，你原来就装着的不动；
+  - `~/.drover/tools` 整个目录（验收工具、它们用的 Python / uv、语法包）；
   - 安装记录本身。
 - **保留**：`config.json`（重装时沿用，不要了可以手动删）、任务记录 `~/.drover/<slug>/`、worktree、herdr 的 agent 状态 hook、插件配置目录里的 `.env`（飞书配对还在，以后重装不用重新扫码）。
 - **带 `--host`** 时只撤那个宿主的项。另一个宿主还装着的话，共用的包、脚本入口、路由区块、飞书 oncall 都保留。
@@ -402,6 +407,58 @@ drover 记着主会话"载入时"的规则（`~/.drover/main-rules.json`：会�
 - CLI 改动保持向后兼容：改参数、改子命令、改输出字段时，旧写法至少再留一个版本（新旧都认），下一个版本再删。正在跑的编排者和 worker 按它们上下文里的旧流程敲旧写法，新代码不认就会在半路出错。
 - **发了版（推了版本 tag），用户的机器很快就会装上**：主会话开着时最晚在下一个检查间隔（30 分钟）里。发错了只能再发一个修复版本。所以发版之前照旧在集成 worktree 里跑全量自测（`flow/dispatch.md` 第 9.1 节）。只推 main 不打 tag 时，只有 `main` 通道的机器会装。不想自动更新的可以用上面的开关关掉。
 
+### 2.8 验收工具：crapper、dryer
+
+默认编码规范里"控制复杂度""消除重复"两条（改编自 ub-mode，见第 9 节）原本靠 Robert C. Martin 的两个工具做约束。install 默认把它们装好，验收时 drover 自动跑，不用 worker 自己装：
+
+| | crapper（[unclebob/crapper](https://github.com/unclebob/crapper)，0BSD） | dryer（[unclebob/dryer](https://github.com/unclebob/dryer)，0BSD） |
+|---|---|---|
+| 什么时候跑 | 条目验收（`accept`） | 集成检查（`accept --integration`，`flow/dispatch.md` 第 9.1 节第 3 步） |
+| 跑什么 | 只算圈复杂度（不跑测试、不算覆盖率），零点几秒 | 扫全仓找结构相似的函数（相似度 ≥ 0.8），和验证命令一起交给 heavy 调度（大仓库单核约 85 秒） |
+| 报什么 | 这次改动碰到的函数里圈复杂度 ≥ 10、而且是新函数或比原来更复杂的（`complexity.over`）；碰到但本来就这么复杂的只作参考（`already_complex`） | 至少一边碰到这次改动行的重复对（`duplicates.pairs`） |
+| 要怎么处理 | worker 要么拆，要么在报告里写理由 | 要么合并，要么写理由 |
+
+- **阈值的依据**：crapper 的 CRAP = CC² × (1 − 覆盖率)³ + CC，覆盖率 100% 时 CRAP 就是圈复杂度 CC。所以 CC ≥ 10 的函数测试写得再全，也到不了 ub-mode 要的"CRAP 10 以下"。不跑覆盖率时只能按这个下界查。
+- **跑不了不挡验收**：没装、语法包下不来、工具出错时，结果里写"测不了：原因"，不算验收不通过。
+- **不往你的仓库里写东西**：两个工具平时会在项目里写 `.metrics/`。drover 让 dryer 把它写进临时目录；crapper 不走它的命令行，直接调它取函数的那一层拿名字、复杂度和行号（它的输出没有行号，没法只挑改动的函数）。所以 worktree 里不会多出 `.metrics/`，仓库自己跟踪的 `.metrics/` 也不会被动到。
+- **不分析的文件**：没有扩展名的脚本（比如 `bin/drover`）、测试文件、两个工具不支持的语言，列在 `complexity.skipped_files`。两个工具支持 Clojure、Java、Go、TypeScript / JavaScript、Rust、Python（dryer 不含 JavaScript）。
+
+**怎么装的**：装进 `~/.drover/tools/<工具>`，钉提交（crapper `c757ec7`、dryer `66ff6d2`）：git clone、切到钉的提交、建 `.venv`、`pip install -e`（照工具自带入口脚本的装法，用你自己的 pip 配置），再跑一次 `--help` 确认能用。每个约 18MB，十几秒。
+
+- **要 Python 3.11+**：install 先找 PATH 上的 python3.14…python3.11、python3（macOS 自带的是 3.9，不够），再问 uv。都没有时，用 uv 装一份 3.12 到 `~/.drover/tools/python`（`--no-bin`，不往 `~/.local/bin` 放东西）。连 uv 也没有，就先用 uv 官方安装脚本装一份 drover 私有的到 `~/.drover/tools/bin`（`UV_NO_MODIFY_PATH=1`，不改 shell 配置）。都在 drover 自己的目录里，卸载时一起删。
+- **语法包**：第一次分析某种语言时，从 GitHub 下载这种语言的 tree-sitter 语法包，放 `~/.drover/tools/grammars`（python、typescript、tsx 三种实测约 29MB、17 秒）。下载失败那次报"测不了"，下次验收自动重试。
+- **装不上**（没网、访问不了 GitHub / PyPI、pip 失败）：删掉半截的 `.venv`，这一项只记警告，drover 其余照装，install 退出码不变；`drover update` 的输出里写"只记警告"。之后重跑 install 或 `drover update` 会按钉的版本补装；`--check` 里只算提示（`!`）。
+- **不想要**：`~/.drover/config.json` 写 `"quality_tools": false`（环境变量 `DROVER_QUALITY_TOOLS=0` 也行）。之后不装、不查，验收时两步都不跑；已经装的不会被卸掉，要删就 `rm -rf ~/.drover/tools`。
+
+**手动跑带覆盖率的 crapper 和 mutator**：这两样不默认装、也不默认跑，原因是太重、坑也多（实测）：
+
+- **带覆盖率的 crapper** 会先跑一遍全量测试拿覆盖率（大前端仓库实测 255 秒、约 6 核、4.2GB）。TS 项目还会 `npm install --no-save @vitest/coverage-v8`，改掉 bun / pnpm 装的 `node_modules`。Python 项目在没有 `.venv` 时，会往全局解释器里装 coverage，装不上就把函数全算成 0% 覆盖、误报一片。要跑的话经 heavy 排队，最好用集成检查已经产出的覆盖率：
+
+  ```bash
+  cd <仓库>
+  ~/.drover/bin/drover heavy -- ~/.drover/tools/crapper/crapper --changed                         # 会跑全量测试
+  ~/.drover/bin/drover heavy -- ~/.drover/tools/crapper/crapper --use-existing-coverage src/      # 只读已有的覆盖率报告
+  ```
+
+  跑完删掉它在仓库里写的 `.metrics/`（TS 项目还有 `target/`）。
+- **mutator**（[unclebob/mutator](https://github.com/unclebob/mutator)，0BSD）要自己装。它要求 crapper 就在旁边的 `../crapper`，所以放 `~/.drover/tools/mutator`（crapper 已经在旁边了）。它自带的入口脚本会拿 PATH 上的 `python3` 建 `.venv`，macOS 上那是 3.9，建不成，所以用 3.11+ 的 python 先手动建好：
+
+  ```bash
+  git clone https://github.com/unclebob/mutator.git ~/.drover/tools/mutator
+  python3.12 -m venv ~/.drover/tools/mutator/.venv          # 任何 3.11+ 的 python；没有就用 ~/.drover/tools/python 里 uv 装的那份
+  ~/.drover/tools/mutator/.venv/bin/pip install -e ~/.drover/tools/mutator
+  ```
+
+  它默认把整个测试命令当基线来跑：全量测试本来就不稳（有偶发失败）时，会报 "Baseline failed"，一个变异都跑不了。所以要用 `--test-command` 指定只跑相关的测试文件；并发默认是每核一个 worker，而 heavy 给没见过的命令只按 1 核预留，所以再用 `--max-workers` 限一下：
+
+  ```bash
+  cd <仓库>
+  ~/.drover/bin/drover heavy -- ~/.drover/tools/mutator/mutator --test-command "node_modules/.bin/vitest run src/lib/format.test.ts" --max-workers 2 src/lib/format.ts
+  ```
+
+  实测：覆盖率阶段照样会跑一遍全量；加 `--reuse-coverage` 读已有的覆盖率后，只剩变异阶段，13 秒。另外它在符号链接拼出来的 worker 目录里跑，测试要是用 `Path(__file__).resolve()` 找文件，会解析回原文件，出现假存活。跑完删掉它写的 `.metrics/`。
+- 两个都按原阈值看：CRAP < 10、变异测试的存活者要杀掉。
+
 ## 3. 配置
 
 配置文件是 `~/.drover/config.json`，由 install 写，也可以直接编辑：
@@ -427,6 +484,7 @@ drover 记着主会话"载入时"的规则（`~/.drover/main-rules.json`：会�
 | `claude_effort` | Claude Code 编排者和 worker 的 effort（`claude --effort`：low / medium / high / xhigh / max）。派发时写了 `--effort` 以那个为准 | `xhigh` |
 | `codex_effort` | Codex 编排者、worker 和复审的 effort（`-c model_reasoning_effort=…`，比 claude 多一个 ultra）。派发时写了 `--effort` 以那个为准；codex 的模型不传，用 `~/.codex/config.toml` 的默认 | `xhigh` |
 | `auto_update` | 自动更新（2.7）。`false` 时这台机器不自动更新（手动 `drover update` 照常）；环境变量 `DROVER_AUTO_UPDATE=0` 也能关。install 没有对应参数，手动编辑 | 没有这个键 = 开 |
+| `quality_tools` | 验收工具 crapper、dryer（2.8）。`false` 时 install 不装、`--check` 不查，验收时两步都不跑（已经装的不卸）；环境变量 `DROVER_QUALITY_TOOLS=0` 也能关。install 没有对应参数，手动编辑 | 没有这个键 = 开 |
 | `auto_update_minutes` | 自动更新多久查一次（分钟），离上次尝试满这么久才查 | 30 |
 | `update_channel` | 更新通道（2.7）：`release` 只装发布的版本（上游历史上最新的 `vX.Y.Z` tag），`main` 跟上游最新（开发 drover 用）。手动 `update` 和自动更新都按它；写了别的值时 `update` 报错、什么都不改。install 没有对应参数，手动编辑 | `release` |
 | `heavy_cpu_capacity` | heavy 调度的 CPU 容量（核）：几条构建 / 测试合计占用不超过它就同时跑。默认从硬件值起步、按真实命令的表现自动校准（第 6 节 `locks/heavy/`），一般不用写；写了就固定用它、不再校准（比如机器还要留给别的重活，或者 Linux 容器里 CPU 配额比看到的核数少） | 不写：Apple 芯片从性能核数（`hw.perflevel0.logicalcpu`）、其他从逻辑核数起步，之后自动校准，不超过逻辑核数 |
@@ -711,7 +769,7 @@ rollup 的状态：
 | `deps` | 在 worktree 里独立安装依赖（不软链源仓库） | 编排者 |
 | `agent-start` | 在 pane 里启动 claude / codex worker，自动处理启动弹窗：新目录的信任弹窗、Claude Code 对 `--add-dir` 加进来的目录弹的 "Adding a new directory" 信任框（光标默认在 "No, exit"，移到 "Yes, add it" 再确认）、codex 的升级提示 | 编排者 |
 | `brief` | 按模板生成任务书（必填完成证据），可先摸底，`--send` 生成后立刻发出（和 `prompt` 一样看到开工就返回）。模板里限了篇幅：摸底只写结论和证据位置，"和代码不符""需要决策"两部分写全、其余 100 行左右；报告每条 verification 一行、尽量 60 行内，worker 在对话里只回复报告路径和 status | 编排者 |
-| `accept` | 验收：标记新文件、建图、改动分析、diff 概览、重跑验证命令；`--verify-baseline` 和基线比失败条目（基线上只重跑失败的文件），`--no-graph` 不建图（集成检查用）。建图和验证命令都经 heavy 调度；多条验证默认同时交给调度（能同时跑的同时跑，结果按传入顺序），前后有依赖的加 `--serial` 逐条跑 | 编排者 |
+| `accept` | 验收：标记新文件、建图、改动分析、diff 概览、crapper 查这次改动碰到的函数的圈复杂度、重跑验证命令；`--verify-baseline` 和基线比失败条目（基线上只重跑失败的文件），`--integration` 是集成检查（不建图、不跑 crapper，dryer 扫全仓、只留碰到改动的重复），`--no-graph` 只是不建图。建图、dryer 和验证命令都经 heavy 调度；多条验证默认同时交给调度（能同时跑的同时跑，结果按传入顺序），前后有依赖的加 `--serial` 逐条跑 | 编排者 |
 | `integrate` | 集成 worktree：从最新上游建（或复用），依次 cherry-pick 条目分支，装依赖。新建时和 `wt` 一样核实起点含上一轮推的提交（`--from` 的条目分支里已有的不算缺），`--carry` 同 `wt`；重建集成 worktree 不丢推送记录 | 编排者 |
 | `push` | 集成 worktree 推送：上游有新提交就 rebase 并报告（这次不推），否则推送并 `ls-remote` 核对；每次推上去都记进任务的 `pushes.jsonl`（有没有集成状态都记），定不了任务就不推、提示加 `--slug` | 编排者 |
 | `wrapup` | 收尾汇总的事实收集，不改仓库和任务记录：每个仓库每条分支的推送记录（`pushes.jsonl` 和旧任务的 `integrate-*.json`，patch 模式的也在）和远端核对、推送范围里的迁移 / 配置 / 部署 / 依赖文件和新增配置键线索、整体检查结果、待清理的 worktree 和分支（子编排者的一起收）；`--draft <文件>` 生成 wrapup.md 骨架（只写这一个文件，写成了在时间线记一条收尾汇总） | 编排者 |
@@ -785,6 +843,8 @@ drover/
 ├── config.json                                   # workspace、repo_dirs、profile、playbook_dirs、oncall
 ├── drover-install.json                           # 安装记录：宿主、新建的文件、加的规则和 hook、备份、飞书 oncall（--uninstall / --check 用）
 ├── oncall-images/                                # 飞书里发给主会话的图片（飞书 oncall 插件存的，7 天后自动删；卸载时保留）
+├── tools/                                        # 验收工具（2.8，卸载时删）：crapper/、dryer/（钉提交的 clone + .venv）、grammars/（tree-sitter 语法包）；
+│                                                 #   本机没有 Python 3.11+ 时还有 python/（uv 装的），没有 uv 时还有 bin/uv
 └── backups/codex-skills/                         # Codex 技能目录的备份（有替换时才有）
 
 ~/.claude/                                        # --host 含 claude
@@ -812,7 +872,7 @@ drover/
 
 ```
 ~/.drover/
-├── <slug>/                          # 一个任务一个目录（slug 不能和固定目录重名：pkg、src、bin、backups、baselines、locks）
+├── <slug>/                          # 一个任务一个目录（slug 不能和固定目录重名：pkg、src、bin、backups、baselines、locks、oncall-images、tools）
 │   ├── request.md                   # 主会话写的需求：你的原话、目标（复述）、标题（看板的任务列）、@仓库和参数、已知上下文
 │   ├── dispatch.md                  # 编排者的状态文件：目标、计划、每一步的 ID 和结果、最终汇报（history 从这里摘）
 │   ├── rollup.md                    # 一页汇报（≤ 40 行）：状态 / 标题 / 摘要 / 要你做 / 收尾 / 提醒 / 需要你决定 / 当前进度 / 结论
@@ -1049,6 +1109,13 @@ find ~/.claude ~/.codex ~/.drover <主工作台> -maxdepth 3 -name "*.bak-drover
 - Codex：没有 hook，主会话在你发第一条消息时按路由规则登记；刚开的 Codex 会话还没说过话时，飞书消息找不到它。
 - `/clear` 或退出重开后，herdr 会清掉名字，hook 会在一两秒内重新登记；这期间发的飞书消息会回"没找到主会话"，再发一次就好。
 
+### 验收工具没装上，或者验收里报"测不了"
+
+- install 的汇总里写"只记警告"、`--check` 里"验收工具 crapper / dryer"或"验收工具用的 Python 3.11+"是 `!`：提示里写了哪一步失败（git clone、uv、`pip install -e`）和原因，多半是访问不了 GitHub 或 PyPI。网络好了以后重跑 install，或者 `~/.drover/bin/drover update`，会按钉的版本补装。
+- 没有 Python 3.11+、也装不上 uv：自己装一个 3.11+（`brew install python@3.12`，或 python.org 的安装包）再重跑 install。
+- 验收结果里 `complexity` / `duplicates` 写"测不了：…"：不算验收不通过。"没装"按上一条处理；带 `DownloadError` 的，是第一次分析这种语言时语法包从 GitHub 下不来，下次验收会再试。
+- 不想要这两步：`~/.drover/config.json` 写 `"quality_tools": false`（见 2.8）。
+
 ### 其他
 
 - **编排者停了，rollup 却还是"进行中"**：主会话会看一眼它的屏幕，判断是在等后台任务还是卡住了；你也可以 `herdr agent focus <编排者名>` 自己看。
@@ -1077,7 +1144,7 @@ drover 的几条核心原则：
 
 致谢：[Herdr](https://herdr.dev)（牧场是它的，我们只是赶羊的），code-review-graph（验收时的那张图），以及 Claude Code 和 Codex 两位宿主。
 
-默认编码规范（`flow/coding-rules.md`）的通用原则改编自 Robert C. Martin 的 [ub-mode](https://github.com/unclebob/ub-mode)（MIT），原文和许可证见 [`third_party/ub-mode/`](third_party/ub-mode/)。
+默认编码规范（`flow/coding-rules.md`）的通用原则改编自 Robert C. Martin 的 [ub-mode](https://github.com/unclebob/ub-mode)（MIT），原文和许可证见 [`third_party/ub-mode/`](third_party/ub-mode/)。验收时用的 [crapper](https://github.com/unclebob/crapper)（圈复杂度）、[dryer](https://github.com/unclebob/dryer)（重复代码），以及 README 2.8 写了手动跑法的 [mutator](https://github.com/unclebob/mutator)，也都出自 Robert C. Martin，0BSD 许可。drover 不带它们的代码，install 从 GitHub 按钉住的提交装到 `~/.drover/tools`。
 
 ## 10. 自测
 
@@ -1101,7 +1168,7 @@ python3 tests/test_update.py                   # drover update：快进后按原
 python3 tests/test_cd_git_guard.py             # cd+git 拦截 hook 的判定、改写建议、出错放行（不到 1 秒）
 ```
 
-`tests/test_install.py` 也不碰真实状态、不联网：临时 HOME；PATH 最前面是假 herdr（`plugin list / install / update / uninstall / config-dir` 也是假的，只改它自己的状态文件）和假 `node`；"没装 herdr"的用例会把 PATH 里所有含 herdr 的目录去掉，安装命令换成假的安装器（照官方脚本的行为把假 herdr 放进临时 HOME 的 `~/.local/bin`），PATH 里还放了一个只记日志的假 `curl`；其余用例的安装命令一律换成"禁止安装"，谁意外触发了安装，用例就报错。"没有 Node"的用例同样把 PATH 里含 node 的目录去掉。交互终端里"先问一句"的分支（缺 herdr 时问要不要装、装完问要不要配对飞书）用伪终端测；配对用例里假插件的 status 脚本按假 herdr 的状态报飞书配没配，假 `qrencode` 只打印一行。`tests/test_update.py` 同样用临时 HOME，远端是本地的 bare 仓库，不联网、不碰真实状态；`--auto` 的用例覆盖快进成功（连着两次没报的并成一次）、已是最新（不重跑 install）、有改动 / 分叉被挡住、远端没了、`DROVER_AUTO_UPDATE=0`、锁被占着，每种都核对 `auto-update.json`；无人值守那条把远端换成 `ssh://`、PATH 里放假 `ssh`（记参数，报连不上或一直挂着），核对 `BatchMode=yes`、`GIT_TERMINAL_PROMPT=0`、只试 1 次、用户自己的 `core.sshCommand` 不覆盖，挂着的那条在进程里把 60 秒超时换成 2 秒（只核对报错里的"命令超时（2 秒）"和只试 1 次，不数假 ssh 被调了几次、不量墙钟：机器忙时 2 秒内 git 可能还没起到假 ssh）；要等的另外两条也在进程里跑：远端没了那条把重试前的 sleep 换成只记下来（仓库不存在不会自己好：核对只试 1 次、一次都不等），锁被占着那条把等锁上限从 5 秒改成 0.3 秒。手动 `update` 换了版本也写 `auto-update.json` 的 update（source manual、announced true，上一次自动检查的 result / last_attempt / finished / error 原样）；之前有一次自动更新还没报的并成一次、announced 保持 false；没有新提交、`--dry-run`、被挡住、update_run 抛错都不写；上一次已经报过的不并；copy 模式 install 复制副本失败（clone 新了、副本标记还是旧的）不记、看板第二行没有"已更新"，接着重跑成功（clone 已是新的，副本换成新的）记旧副本版本→新版本、标题按这一段现算。
+`tests/test_install.py` 也不碰真实状态、不联网：临时 HOME；验收工具默认关着（`DROVER_QUALITY_TOOLS=0`），uv 的安装命令和 herdr 一样换成"禁止安装"；测验收工具的用例（`QualityToolsTests`）自己打开，工具源换成本地仓库（`DROVER_QUALITY_TOOLS_SOURCE`），PATH 最前面放假的 python3.14…python3（版本可设、`-m venv` 建假 `.venv`），覆盖装成功 / 重跑不动 / `--check` / 卸载删掉、pip 失败只记警告且退出码 0（半截 `.venv` 删掉，修好后重跑装上）、没有 3.11+ 时装私有 uv（`UV_INSTALL_DIR`、`UV_NO_MODIFY_PATH=1`）再装 Python、装 uv 也失败只记警告、`--dry-run` 和 `quality_tools: false`；PATH 最前面是假 herdr（`plugin list / install / update / uninstall / config-dir` 也是假的，只改它自己的状态文件）和假 `node`；"没装 herdr"的用例会把 PATH 里所有含 herdr 的目录去掉，安装命令换成假的安装器（照官方脚本的行为把假 herdr 放进临时 HOME 的 `~/.local/bin`），PATH 里还放了一个只记日志的假 `curl`；其余用例的安装命令一律换成"禁止安装"，谁意外触发了安装，用例就报错。"没有 Node"的用例同样把 PATH 里含 node 的目录去掉。交互终端里"先问一句"的分支（缺 herdr 时问要不要装、装完问要不要配对飞书）用伪终端测；配对用例里假插件的 status 脚本按假 herdr 的状态报飞书配没配，假 `qrencode` 只打印一行。`tests/test_update.py` 同样用临时 HOME，远端是本地的 bare 仓库，不联网、不碰真实状态；`--auto` 的用例覆盖快进成功（连着两次没报的并成一次）、已是最新（不重跑 install）、有改动 / 分叉被挡住、远端没了、`DROVER_AUTO_UPDATE=0`、锁被占着，每种都核对 `auto-update.json`；无人值守那条把远端换成 `ssh://`、PATH 里放假 `ssh`（记参数，报连不上或一直挂着），核对 `BatchMode=yes`、`GIT_TERMINAL_PROMPT=0`、只试 1 次、用户自己的 `core.sshCommand` 不覆盖，挂着的那条在进程里把 60 秒超时换成 2 秒（只核对报错里的"命令超时（2 秒）"和只试 1 次，不数假 ssh 被调了几次、不量墙钟：机器忙时 2 秒内 git 可能还没起到假 ssh）；要等的另外两条也在进程里跑：远端没了那条把重试前的 sleep 换成只记下来（仓库不存在不会自己好：核对只试 1 次、一次都不等），锁被占着那条把等锁上限从 5 秒改成 0.3 秒。手动 `update` 换了版本也写 `auto-update.json` 的 update（source manual、announced true，上一次自动检查的 result / last_attempt / finished / error 原样）；之前有一次自动更新还没报的并成一次、announced 保持 false；没有新提交、`--dry-run`、被挡住、update_run 抛错都不写；上一次已经报过的不并；copy 模式 install 复制副本失败（clone 新了、副本标记还是旧的）不记、看板第二行没有"已更新"，接着重跑成功（clone 已是新的，副本换成新的）记旧副本版本→新版本、标题按这一段现算。
 
 只跑一个文件：`python3 selftest/run.py test_push`，或者 `python3 -m unittest discover -s selftest -p test_push.py -v`。只用标准库，不用装包。`selftest/` 下没有 `__init__.py`，入口就是上面这条，不要加 `-t .`；公共工具在 `selftest_support.py`（临时环境、执行 / 加载 `bin/drover`、假时钟和在进程里跑命令）、`selftest_fakes.py`（假 herdr、假测试工具，测联网重试的用例按需装的假 ssh）、`selftest_repos.py`（integrate / push 用的仓库布局）、`selftest_screens.py`（watch 用例的真实屏幕：确认弹框、正文引用、后台子 agent 的确认框；启动弹窗用例的信任框）。
 
@@ -1112,6 +1179,7 @@ python3 tests/test_cd_git_guard.py             # cd+git 拦截 hook 的判定、
 | `test_vitest_recheck.py` | vitest 负载超时复核：只超时 → 单独重跑失败文件，通过就放行；超时 + 真失败、复核还失败、计数对不上都不放行；重跑命令去掉位置参数、保留选项的值；`../../..` 开头的路径换成相对 worktree 的 |
 | `test_baseline.py` | `--verify-baseline`：vitest / pytest / tsc / eslint 四种解析（包脚本、绝对路径、只算 error）和认不出的输出；和基线比失败集合，新增列出、修好的进 `fixed`，第二次走缓存，新增全是超时先复核。基线只重跑失败的文件（假工具记下的参数为证）：vitest / pytest 按失败所在的测试文件、eslint 按报错的文件，选项保留、目录参数和 vitest 的 `--changed` 去掉，tsc 照旧整条；失败的文件 BASE 上没有 → 不放进基线命令、算新增，全都没有 → 不建基线 worktree；目标文件不同不命中旧缓存；失败路径对不上 worktree 里的文件、经 make 包装的命令 → 退回整条命令 |
 | `test_accept_cli.py` | accept 端到端：`--verify` 和 `--verify-baseline` 对同一条失败命令的不同结论；不建图；`--no-graph` 不调用 code-review-graph（PATH 里放了只记日志的假命令为证）、`graph` 标 `skipped`，`--brief`、`accept-summary`、`review --dry-run` 读这份存档不报错、不当成"图谱不可用" |
+| `test_quality.py` | accept 的验收工具（假 crapper / dryer 放在临时状态目录的 `tools/` 下）：条目验收只报这次改动碰到的函数里圈复杂度 ≥ 10 的，新函数和比 base 更复杂的进 `over`、本来就这么复杂的进 `already_complex`、没碰到的和不够阈值的不报，README、测试文件进 `skipped_files`，base 的源码只为有复杂函数的文件取；没装、出错（语法包下不来）报"测不了"、不挡验收；两步都不往 worktree 写（跑前跑后 git status 的路径一样，仓库跟踪的 `.metrics` 没动，dryer 的 `--root` 在 worktree 外、跑完删掉）；`--integration` 不建图、不跑 crapper，dryer 带 `--threshold 0.8` 扫 worktree 的绝对路径，只留至少一边碰到改动行的重复对（名字带空格的新文件、dry.edn 里转义的路径），出错报"测不了"；config 的 `quality_tools: false` 和 `DROVER_QUALITY_TOOLS=0` 两步都不跑；改动行（改的行、只删行的删除点、新文件、删掉的文件不算、已提交的也算）；取函数行号的小脚本的输入输出格式（用同名的桩包代替 crapper）；`tools` 是保留名、heavy 名单有 crapper / mutator |
 | `test_integrate.py` | integrate：从最新上游建、按顺序 cherry-pick、重跑全跳过、冲突停下 → 解完重跑跳过；cherry-pick 被未跟踪文件挡住（git 没开始就拒绝）→ 记 `failed`，挪走后重跑真的应用上；条目的改动已被上游带进来（空提交）→ 跳过、记 `empty`，中文 locale 下照样认得出；新建时快进源仓库主检出、目标分支不重复 fetch；主检出的上游在远端已删不影响集成；条目 worktree 有没提交的改动时拒绝；`--dry-run` |
 | `test_wt_sync.py` | wt 新建前同步源仓库主检出：落后 → 快进、从最新起；已是最新；本地领先 → 从 HEAD 起并提示；有已跟踪改动、分叉、快进被未跟踪文件挡住 → 主检出不动、从 `origin/<分支>` 起、`warnings` 写原因；`--base origin/<别的分支>` 先 fetch；和上游同一条只 fetch 一次；fetch 失败 → `ok: false`、不建，`--no-sync` 能建：远端仓库没了（永久错误）只试 1 次、不等，偶发错误（假 ssh 前两次报连接被重置）隔 5 秒重试、第 3 次成功照常建（假时钟）；`--no-sync`、`--dry-run`、复用已有 worktree 都不 fetch 不快进；没配上游回退 `origin/<分支>`、远端没有这条分支、detached 当作没有上游；配了上游但远端已删 → `upstream_gone`、不报错（不带 `--base` 从 HEAD 起并提示，带 `--base origin/<别的分支>` 从它最新起；中文 locale 下 git 的报错是中文，照样认得出）；主检出不在远端默认分支（`origin/HEAD`）上 → 提示一句（`--dry-run` 也有），在默认分支上、上游是默认分支、显式 `--base`、本地没有 `origin/HEAD` 都不提示；同一仓库的同步锁被占着时等待。`.env*` 复制：源仓库跟踪、基线分支上没有的不复制，跟踪但在新 worktree 里被忽略的照复制，没跟踪的照旧复制。`.worktreeinclude`（照 order-service 这类 Java 服务仓库的布局）：目录模式 `tools/` 和通配模式 `config/*.yml` 都复制，跟踪的、`!` 取反的、匹配了但没被忽略的不复制，和 `.env*` 重复的只复制一次；源仓库忽略、基线分支不忽略的不复制、列进 `worktreeinclude_skipped`；符号链接跳过；复用时补复制、不覆盖已有的；`--dry-run` 逐个列出匹配文件；没有这个文件时 `would_copy`、`copied` 和以前一样 |
 | `test_push.py` | push：直接推并 `ls-remote` 核对、推送记进 `pushes.jsonl`（不再写进集成状态）；没有集成状态（patch 模式，wt 建的集成 worktree）也记，字段齐全，任务按分支名归属；定不了任务就不推、提示加 `--slug`，`--slug` 写错报没有任务目录；上游只改文档 / 改代码 → rebase、`needs_reverify`、base 回写（integrate 再加条目时读到新 base）；add/add 冲突 → 人工解完先停一次再推；手动 rebase 标 `manual`；push 遇到永久错误（推送地址指向不存在的仓库）只试 1 次、不等，遇到偶发错误（假 ssh 第一次报会话被对端关掉）隔 5 秒重试后推出并核对 |
@@ -1130,7 +1198,7 @@ python3 tests/test_cd_git_guard.py             # cd+git 拦截 hook 的判定、
 | `test_board_reexec.py` | 看板换新代码（2.7）。`board --live` 在伪终端里跑临时目录里的一份 `bin/drover`（看板 tab 里，`--interval 0.3`）：link 模式（临时 clone）版本没变时跑几轮都不重新执行、心跳是这个进程 / pane / 版本；提交一版新代码（第一行改成"drover 新看板"）→ 同一个进程换过去，先关鼠标上报、恢复终端再重新打开，第一行版本和心跳跟着变，Ctrl-C 后终端属性和启动前一样；提交有语法错误的代码 → 不换、没动终端、看板上多一行"没换成新代码…SyntaxError…；接着用 <旧>，下一轮再试"，再提交能跑的 → 下一轮换过去；copy 模式（副本有 `.drover-copy`）clone 快进了、副本没重装不换，重装好换过去。假的版本来源加假时钟：版本没变、启动时 / 后来取不到都不换，变了每轮去换、原因那一行紧接第一行，变回来那一行没了；`os.execv` 报错返回原因、开着鼠标时关了再开，试跑没过不 exec、终端不动。`board --tab` 复用（假时钟、假版本）：心跳新、版本对、刚好 120 秒不重启，装着的版本或心跳里的版本取不到不重启；没有心跳、别的 pane 的、版本不对、121 秒没更新 → `pane send-keys <pane> ctrl+c` 再 `pane run`，返回 `restarted` 和原因；`--dry-run` 只列两条命令；`pane run` 失败报错。`--live` 只在看板 tab 里写心跳 |
 | `test_timeline.py` | 时间线 `<slug>/timeline.jsonl`（统计数据）：命令当场记——`orch-start` 派发（start）、`--args "resume …"` 换编排者（replace，老任务先补一条估计的派发）、子编排者也记、`--dry-run` 不写；`drover prompt` 发给编排者记 answered（开头 20 个字），以"收尾"开头的再记 wrapup-sent，发送失败、发给 worker 不记；`wrapup` 只在 `--draft` 写成时记；主会话用 `drover rollup` 读到新内容才记 main-read（编排者读不记）；看板点收尾记 wrapup-clicked 和 `wrapup-clicked.json`。观察者补——显示状态变了才记 state（时间是 rollup 修改时间 / 转答复的时间 / 没有 rollup 时的派发时间，不是看到的时间；同一状态重写不记），`--json` 的 state_since / state_seconds / total_seconds（完成的算到这一段完成开始）；先看板后 watch、先 watch 后看板、4 个看板加 1 个 `watch --main` 子进程同时跑都只记一次；编排者每换一段状态记 agent（working / 确认框带弹框指纹 / done / 接口错误 / 退出）；停了没更新满 10 分钟记一次 stalled，等你决定的不算；观察中断（超过 60 秒才记、第一次不记、时间不往回走，`--line` / `--pending` 不算观察）；老任务补派发（request.md 和 rollup.md 里早的）和估计的状态，只补一次 |
 | `test_watch_progress.py` | `working-no-output` / `working-no-diff`（阈值 0.02 分钟、假时钟，`--until-event` 退出；在跑命令、输出在变、worktree 在变时不报），屏幕输出指纹和 worktree 指纹；取指纹的 git 超时（刚进 working 就超时、取到一半超时、一直超时）→ watch 不退出、这一轮不算有没有变化，之后取到照常报 `working-no-diff` |
-| `test_git_nolock.py` | drover 起的只读 git 不改写 index、不拿 index.lock：已跟踪文件只改了修改时间时，watch 取进度、accept 的 `status` 和 `diff <base> --stat`、集成列冲突文件（`diff --name-only --diff-filter=U`）跑完 index 和 git 目录都没变、输出和改之前的写法一样，对照（不带变量的原始 git）会改写 index；accept 在 `add -N` 之后显式刷新 index，detect-changes 默认写法的 `git diff --name-status <base>` 不再改写 index、不列只改了时间的文件；`git()`、`git_bytes()`、cleanup 的 `git worktree remove`、accept 的 detect-changes 的子进程环境带 `GIT_OPTIONAL_LOCKS=0`（外面是 1、调用方另给 env 时也是）；git 超时先 SIGTERM 进程树、等宽限期再 SIGKILL：`git commit -a` 卡在一直睡的 pre-commit hook 上（持着 index.lock），`git()` / `git_bytes()` 短超时后报命令超时、不留锁、hook 一起停，对照（原来的 `subprocess.run(timeout)`，SIGKILL）留锁；不理 SIGTERM 的假 git 宽限期后被 SIGKILL，总耗时有上界 |
+| `test_git_nolock.py` | drover 起的只读 git 不改写 index、不拿 index.lock：已跟踪文件只改了修改时间时，watch 取进度、accept 的 `status`、`diff <base> --stat` 和算改动行的 `diff -U0 <base>`、集成列冲突文件（`diff --name-only --diff-filter=U`）跑完 index 和 git 目录都没变、输出和改之前的写法一样，对照（不带变量的原始 git）会改写 index；accept 在 `add -N` 之后显式刷新 index，detect-changes 默认写法的 `git diff --name-status <base>` 不再改写 index、不列只改了时间的文件；`git()`、`git_bytes()`、cleanup 的 `git worktree remove`、accept 的 detect-changes 的子进程环境带 `GIT_OPTIONAL_LOCKS=0`（外面是 1、调用方另给 env 时也是）；git 超时先 SIGTERM 进程树、等宽限期再 SIGKILL：`git commit -a` 卡在一直睡的 pre-commit hook 上（持着 index.lock），`git()` / `git_bytes()` 短超时后报命令超时、不留锁、hook 一起停，对照（原来的 `subprocess.run(timeout)`，SIGKILL）留锁；不理 SIGTERM 的假 git 宽限期后被 SIGKILL，总耗时有上界 |
 | `test_isolation.py` | 隔离本身：`DROVER_STATE_DIR` 生效，herdr 解析到假的；写进任务书的 CLI 入口是字面的 `~/.drover/bin/drover`，和 install.py 的白名单对得上 |
 | `test_orch.py` | 编排者相关：`orch-start` 的开场提示（claude / codex / 子编排者）、要用的 `/drover` 命令或 `$drover` 技能没装时报错、复用 `orch` workspace、写 `orch.json`；宿主不给 `--kind` 时跟主会话走：`orch-start` 按调用方 pane 的 agent 定宿主、`default_kind` 不受显式 `--kind` 影响、子编排者取上层的 `default_kind`、认不出又没给 `--kind` 报错，`agent-start` 先用 `default_kind` 再用调用方；slug 不能用保留名；`orch-status`（含按屏幕修正的 `screen_status` / `blocked`、读屏失败按原值、带"更新："行的旧 rollup；`rollup_summary` / `unread` / `answered_after_rollup`；`needs_attention` 只算未读（编排者读过不算读过）、状态按前缀匹配、完成且已退出的不算）；发 prompt 带 `--until working`，`started` / `settled` / `timeout` / stalled / blocked 的结果和 hint |
 | `test_config_missing.py` | 主工作台没有默认值：没有 `config.json` 时不信任任何目录、只按路径找仓库，`orch-start` 报错要你先跑 install，`preflight` 报出缺配置，`wt` 不自动信任；有配置时 `repo_dirs` 默认是 workspace |

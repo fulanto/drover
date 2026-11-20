@@ -27,8 +27,8 @@ JSON 对象，字段 ok 表示是否成功；失败时 error 字段说明原因�
   board         任务看板：等你 / 现在可以看结果的 / 还在处理的 / 提醒，每样交付走到哪一步，每次现场生成；默认 Markdown，
                 --plain（飞书）、--json、--line（状态栏）、--pending（【转达】的脚注）、--live（循环重画，看板 tab 里能点 [收尾]，
                 装着的 drover 换了版本就重新执行自己）、--tab（开和主对话同级的看板 tab，里面是旧代码的看板就重启）、--pane（旧的下方分屏）
-  accept        验收：git add -N、建图、detect-changes --brief、diff --stat、--verify 重跑验证命令；--save 存成 JSON 给 review 用；--brief 只打印摘要；
-                --no-graph 不建图（集成检查用）
+  accept        验收：git add -N、建图、detect-changes --brief、diff --stat、crapper 查改动函数的复杂度、--verify 重跑验证命令；
+                --save 存成 JSON 给 review 用；--brief 只打印摘要；--integration 集成检查（不建图，dryer 查碰到改动的重复）
   review        复审一条命令：按模板生成 prompt、分屏启动只读 codex、立刻发出 prompt
   collect       复审结束后存档输出原文、取出 codex 自报耗时、关闭复审 pane
   review-start  （底层）只分屏并启动只读 codex，不发 prompt
@@ -121,7 +121,7 @@ AGENT_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,59}$")
 # 状态目录下的固定目录（install.py 和本脚本建的，oncall-images 是飞书 oncall 插件按 drover.env 的 CHAT_IMAGE_DIR 存飞书图片的），
 # 任务 slug 不能和它们重名。
-RESERVED_SLUGS = ("pkg", "src", "bin", "backups", "baselines", "locks", "oncall-images")
+RESERVED_SLUGS = ("pkg", "src", "bin", "backups", "baselines", "locks", "oncall-images", "tools")
 HERDR_WORKTREES = HOME / ".herdr" / "worktrees"
 # 安装后的 CLI 固定入口（install.py 的 BIN_LINK），写进任务书让 worker 执行的命令用它。写成字面的 ~ 路径：
 # 权限规则 Bash(~/.drover/bin/drover:*) 按命令文本的字面前缀匹配，展开成 /Users/<名字>/... 就对不上，worker 每跑一次
@@ -221,12 +221,14 @@ HEX_REV_RE = re.compile(r"^[0-9a-f]{7,40}$")
 # 就等于白名单放行了任意命令（git push、rm、bash -c …）。所以跳过开头的 env 和 VAR=值 之后，程序名（取 basename，
 # ./mvnw、./.venv/bin/python 都认）必须在这张表里；python 带版本号（python3.12）也算。jest、vue-tsc 是在建议名单上
 # 补的：和 vitest、tsc 同类。node 是后补的：文档的 CDP 检查（verify-*-cdp.mjs）一直用 heavy -- node 排队。
-# 名单里的 python / node / npx / bun / make 本身能跑任意代码，这里挡的是把 heavy 当通用执行器。
+# 名单里的 python / node / npx / bun / make 本身能跑任意代码，这里挡的是把 heavy 当通用执行器。crapper、mutator 是 README 写的
+# 手动跑法（带覆盖率的 crapper 会跑全量测试，mutator 一跑就是每核一个 worker），要经调度。
 HEAVY_TOOLS = frozenset({
     "mvn", "mvnw", "gradle", "gradlew",
     "bun", "bunx", "npm", "npx", "pnpm", "yarn", "vitest", "jest", "tsc", "vue-tsc", "eslint", "prettier",
     "python", "python3", "pytest", "uv", "node",
     "make", "go", "cargo",
+    "crapper", "mutator",
 })
 HEAVY_PYTHON_RE = re.compile(r"^python3\.\d+$")
 ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
@@ -7018,6 +7020,206 @@ def run_verifies(wt: str, jobs: list, timeout: float, *, lock: bool, serial: boo
         return [f.result() for f in futures]
 
 
+# ---------------------------------------------------------------- accept：复杂度（crapper）、重复（dryer）
+
+# 验收工具（install.py 装的，钉的版本和"换版本时要核对"见那边 QUALITY_TOOLS 的注释）：STATE_HOME/tools/<工具>/.venv。
+# 条目验收跑 crapper（只算复杂度），集成检查（--integration）跑 dryer。没装、出错只报"测不了"，不挡验收。
+# config 的 quality_tools 是 false、或 DROVER_QUALITY_TOOLS=0 时两步都不跑（和 install.py 一致）。
+TOOLS_DIR = STATE_HOME / "tools"
+# tree-sitter 语法包：第一次分析某种语言时两个工具从 GitHub 下载，放 drover 自己的目录（默认在 ~/Library/Caches），卸载一起删。
+TOOLS_GRAMMARS = TOOLS_DIR / "grammars"
+QUALITY_OFF_REASON = "关了（config.json 的 quality_tools 是 false，或 DROVER_QUALITY_TOOLS=0）"
+# 圈复杂度到这个数就报：crapper 的 CRAP = CC² × (1 − 覆盖率)³ + CC，覆盖率 100% 时 CRAP 就是 CC，所以 CC ≥ 10 的函数测试
+# 写得再全也到不了 ub-mode 要的"CRAP 10 以下"（flow/coding-rules.md、third_party/ub-mode/SKILL.md 的 Crapper 一节）。
+# 不跑覆盖率时只能用这个下界。
+COMPLEXITY_THRESHOLD = 10
+DUP_THRESHOLD = "0.8"  # dryer 自己默认 0.82；ub-mode 的 Dryer 一节是 0.8 及以上
+DRYER_TIMEOUT = 900    # 秒：大仓库实测单核 85 秒
+HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+# crapper 的 crap.edn 和报表都只有函数名、没有行号，按"这次改动碰到的函数"筛不了，所以不走它的命令行：在它自己的 .venv 里
+# 调它取函数的那个函数（它的 CLI 也是调这个），拿名字、圈复杂度和行号范围，不写任何文件。stdin：{"root", "files":
+# [{"side", "path", "source"?}]}（没给 source 就读 root/path）；stdout：{"functions": [{side, path, name, namespace,
+# complexity, start_line, end_line}], "skipped": [它不认的文件（没有扩展名、不支持的语言）和测试文件]}。
+CRAP_SPANS_SCRIPT = r'''
+import json, sys
+from pathlib import Path
+from crapper.discover import is_test_file, language_of
+from crapper.languages import functions_in_file
+req = json.load(sys.stdin)
+out = {"functions": [], "skipped": []}
+for f in req["files"]:
+    lang = language_of(f["path"])
+    if lang is None or is_test_file(f["path"]):
+        out["skipped"].append(f["path"])
+        continue
+    source = f.get("source")
+    if source is None:
+        source = (Path(req["root"]) / f["path"]).read_text(encoding="utf-8", errors="replace")
+    for fn in functions_in_file(lang, source, f["path"], req["root"]):
+        out["functions"].append({"side": f["side"], "path": f["path"], "name": fn.name, "namespace": fn.namespace,
+                                 "complexity": fn.complexity, "start_line": fn.start_line, "end_line": fn.end_line})
+print(json.dumps(out))
+'''
+# dryer 的结果（<root>/.metrics/dry.edn，dryer report.py 的 render_edn）里的一个候选。
+DRY_CANDIDATE_RE = re.compile(
+    r'\{:score ([0-9.eE+-]+)\s+:language "(?:[^"\\]|\\.)*"\s+'
+    r':left \{:file "((?:[^"\\]|\\.)*)", :start-line (\d+), :end-line (\d+)\}\s+'
+    r':right \{:file "((?:[^"\\]|\\.)*)", :start-line (\d+), :end-line (\d+)\}')
+
+
+def quality_tools_enabled() -> bool:
+    if os.environ.get("DROVER_QUALITY_TOOLS", "").strip().lower() in ("0", "false", "off", "no"):
+        return False
+    return CONFIG.get("quality_tools") is not False
+
+
+def changed_lines(wt: str, base: str) -> dict:
+    """这次改动碰到的行：{相对路径: 新文件里的行号集合}，按 git diff -U0 <base>（accept 先 add -N，新文件也在；提交了的、没提交的
+    都算）。只删了行的 hunk 记删除点前面那一行（至少第 1 行），算进它所在的函数。整个删掉的文件不在里面。"""
+    p = git(wt, *DIFF_NO_REFRESH, "-c", "core.quotePath=false", "diff", "--no-color", "--no-ext-diff", "-U0", base)
+    if p.returncode != 0:
+        raise DroverError(f"git diff -U0 {base} 失败", stderr=tail(p.stderr))
+    out: dict = {}
+    for path, raw in diff_body(p.stdout):
+        m = HUNK_RE.match(raw)
+        if path and m:
+            start, count = int(m.group(1)), int(m.group(2) or 1)
+            out.setdefault(path, set()).update(range(start, start + count) if count else [max(start, 1)])
+    return out
+
+
+def touches(lines: set, start: int, end: int) -> bool:
+    return not lines.isdisjoint(range(start, end + 1))
+
+
+def tool_python(name: str) -> Optional[Path]:
+    """工具 .venv 里的 python（不调工具的入口脚本：.venv 不在时它会拿 PATH 上的 python3 现建一个，macOS 上是 3.9，建不成）。"""
+    py = TOOLS_DIR / name / ".venv" / "bin" / "python"
+    return py if os.access(py, os.X_OK) else None
+
+
+def cannot_measure(why: str) -> dict:
+    return {"ok": False, "error": f"测不了：{why}"}
+
+
+QUALITY_SKIPPED = {"ok": False, "skipped": True, "reason": QUALITY_OFF_REASON}
+
+
+def crap_spans(py: Path, wt: str, files: list) -> dict:
+    """跑 CRAP_SPANS_SCRIPT；跑不了抛 DroverError（原因里带输出尾部）。"""
+    p = run([str(py), "-I", "-c", CRAP_SPANS_SCRIPT], cwd=wt, timeout=300,
+            input_text=json.dumps({"root": wt, "files": files}),
+            env={"TREE_SITTER_LANGUAGE_PACK_CACHE_DIR": str(TOOLS_GRAMMARS)})
+    if p.returncode == 0:
+        with contextlib.suppress(ValueError):
+            return json.loads(p.stdout)
+    raise DroverError(f"crapper 出错（退出码 {p.returncode}）：{tail(p.stderr or p.stdout, 400)}")
+
+
+def base_complexity(py: Path, wt: str, base: str, paths: list) -> dict:
+    """base 上这几个文件里各函数的圈复杂度：{(路径, namespace, 名字): 复杂度}；base 上没有的文件跳过。"""
+    files = []
+    for path in paths:
+        old = git_bytes(wt, "show", f"{base}:{path}")
+        if old.returncode == 0:
+            files.append({"side": "base", "path": path, "source": old.stdout.decode(errors="replace")})
+    found: dict = {}
+    for f in crap_spans(py, wt, files)["functions"] if files else []:
+        key = (f["path"], f["namespace"], f["name"])
+        found[key] = max(found.get(key, 0), f["complexity"])
+    return found
+
+
+def touched_functions(py: Path, wt: str, changed: dict) -> tuple:
+    """(这次改动碰到的函数, crapper 不分析的文件)。"""
+    paths = sorted(p for p in changed if (Path(wt) / p).is_file())
+    if not paths:
+        return [], []
+    head = crap_spans(py, wt, [{"side": "head", "path": p} for p in paths])
+    return [f for f in head["functions"] if touches(changed[f["path"]], f["start_line"], f["end_line"])], head["skipped"]
+
+
+def split_by_base(heavy: list, before: dict) -> tuple:
+    """新函数、或者比 base 上同名函数（同文件、同 namespace）更复杂的 → 第一组；本来就这么复杂的 → 第二组。"""
+    over, known = [], []
+    for f in heavy:
+        old = before.get((f["path"], f["namespace"], f["name"]))
+        row = {"path": f["path"], "name": f["name"], "namespace": f["namespace"],
+               "lines": f"{f['start_line']}-{f['end_line']}", "complexity": f["complexity"], "base_complexity": old}
+        (over if old is None or f["complexity"] > old else known).append(row)
+    return over, known
+
+
+def complexity_check(wt: str, base: str, changed: Optional[dict]) -> dict:
+    """条目验收：这次改动碰到的函数里圈复杂度 ≥ 阈值的。over（新函数或比 base 更复杂）要 worker 拆或写理由；
+    already_complex（本来就这么复杂、这次没变得更复杂）只作参考。changed 是 None：开关关着。"""
+    if changed is None:
+        return dict(QUALITY_SKIPPED)
+    py = tool_python("crapper")
+    if not py:
+        return cannot_measure(f"crapper 没装（{home_path(TOOLS_DIR / 'crapper')}；重跑 install 或 drover update 会补装）")
+    try:
+        touched, skipped = touched_functions(py, wt, changed)
+        heavy = [f for f in touched if f["complexity"] >= COMPLEXITY_THRESHOLD]
+        before = base_complexity(py, wt, base, sorted({f["path"] for f in heavy}))
+    except DroverError as exc:
+        return cannot_measure(exc.message)
+    over, known = split_by_base(heavy, before)
+    return {"ok": True, "threshold": COMPLEXITY_THRESHOLD, "changed_functions": len(touched), "over": over,
+            "already_complex": known, "skipped_files": skipped}
+
+
+def dry_candidates(text: str, wt: str) -> list:
+    """dry.edn → [(分数, (路径, 起, 止), (路径, 起, 止))]；路径换成相对 worktree 的。认不出格式抛 DroverError。"""
+    def rel(path: str) -> str:
+        path = re.sub(r"\\(.)", r"\1", path)
+        return os.path.relpath(path, wt) if path.startswith(wt + os.sep) else path
+    found = [(float(m.group(1)), (rel(m.group(2)), int(m.group(3)), int(m.group(4))),
+              (rel(m.group(5)), int(m.group(6)), int(m.group(7)))) for m in DRY_CANDIDATE_RE.finditer(text)]
+    if len(found) != text.count("{:score "):
+        raise DroverError("dryer 的结果格式认不出（换了版本？）")
+    return found
+
+
+def duplicates_check(wt: str, changed: Optional[dict], lock: bool) -> dict:
+    """集成检查：dryer 扫全仓（经 heavy 调度），只留至少一边碰到这次改动行的重复对（要么合并、要么写理由）。
+    --root 放临时目录：dry.edn 写在那里，worktree 里什么都不写；扫描路径给 worktree 的绝对路径。changed 是 None：开关关着。"""
+    if changed is None:
+        return dict(QUALITY_SKIPPED)
+    py = tool_python("dryer")
+    if not py:
+        return cannot_measure(f"dryer 没装（{home_path(TOOLS_DIR / 'dryer')}；重跑 install 或 drover update 会补装）")
+    with tempfile.TemporaryDirectory(prefix="drover-dryer-") as root:
+        res = heavy_run([str(py), "-m", "dryer", "--root", root, "--threshold", DUP_THRESHOLD, wt], wt, lock=lock,
+                        timeout=DRYER_TIMEOUT, env={**os.environ, "TREE_SITTER_LANGUAGE_PACK_CACHE_DIR": str(TOOLS_GRAMMARS)})
+        edn = Path(root) / ".metrics" / "dry.edn"
+        text = edn.read_text(errors="replace") if edn.is_file() else ""  # 没有源文件时 dryer 不写它
+    if res["exit_code"] != 0:
+        return cannot_measure(f"dryer 出错（退出码 {res['exit_code']}）：{tail(res.get('error') or res['output'], 400)}")
+    try:
+        found = dry_candidates(text, wt)
+    except DroverError as exc:
+        return cannot_measure(exc.message)
+    pairs = [{"score": round(score, 2), "left": f"{a[0]}:{a[1]}-{a[2]}", "right": f"{b[0]}:{b[1]}-{b[2]}"}
+             for score, a, b in found if any(touches(changed.get(s[0], set()), s[1], s[2]) for s in (a, b))]
+    out = {"ok": True, "threshold": float(DUP_THRESHOLD), "candidates": len(found), "pairs": pairs,
+           "seconds": res.get("seconds")}
+    if res.get("lock_waited_seconds"):
+        out["lock_waited_seconds"] = res["lock_waited_seconds"]
+    return out
+
+
+def verify_with_duplicates(wt: str, jobs: list, a: argparse.Namespace, changed: Optional[dict]) -> tuple:
+    """(验证命令的结果, dryer 的结果)。集成检查时 dryer 和验证命令同时交给 heavy 调度（扫全仓要一阵子，大仓库单核 85 秒）；
+    改动行在这之前就算好了。条目验收不跑 dryer，第二项是 None。"""
+    if not a.integration:
+        return run_verifies(wt, jobs, a.verify_timeout, lock=not a.no_lock, serial=a.serial), None
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        dup = pool.submit(duplicates_check, wt, changed, not a.no_lock)
+        verify = run_verifies(wt, jobs, a.verify_timeout, lock=not a.no_lock, serial=a.serial)
+    return verify, dup.result()
+
+
 def cmd_accept(a: argparse.Namespace) -> dict:
     heavy_install_signals()  # 被中断时把在跑的建图 / 验证命令的进程树一起结束
     wt = str(Path(a.wt).resolve())
@@ -7035,9 +7237,11 @@ def cmd_accept(a: argparse.Namespace) -> dict:
         refresh_error = exc.message
 
     graph: dict = {"ok": False}
-    if a.no_graph:
+    if a.no_graph or a.integration:
         # 集成检查不建图：图谱结论（风险、无测试覆盖的函数）只在条目验收时用，大仓库建一次要 30–60 秒。
-        graph = {"ok": False, "skipped": True, "reason": "--no-graph：这次验收没建图（集成检查用不到图谱）"}
+        graph = {"ok": False, "skipped": True,
+                 "reason": "--integration：集成检查不建图（图谱结论只在条目验收时用）" if a.integration
+                 else "--no-graph：这次验收没建图（集成检查用不到图谱）"}
     elif not shutil.which("code-review-graph"):
         graph["error"] = "找不到 code-review-graph 命令"
     else:
@@ -7082,10 +7286,16 @@ def cmd_accept(a: argparse.Namespace) -> dict:
     }
     if refresh_error:
         result["index_refresh_error"] = refresh_error
+    # 复杂度（条目验收，crapper）、重复（集成检查，dryer）：按这次改动的行筛；没装、出错只报"测不了"，不挡验收。
+    changed = changed_lines(wt, a.base) if quality_tools_enabled() else None
+    if not a.integration:
+        result["complexity"] = complexity_check(wt, a.base, changed)
     # 最后才重跑验证命令：测试可能生成缓存等文件，不能让它们混进上面的状态和 diff。
     # 任一条失败 ok 仍为 true（脚本本身没出错），由 verify_failed 表示验收不通过。
     jobs = [(cmd, None) for cmd in a.verify] + [(cmd, a.base) for cmd in a.verify_baseline]
-    result["verify"] = run_verifies(wt, jobs, a.verify_timeout, lock=not a.no_lock, serial=a.serial)
+    result["verify"], duplicates = verify_with_duplicates(wt, jobs, a, changed)
+    if a.integration:
+        result["duplicates"] = duplicates
     result["verify_failed"] = any(not v["ok"] for v in result["verify"])
     if a.save:
         # review 子命令从这里取图谱摘要和验证结果，编排者不必再手抄一遍。
@@ -7124,10 +7334,27 @@ def brief_graph(graph: dict) -> dict:
     return {"ok": False, "error": graph.get("error")}
 
 
+def brief_complexity(c: dict) -> dict:
+    """复杂度摘要：要处理的（over）逐个列，只作参考的、不分析的只给个数；跳过、测不了原样。"""
+    if not c.get("ok"):
+        return c
+    over = [f"{r['path']}:{r['lines']} {r['name']} 圈复杂度 {r['complexity']}"
+            + (f"（base 上 {r['base_complexity']}）" if r["base_complexity"] is not None else "（新函数）") for r in c["over"]]
+    return {"ok": True, "threshold": c["threshold"], "over": over, "already_complex": len(c["already_complex"]),
+            "skipped_files": len(c["skipped_files"])}
+
+
+def brief_duplicates(d: dict) -> dict:
+    if not d.get("ok"):
+        return d
+    return {"ok": True, "threshold": d["threshold"], "candidates": d["candidates"],
+            "pairs": [f"{p['score']} {p['left']} ↔ {p['right']}" for p in d["pairs"]]}
+
+
 def accept_brief(result: dict) -> dict:
     """accept 的摘要视图：完整结果在 --save 的文件里，屏幕上只留判断要用的字段，避免撑大调用方的上下文。"""
     status = result.get("status_porcelain", [])
-    return {
+    out = {
         "ok": result.get("ok"),
         "saved_to": result.get("saved_to"),
         "head": result.get("head"),
@@ -7139,6 +7366,10 @@ def accept_brief(result: dict) -> dict:
         "verify": [brief_verify(v) for v in result.get("verify", [])],
         "verify_failed": result.get("verify_failed"),
     }
+    for key, brief in (("complexity", brief_complexity), ("duplicates", brief_duplicates)):
+        if key in result:
+            out[key] = brief(result[key])
+    return out
 
 
 def cmd_accept_summary(a: argparse.Namespace) -> dict:
@@ -7881,19 +8112,28 @@ def rev_commit(repo: str, rev: Optional[str]) -> Optional[str]:
     return p.stdout.strip() if p.returncode == 0 else None
 
 
-def config_refs_from_diff(diff: str) -> list:
-    """git diff -U0 里新增行（+ 开头，不是 +++ 文件头）的环境变量 / 配置键引用：[{key, file, via}]。删除行不看。"""
-    refs, current, in_header = [], None, False
+def diff_body(diff: str):
+    """git diff 输出里每个文件头之后的行：(新文件路径, 这一行)，@@ 行也在内。整个文件删了（+++ /dev/null）路径是 None。
+    路径里有空格时 git 在 +++ 行末尾加一个 tab（给 GNU patch 认），去掉它。"""
+    current, in_header = None, False
     for raw in diff.splitlines():
         if raw.startswith("diff --git "):
             current, in_header = None, True
             continue
         if in_header:
             if raw.startswith("+++ "):
-                current = raw[6:] if raw.startswith("+++ b/") else None  # +++ /dev/null：整个文件删了
+                current = raw[6:].rstrip("\t") if raw.startswith("+++ b/") else None
             elif raw.startswith("@@"):
                 in_header = False
+                yield current, raw
             continue
+        yield current, raw
+
+
+def config_refs_from_diff(diff: str) -> list:
+    """git diff -U0 里新增行（+ 开头，不是 +++ 文件头）的环境变量 / 配置键引用：[{key, file, via}]。删除行不看。"""
+    refs = []
+    for current, raw in diff_body(diff):
         if not current or not raw.startswith("+"):
             continue
         text = raw[1:]
@@ -9359,7 +9599,8 @@ def update_install(clone: str, mode: str, hosts: list) -> dict:
     """子进程跑 clone 里的新 install.py --json（每次都跑：幂等，装对的项跳过）。宿主按安装记录传，
     不让它按本机自动判断多装一个宿主；记录里没有就不传。"""
     cmd = [sys.executable, str(Path(clone) / "install.py"), "--json", "--mode", mode, *update_host_args(hosts)]
-    info: dict = {"ok": False, "command": shlex.join(cmd), "changed": [], "changed_keys": [], "failed": [], "notes": []}
+    info: dict = {"ok": False, "command": shlex.join(cmd), "changed": [], "changed_keys": [], "failed": [], "warned": [],
+                  "notes": []}
     out, err = run_json_cmd(cmd, UPDATE_INSTALL_TIMEOUT)
     if out is None:
         info["error"] = err
@@ -9372,6 +9613,8 @@ def update_install(clone: str, mode: str, hosts: list) -> dict:
             info["changed_keys"].append(s.get("key"))
         if result.startswith(("失败", "没法处理")):
             info["failed"].append({"key": s.get("key"), "label": s.get("label"), "result": result})
+        if result.startswith("警告"):  # 没做成但只记警告（验收工具装不上）：不算失败，原因在 notes
+            info["warned"].append(s.get("label"))
     info["notes"] = out.get("notes") or []
     info["ok"] = bool(out.get("ok"))
     if out.get("error"):
@@ -9535,6 +9778,8 @@ def update_text(res: dict) -> list:
         line = "安装：没改动" if inst["failed"] else "安装：都已是最新"
     if inst["failed"]:
         line += "；失败：" + "；".join(f"{f['label']}（{tail(f['result'], 120)}）" for f in inst["failed"])
+    if inst.get("warned"):
+        line += f"；只记警告（不影响使用）：{'、'.join(inst['warned'])}"
     lines.append(line)
     chk = res["check"]
     if chk["ok"]:
@@ -10262,7 +10507,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "没有新增就算通过。vitest / pytest / eslint 在基线上只重跑当前失败所在的文件（BASE 上没有的文件直接算新增），"
                         "tsc 和拆不出文件的命令跑整条；基线结果按仓库 + BASE + 命令 + 文件缓存")
     p.add_argument("--no-graph", action="store_true",
-                   help="不建图（graph 记为 skipped）：集成检查用，图谱结论只在条目验收时用")
+                   help="不建图（graph 记为 skipped）。集成检查改用 --integration（它也不建图）")
+    p.add_argument("--integration", action="store_true",
+                   help="集成检查：不建图、不跑 crapper；dryer 扫全仓（和 verify 同时交给 heavy 调度），只留至少一边碰到这次"
+                        "改动行的重复对，进 duplicates。不带时是条目验收：crapper 只算复杂度，这次改动碰到的函数里圈复杂度 ≥ "
+                        f"{COMPLEXITY_THRESHOLD} 的进 complexity。两个工具没装、出错都只报\"测不了\"，不挡验收；config 的 "
+                        "quality_tools 是 false 时都不跑")
     p.add_argument("--save", help="把结果另存为 JSON（review 从 ~/.drover/<slug>/accept.json 取图谱摘要和验证结果）")
     p.add_argument("--brief", action="store_true",
                    help="只打印摘要（文件数、图谱结论、verify 结果和测试计数）；完整结果看 --save 的文件。建议和 --save 一起用")

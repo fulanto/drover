@@ -347,7 +347,8 @@ class BriefCodingRulesTests(PlaybookTestBase):
         for name in UB_MODE_DROPPED:
             self.assertNotIn(name, raw)
         self.assertIn("写不出诚实的测试，就不写坏测试，在报告里说明", body)
-        self.assertIn("CRAP < 10、相似度 ≥ 0.8 的重复要消掉、变异测试的存活者要杀掉", body)
+        self.assertIn("drover 默认装了 unclebob/crapper、dryer，验收时自动跑", body)
+        self.assertIn("手动跑的按原阈值：CRAP < 10、变异测试的存活者要杀掉", body)
         self.assertNotIn("\n## ", body)
         self.assertNotIn("npmmirror", body)
         self.assertNotIn("<!--", body)
