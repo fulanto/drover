@@ -2367,7 +2367,8 @@ def deps_record(ctx: Ctx, old: dict) -> dict:
 
 
 def plan_state(ctx: Ctx) -> Step:
-    """安装记录放在最后一项：run 时前面各项已经执行完，ctx 里有这次新建的文件和加的规则。"""
+    """安装记录放在 drover 自己的各项的最后：run 时它们已经执行完，ctx 里有这次新建的文件和加的规则。后面只剩验收工具，
+    它们不进记录。"""
     def run() -> None:
         data = merged_state(ctx)
         data["updated_at"] = datetime.datetime.now().isoformat(timespec="seconds")
@@ -2411,12 +2412,10 @@ def plan_workspace_location(ctx: Ctx) -> Step:
 
 
 def build_plan(ctx: Ctx) -> list:
-    # 依赖放最前面，按这个顺序：（装依赖的目录不在 PATH 里时）把它加进 shell 配置 → herdr → 选定宿主缺的命令行 → 验收工具要的
-    # uv / Python 3.11+ → crapper、dryer → 接飞书时的 Node → drover 自己的各项。缺 herdr / Node 时先装（或问你），后面用到它们的
-    # 项等它装完再跑。--check 不列 PATH、herdr 和宿主命令行（在"依赖"那一栏里）。
+    # 外部依赖放最前面，按这个顺序：（装依赖的目录不在 PATH 里时）把它加进 shell 配置 → herdr → 选定宿主缺的命令行 → 接飞书时的
+    # Node；再 drover 自己的各项，最后一项是安装记录；验收工具（uv / Python 3.11+ → crapper、dryer）放在整个计划的最后。缺 herdr /
+    # Node 时先装（或问你），后面用到它们的项等它装完再跑。--check 不列 PATH、herdr 和宿主命令行（在"依赖"那一栏里）。
     steps = [] if ctx.checking else plan_deps(ctx)
-    # 验收工具（宿主无关）：装不上只记警告（StepWarning），不影响退出码。
-    steps += plan_quality_tools(ctx)
     steps.append(plan_oncall_node(ctx))
     has_ws = bool(ctx.workspace)
     steps += [
@@ -2459,13 +2458,16 @@ def build_plan(ctx: Ctx) -> list:
     share_backups(steps)
     if ctx.checking:
         steps.append(plan_chain())
-        return steps
-    state_step = plan_state(ctx)
-    old = {k: v for k, v in ctx.state.items() if k != "updated_at"}
-    if not any(s.run for s in steps) and merged_state(ctx) == old:
-        state_step.state, state_step.action, state_step.run = "已是最新", "无需改动", None
-    steps.append(state_step)
-    return steps
+    else:
+        state_step = plan_state(ctx)
+        old = {k: v for k, v in ctx.state.items() if k != "updated_at"}
+        if not any(s.run for s in steps) and merged_state(ctx) == old:
+            state_step.state, state_step.action, state_step.run = "已是最新", "无需改动", None
+        steps.append(state_step)
+    # 验收工具（宿主无关）最慢、装不上也只是警告（StepWarning，不影响退出码），放最后，被打断时（drover update 给 install 的时限
+    # 到了）drover 自己的各项已经装好。排在安装记录后面：它们不进记录（--uninstall 整个删 ~/.drover/tools），前面也没有哪一项
+    # 用它们的结果（ctx.tools_python 只有它们自己读），被打断时记录已经写好。
+    return steps + plan_quality_tools(ctx)
 
 
 def do_backup(ctx: Ctx, st: Step) -> None:
@@ -3220,6 +3222,8 @@ EPILOG = """\
   没有的 Node——共用一次同意：交互终端里正式安装前一句 [Y/n] 问完（列出这次要装的几样，直接回车算同意；答 n 只给命令）；
   加 --install-deps 不问直接装；非交互（agent 的 shell、管道、CI、--json，drover update 重跑 install 也是）不装、只给命令。
   都是官方安装脚本、都装在家目录、都不用 sudo；dry-run 里每一样写清要跑的命令、装到哪、改不改 shell 配置。
+  顺序：这几样和 PATH 放在计划最前面（PATH → herdr → claude / codex → Node），再 drover 自己的各项（最后一项是安装记录）；
+  验收工具（见下文"安装布局"末尾）放在整个计划的最后：最慢、装不上也只是警告，放最后，被打断时 drover 自己的各项已经装好。
   测试或内网镜像可以用环境变量换掉安装命令：DROVER_HERDR_INSTALLER、DROVER_CLAUDE_INSTALLER、DROVER_CODEX_INSTALLER、
   DROVER_NODE_INSTALLER（照样交给 sh -c 执行）。
   PATH                 装依赖的目录（~/.local/bin，或 $HERDR_INSTALL_DIR、$CODEX_INSTALL_DIR）不在 PATH 里、这次要往里装东西或者
@@ -3318,7 +3322,7 @@ EPILOG = """\
     多大、多久                           本机有 3.11+：两个工具各约 18MB、十几秒。本机没有 3.11+：再加 drover 自己的 Python 和 uv，
                                          全新环境实测 ~/.drover/tools 共 137MB、安装 114 秒（含 pip、uv 的下载，随网速变）
     装不上（没网、没 Python、pip 失败）只记警告：删掉半截的 .venv，install 退出码不变，验收时报"测不了"；重跑 install 或
-    drover update 会按钉的版本补装。
+    drover update 会按钉的版本补装。这几项排在计划的最后（安装记录之后，它们不进安装记录；--uninstall 整个删 ~/.drover/tools）。
 
 --host 不给时自动判断：PATH 里有 claude 命令、或 ~/.claude 存在 → claude；PATH 里有 codex 命令、或 $CODEX_HOME
   （默认 ~/.codex）存在 → codex；都满足就都装。--check 不给 --host 时按安装记录里的宿主查。

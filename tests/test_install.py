@@ -3135,6 +3135,20 @@ class QualityToolsTests(InstallTestBase):
         verdicts = dict(zip([s["key"] for s in check["steps"]], check["verdicts"]))
         self.assertEqual(verdicts["tool-crapper"], "ok")
 
+    def test_tools_last_in_plan(self) -> None:
+        """验收工具这几项排在整个计划的最后、安装记录之后（按计划顺序执行）：最慢、装不上也只是警告，被打断时 drover 自己的各项
+        （包、CLI 入口、config、settings、hook、飞书插件、路由区块、安装记录）已经装好；--check 里同样排在最后"""
+        tools = ["tools-python", *(f"tool-{n}" for n in QUALITY_TOOL_NAMES)]
+        out = self.install()
+        self.assertTrue(out["ok"], out)
+        keys = [s["key"] for s in out["steps"]]
+        self.assertEqual(keys[-len(tools) - 1:], ["state", *tools])
+        for own in ("pkg", "bin", "config", "claude-settings", "claude-hook", "oncall-plugin", "routing"):
+            self.assertLess(keys.index(own), keys.index("state"), own)
+        self.assertTrue(self.step(out, "state")["result"].startswith("完成"), out)
+        check = [s["key"] for s in self.install_json("--check")["steps"]]
+        self.assertEqual(check[-len(tools):], tools)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
