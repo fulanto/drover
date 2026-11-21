@@ -1,7 +1,8 @@
 """wrapup：收尾汇总的事实。本地裸仓库当 origin，集成记录由真的 integrate / push 写（归档名靠手工改名，和实际做法一样）。
 
   两份集成记录（不同 upstream，一份是归档名）→ 两行；子编排者（parent.json 指向本 slug）的记录带上、行里有 slug；
-  没有集成记录 / 没有状态文件；远端核对 true / true（远端又有新提交，--fetch 后）/ false（远端被改成不含推送的提交）/ 跳过；
+  没有集成记录 / 没有状态文件；远端核对 true / true（远端又有新提交，--fetch 后）/ false（远端被改成不含推送的提交）/ 跳过 /
+  不核对（origin 换了地址，最后一次推的是旧地址）；
   改动文件分类和新增配置键引用（删除行不算）；--draft 骨架和拒绝覆盖；待清理的 worktree / 分支和 dirty。
 """
 
@@ -207,6 +208,21 @@ class WrapupTests(WrapupCase):
         self.assertEqual((r["remote_head"], r["contains"]), (base, False))
         self.assertTrue(any("不含推送的" in w for w in gone["warnings"]), gone["warnings"])
         self.assertEqual(self.wrapup("--no-remote")["lines"][0]["remote"], {"checked": False, "reason": "--no-remote"})
+
+    def test_remote_moved_not_checked(self) -> None:
+        """最后一次推送推到的是 origin 换地址之前的仓库 → 不拿新地址核对：remote.checked 是 false、reason 写明两个地址，
+        没有"不含推送的提交"之类的误报（--fetch 也一样，以前会 fetch 新地址再报不含）；骨架的远端核对那格照 reason 写"""
+        a = self.item("a", {"app/a.py": "A = 1\n"})
+        self.ship("main", a)
+        old = str(self.origin)
+        moved = self.move_origin()
+        draft = self.tmp / "wrapup.md"
+        res = self.wrapup("--fetch", "--draft", str(draft))
+        r = res["lines"][0]["remote"]
+        self.assertFalse(r["checked"])
+        self.assertIn(f"推到的是 {old}，现在 origin 是 {moved}", r["reason"])
+        self.assertFalse(any("不含" in w or "远端核对" in w for w in res["warnings"]), res["warnings"])
+        self.assertIn(f"未核对：{r['reason']}", draft.read_text())
 
     def test_categories_and_config_refs(self) -> None:
         """推送范围里的迁移 / 配置 / 部署 / 依赖文件进各自类别；新增行里的 os.getenv / process.env / @Value / .env 键

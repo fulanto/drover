@@ -3,6 +3,7 @@
   tmp/origin.git    裸仓库（远端）
   tmp/work/shop     源仓库（主检出），条目分支 task/s1-<名字> 都从它的 main 拉
   tmp/upstream      origin 的另一个克隆：模拟别人往上游推提交
+  tmp/moved.git     move_origin 之后 origin 改指的裸仓库：全新历史（换了托管地址、新地址上的历史是重建的）
 集成 worktree 由假 herdr 的 worktree create 建在临时 HOME 的 .herdr/worktrees/shop/ 下。
 """
 
@@ -62,6 +63,17 @@ class IntegrationCase(DroverTestCase):
     def remote_head(self) -> str:
         """独立核对：ls-remote 读远端 main。"""
         return self.git(self.tmp, "ls-remote", str(self.origin), "refs/heads/main").split()[0]
+
+    def move_origin(self) -> Path:
+        """源仓库的 origin 改指另一个裸仓库，它的 main 和原来的没有共同祖先（仓库换了托管地址、新地址上的历史是重建的），
+        返回新仓库的路径。tmp/upstream 还指着原来的 origin。"""
+        moved = self.tmp / "moved.git"
+        self.git(self.tmp, "init", "-q", "--bare", "-b", "main", str(moved))
+        seed = self.tmp / "moved-seed"
+        self.init_repo(seed, {"README.md": "# shop（重建的历史）\n", "app/core.py": "VALUE = 1\n"})
+        self.git(seed, "push", "-q", str(moved), "main")
+        self.git(self.src, "remote", "set-url", "origin", str(moved))
+        return moved
 
     def ssh_origin(self, fail: int, message: str) -> str:
         """装假 ssh（前 fail 次打 message、退出 255，之后在本机执行远端命令），返回经它访问 origin 的地址。"""

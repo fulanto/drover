@@ -44,7 +44,7 @@ class PushTests(IntegrationCase):
 
     def test_patch_mode_push_recorded_without_state(self) -> None:
         """没有集成状态文件（集成 worktree 是 wt 建的，patch 模式）的推送也落盘：任务按分支 task/s1-… 归属，记分支、目标、
-        远端提交、范围、提交列表、时间、是否核对过"""
+        远端和它当时的推送地址、远端提交、范围、提交列表、时间、是否核对过；返回里也有推送地址"""
         wt = Path(self.drover_json("wt", "--repo", str(self.src), "--branch", "task/s1-r2", "--label", "shop:s1-r2",
                                    "--base", "origin/main")["worktree_path"])
         sha = self.commit(wt, "patch round", {"app/p.py": "P = 1\n"})
@@ -52,12 +52,13 @@ class PushTests(IntegrationCase):
         self.assertTrue(res["verified"])
         self.assertNotIn("state_file", res)
         self.assertEqual((res["task"], res["task_from"]), (self.SLUG, "worktree 分支 task/s1-r2"))
+        self.assertEqual(res["remote_url"], str(self.origin))
         rec = self.records()[-1]
-        self.assertEqual({k: rec[k] for k in ("repo", "remote", "target", "upstream", "branch", "worktree_path", "from",
-                                              "remote_sha", "range", "commits", "verified")},
-                         {"repo": str(self.src), "remote": "origin", "target": "main", "upstream": "origin/main",
-                          "branch": "task/s1-r2", "worktree_path": str(wt), "from": self.base0, "remote_sha": sha,
-                          "range": f"{self.base0[:9]}..{sha[:9]}", "commits": [f"{sha[:7]} patch round"],
+        self.assertEqual({k: rec[k] for k in ("repo", "remote", "remote_url", "target", "upstream", "branch",
+                                              "worktree_path", "from", "remote_sha", "range", "commits", "verified")},
+                         {"repo": str(self.src), "remote": "origin", "remote_url": str(self.origin), "target": "main",
+                          "upstream": "origin/main", "branch": "task/s1-r2", "worktree_path": str(wt), "from": self.base0,
+                          "remote_sha": sha, "range": f"{self.base0[:9]}..{sha[:9]}", "commits": [f"{sha[:7]} patch round"],
                           "verified": True})
         self.assertRegex(rec["at"], r"^\d\d-\d\d \d\d:\d\d:\d\d$")
 

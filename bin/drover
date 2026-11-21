@@ -65,6 +65,7 @@ import ctypes
 import ctypes.util
 import difflib
 import fcntl
+import functools
 import hashlib
 import itertools
 import json
@@ -87,6 +88,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import urlsplit
 
 HOME = Path.home()
 # 状态目录放在 ~/.drover 而不是 ~/.claude：~/.claude 是 Claude Code 的配置目录，agent 往里写报告会被强制审批，规则放行不了。
@@ -1244,6 +1246,8 @@ def plan_source_sync(repo: str, base: Optional[str], prefetched: dict) -> tuple:
 # 建了几次无关，所以记在 <slug>/pushes.jsonl（一行一次推送，只追加），不挂在 integrate 状态上：那份一个仓库一份，
 # 重建或换目标分支时整个换掉（以前推两条分支要手工改名归档）。读它的：wt / integrate 定新一轮的起点并核实、cleanup 核实
 # 内容已在推过的远端分支里、wrapup 列提交。旧任务的推送记在 integrate-*.json 的 pushes 里，task_pushes 一起读。
+# 记录里除了 remote 名还记推送时的地址 remote_url：remote 名只是本地别名，仓库换了托管地址以后 origin 指的是另一个仓库，
+# 拿推到旧地址的记录去核实新地址会误报漏推（push_moved）。
 PUSHES_FILE = "pushes.jsonl"
 CARRY_FILE = "carry.jsonl"  # wt --carry 带上上一轮提交的记录：理由、起点、带上的提交
 
@@ -1296,16 +1300,18 @@ def state_pushes(state: dict, source: str) -> list:
 def task_pushes(slug: str) -> list:
     """这个任务的全部推送记录，从旧到新：旧 integrate-*.json（含改名归档的）里的按时间排在前，pushes.jsonl 的按文件顺序
     在后（新代码只写 pushes.jsonl）。同一仓库、同一目标分支、推上去的同一个提交只算一次：归档时复制的、integrate 重建时
-    转进 pushes.jsonl 的都会重复。"""
+    转进 pushes.jsonl 的都会重复。每条带上 record_file：这条是从哪个文件读的（要用户改记录时给出它；转进 pushes.jsonl
+    的记录还带着原来的 source，但它在 pushes.jsonl 里）。"""
     legacy: list = []
     for f in sorted((STATE_HOME / slug).glob("integrate-*.json")):
         with contextlib.suppress(OSError, ValueError):
             state = json.loads(f.read_text())
             if isinstance(state, dict):
-                legacy += state_pushes(state, f.name)
+                legacy += [{**p, "record_file": str(f)} for p in state_pushes(state, f.name)]
     legacy.sort(key=lambda p: str(p.get("at") or ""))
+    jsonl = STATE_HOME / slug / PUSHES_FILE
     seen, out = set(), []
-    for p in legacy + read_jsonl(STATE_HOME / slug / PUSHES_FILE):
+    for p in legacy + [{**p, "record_file": str(jsonl)} for p in read_jsonl(jsonl)]:
         key = (os.path.realpath(p.get("repo") or "/nonexistent"), p.get("upstream"),
                p.get("remote_sha") or p.get("range"))
         if key not in seen:
@@ -1345,9 +1351,71 @@ def pushed_branches(pushes: list) -> list:
             for k, p in last.items()]
 
 
+@functools.lru_cache(maxsize=None)
+def remote_push_url(repo: str, remote: str) -> Optional[str]:
+    """remote 现在的推送地址（git remote get-url --push，git 已展开 insteadOf / pushInsteadOf）；不是 remote 名（比如传的是
+    地址）、这个 remote 已经不在了返回 None。一条命令里不会变，同一个仓库的同一个 remote 只查一次。"""
+    p = git(repo, "remote", "get-url", "--push", remote)
+    return (p.stdout.strip() or None) if p.returncode == 0 else None
+
+
+def remote_url_key(url: str) -> str:
+    """比较地址用：同一个仓库的几种写法比的是主机 + 路径（git@example.com:o/r.git、ssh://git@example.com/o/r、
+    https://example.com/o/r 算同一个）。scheme://[user@]host[:port]/path（ssh、https、git…）和 scp 写法 [user@]host:path
+    （git 的规则：第一个 / 之前有 : 才算）都换成 host/path：去掉协议、用户名、端口，主机转小写，路径大小写不动；
+    file:///abs/path 是 /abs/path，本地路径照原样；最后去掉首尾空白、末尾的 / 和 .git。别的不归一（不查 DNS、不认托管
+    平台的大小写或改名重定向）：对不上的只是不拿那些推送核实、给出提示，不会挡人。"""
+    s = url.strip()
+    if "://" in s:
+        parts = urlsplit(s)
+        s = parts.path if parts.scheme == "file" else f"{parts.hostname or ''}{parts.path}"
+    elif ":" in s.partition("/")[0]:
+        host, _, path = s.partition(":")
+        s = f"{host.rpartition('@')[2].lower()}/{path.lstrip('/')}"
+    return s.rstrip("/").removesuffix(".git")
+
+
+def push_moved(repo: str, p: dict) -> Optional[dict]:
+    """这次推送是不是推到了别处：记录里有推送时的地址 remote_url，而现在这个仓库里同名 remote 的推送地址和它不同（仓库换了
+    托管地址，origin 指的是另一个仓库了），或者这个 remote 已经不在了。是就返回 {remote, remote_url, remote_url_now}（不在了
+    是 None），不是返回 None。没有 remote_url 的旧记录（这个版本之前写的）当作推到现在这个远端，照旧核实。
+    wt / integrate 定新一轮的起点（split_by_remote）和 wrapup 核对远端都按它认。"""
+    old = p.get("remote_url")
+    if not old:
+        return None
+    remote = push_target(p)[0]
+    now = remote_push_url(repo, remote)
+    if now and remote_url_key(now) == remote_url_key(old):
+        return None
+    return {"remote": remote, "remote_url": old, "remote_url_now": now}
+
+
+def split_by_remote(repo: str, pushes: list) -> tuple[list, list]:
+    """(推到现在这个远端的推送记录, 推到别处的 [{at, upstream, remote, remote_url, remote_url_now}])，见 push_moved。"""
+    here, away = [], []
+    for p in pushes:
+        moved = push_moved(repo, p)
+        if moved:
+            away.append({"at": p.get("at"), "upstream": p.get("upstream"), **moved})
+        else:
+            here.append(p)
+    return here, away
+
+
+def remote_now_text(remote: str, url: Optional[str]) -> str:
+    return f"现在 {remote} 是 {url}" if url else f"现在没有 {remote} 这个远端"
+
+
+def moved_text(away: list) -> str:
+    """"推到的是 <旧地址>，现在 <remote> 是 <新地址>"；几组不同的用"；"连起来。"""
+    return "；".join(dict.fromkeys(f"推到的是 {m['remote_url']}，{remote_now_text(m['remote'], m['remote_url_now'])}"
+                                  for m in away))
+
+
 # 新一轮的起点：起点 = 这一轮要推的那条远端分支（fetch 到最新），不是主检出所在的分支；没说推哪条的
 # 按上一轮推的那条起。建之前核实上一轮推到远端的提交在起点里，不过就拒绝建、列出缺的提交，交用户定：--carry 带上这些
-# 提交在新分支上起，或者 --base 指回上一轮的分支接着改。没有推送记录（第一轮）起点照旧。
+# 提交在新分支上起，或者 --base 指回上一轮的分支接着改。没有推送记录（第一轮）起点照旧。推到别处的推送（remote 换过
+# 地址，见 push_moved）不拿来定起点、不拿来核实：那些提交本来就不在新远端里，--carry 会把那边的提交带到现在的仓库。
 ROUND_REUSED = {"status": "skipped", "reason": "复用已有 worktree：没有新起点，不核实"}
 
 def round_default_base(repo: str, pushes: list) -> Optional[str]:
@@ -1374,13 +1442,31 @@ def cherry_plus(repo: str, upstream: str, end: str, begin: str) -> Optional[list
     return [line.split()[1] for line in c.stdout.splitlines() if line.startswith("+ ")]
 
 
+def push_short(repo: str, p: dict, start_sha: str, also: tuple) -> tuple[list, Optional[str]]:
+    """一次推送推上去的提交里起点 start_sha 没有的（git cherry 的 "+"；also 里已有的不算，见 round_check）：(缺的 sha, None)；
+    核实不了返回 ([], 原因)。"""
+    end, begin = push_end(repo, p), push_start(repo, p)
+    if not end or not begin:
+        return [], "推送记录里的提交本地找不到"
+    plus = cherry_plus(repo, start_sha, end, begin)
+    if plus is None:
+        return [], "git cherry 失败"
+    for rev in also:
+        other = cherry_plus(repo, rev, end, begin) if plus else []
+        if other is not None:
+            plus = [s for s in plus if s in other]
+    return plus, None
+
+
 def round_check(repo: str, pushes: list, start: str, remotes: list, also: tuple = ()) -> dict:
-    """起点 start 含不含这个任务上一轮推到远端的提交。参照：start 是 <远端>/<T> 且推过 T 的按 T 自己的推送（同一条分支）；
-    否则（换了分支）按最近一次推送的那条分支。参照里最后一次推上去的提交是 start 的祖先 → 过；否则逐次推送用 git cherry
-    按补丁内容比（挑到别的分支上的也算），剩下的就是缺的。合并提交 git cherry 不比，合并带进来的普通提交照比。
+    """起点 start 含不含这个任务上一轮推到远端的提交（pushes 只含推到现在这个远端的，见 split_by_remote）。参照：start 是
+    <远端>/<T> 且推过 T 的按 T 自己的推送（同一条分支）；否则（换了分支）按最近一次推送的那条分支。参照里最后一次推上去的
+    提交是 start 的祖先 → 过；否则逐次推送用 git cherry 按补丁内容比（挑到别的分支上的也算），剩下的就是缺的。合并提交
+    git cherry 不比，合并带进来的普通提交照比。
     also 是 integrate 接着要摘进来的条目分支（--from）：缺的提交已在其中的（commit 模式一轮推两条分支时，第二条集成的
     就是同一批条目提交；条目 worktree 用 --carry 带上过的）不算缺，integrate 会把它们摘进来。
-    返回 {status: no_records / ok / missing, …}；推送记录里的提交本地找不到时列进 unknown，也算 missing（核实不了）。"""
+    返回 {status: no_records / ok / missing, …}；推送记录里的提交本地找不到时列进 unknown，也算 missing（核实不了）。
+    缺提交、核实不了的推送里没记远端地址的（旧版本写的）列进 no_remote_url：分不清推的是不是现在这个远端，拒绝时多说一段。"""
     if not pushes:
         return {"status": "no_records", "note": "这个任务在这个仓库还没有推送记录（第一轮），起点照旧"}
     rb = remote_branch_of(start, remotes)
@@ -1395,35 +1481,56 @@ def round_check(repo: str, pushes: list, start: str, remotes: list, also: tuple 
     last = push_end(repo, ref[-1])
     if last and is_ancestor(repo, last, start_sha):
         return {**out, "status": "ok", "how": "ancestor"}
-    missing, unknown, seen = [], [], set()
+    missing, unknown, no_url, seen = [], [], [], set()
     for p in ref:
-        end, begin = push_end(repo, p), push_start(repo, p)
-        what = f"{p.get('at')} 推到 {p.get('upstream')} 的 {p.get('range') or p.get('remote_sha')}"
-        if not end or not begin:
-            unknown.append(f"{what}：推送记录里的提交本地找不到")
-            continue
-        plus = cherry_plus(repo, start_sha, end, begin)
-        if plus is None:
-            unknown.append(f"{what}：git cherry 失败")
-            continue
-        for rev in also:
-            other = cherry_plus(repo, rev, end, begin) if plus else []
-            if other is not None:
-                plus = [s for s in plus if s in other]
+        plus, why = push_short(repo, p, start_sha, also)
+        if why:
+            unknown.append(f"{p.get('at')} 推到 {p.get('upstream')} 的 {p.get('range') or p.get('remote_sha')}：{why}")
         for sha in plus:
             if sha not in seen:
                 seen.add(sha)
                 missing.append({"sha": sha, "short": sha[:9], "subject": git_out(repo, "log", "-1", "--format=%s", sha),
                                 "pushed_to": p.get("upstream"), "pushed_at": p.get("at")})
+        if (plus or why) and not p.get("remote_url"):
+            remote = push_target(p)[0]
+            no_url.append({"at": p.get("at"), "upstream": p.get("upstream"), "range": p.get("range"), "remote": remote,
+                           "remote_url_now": remote_push_url(repo, remote), "file": p.get("record_file")})
     if also:
         out["covered_by"] = list(also)
     if not missing and not unknown:
         return {**out, "status": "ok", "how": "patch"}
-    return {**out, "status": "missing", "how": "patch", "missing": missing, "unknown": unknown}
+    return {**out, "status": "missing", "how": "patch", "missing": missing, "unknown": unknown, "no_remote_url": no_url}
+
+
+def round_other_remote(check: dict, away: list) -> tuple[dict, list]:
+    """推到别处的推送（split_by_remote）不拿来核实，列在 round_check 的 other_remote 里。这个仓库的推送全都推到了别处时
+    （round_check 是 no_records）status 是 other_remote：起点按第一轮的规则定。返回 (round_check, 要进 warnings 的话)。"""
+    if not away:
+        return check, []
+    if check["status"] == "no_records":
+        note = f"上一轮{moved_text(away)}：不拿这些推送核实起点，起点按第一轮的规则定"
+        return {**check, "status": "other_remote", "note": note, "other_remote": away}, [note]
+    return {**check, "other_remote": away}, \
+        [f"另有 {len(away)} 次推送{moved_text(away)}：不拿它们核实起点，只核实推到现在这个地址的"]
+
+
+def no_url_note(check: dict) -> str:
+    """缺的提交来自没记远端地址的旧记录（round_check 的 no_remote_url）时，拒绝的报错末尾加的一段：remote 换过地址的话这些
+    提交本来就不在新远端里，--carry 会把那边的提交带到现在的仓库；给记录补上当时的地址，就按推到别处处理、不拿它们核实。"""
+    legacy = check.get("no_remote_url") or []
+    if not legacy:
+        return ""
+    where = "；".join(f"{p['at']} 推到 {p['upstream']}（记在 {p['file']}）" for p in legacy)
+    remotes = "、".join(dict.fromkeys(p["remote"] for p in legacy))
+    now = "；".join(dict.fromkeys(remote_now_text(p["remote"], p["remote_url_now"]) for p in legacy))
+    return (f"。另外，这几次推送是旧版本记的、没记远端地址：{where}。如果 {remotes} 之后换过地址（{now}）、上一轮推的是另一个"
+            "仓库，这些提交本来就不在新远端里，不要 --carry（会把那边的提交带到现在的仓库）：在记录所在的文件里给这几条记录补上 "
+            "\"remote_url\": \"<当时的地址>\" 再重跑，就不拿它们核实了")
 
 
 def round_refusal(check: dict, base_flag: str, synced: bool, carry: Optional[str]) -> DroverError:
-    """核实不过时的报错，写成编排者能直接搬给用户的中文：缺哪几个提交（短 sha + 标题、什么时候推到哪条分支）、两种做法。
+    """核实不过时的报错，写成编排者能直接搬给用户的中文：缺哪几个提交（短 sha + 标题、什么时候推到哪条分支）、两种做法；
+    缺的来自没记远端地址的旧记录时再加一段怎么补（no_url_note，结构化的在 no_remote_url）。
     base_flag 是"在旧分支上接着改"的写法（wt 是 --base <远端>/<分支>，integrate 是 --target <分支>）。"""
     start, against = check["start"], check["against"]
     sha = f"（{check['start_sha'][:9]}）" if check.get("start_sha") else ""
@@ -1443,8 +1550,9 @@ def round_refusal(check: dict, base_flag: str, synced: bool, carry: Optional[str
         choices.insert(0, {"do": "carry", "text": f"带上这些提交在 {start} 上起：重跑加 --carry \"<理由>\"，新 worktree 建好后"
                                                   "先把它们按顺序 cherry-pick 进来（理由记进任务目录的 carry.jsonl）"})
     marks = "①②"
-    text += "。做法交用户定：" + "；".join(f"{marks[i]}{c['text']}" for i, c in enumerate(choices))
-    return DroverError(text, round_check=check, missing=missing, choices=choices)
+    text += "。做法交用户定：" + "；".join(f"{marks[i]}{c['text']}" for i, c in enumerate(choices)) + no_url_note(check)
+    return DroverError(text, round_check=check, missing=missing, choices=choices,
+                       no_remote_url=check.get("no_remote_url", []))
 
 
 def carry_commits(wt: str, slug: str, repo: str, branch: str, check: dict, reason: str) -> list:
@@ -1509,7 +1617,8 @@ def cmd_wt(a: argparse.Namespace) -> dict:
         task_dir(slug)
     elif not slug:
         slug = task_owner(branch, task_slugs())
-    pushes = repo_pushes(task_pushes(slug), repo) if slug else []
+    # 推到别处的（remote 换过地址，见 push_moved）不拿来定起点、不拿来核实，列在 round_check 的 other_remote 里
+    pushes, away = split_by_remote(repo, repo_pushes(task_pushes(slug), repo) if slug else [])
     remotes = git_out(repo, "remote").split()
     base_from = None
     if not existing and base is None and pushes:
@@ -1517,9 +1626,15 @@ def cmd_wt(a: argparse.Namespace) -> dict:
     also = tuple(getattr(a, "round_also", None) or ())  # integrate 接着要摘的条目分支，见 round_check
 
     def check_round(start: str, synced: bool) -> dict:
-        """核实起点；不过就抛错（带了 --carry、缺的提交都找得到时放行，建好后 carry_commits 带上）。"""
-        check = round_check(repo, pushes, start, remotes, also)
-        if check["status"] == "missing" and (not carry or check.get("unknown")):
+        """核实起点，推到别处的推送进 warnings；不过就抛错（带了 --carry、缺的提交都找得到时放行，建好后 carry_commits
+        带上）。--dry-run 按本地记录预测（would_refuse），不报错：实际执行时 fetch 后再核实。"""
+        check, notes = round_other_remote(round_check(repo, pushes, start, remotes, also), away)
+        warnings.extend(notes)
+        refuse = check["status"] == "missing" and (not carry or bool(check.get("unknown")))
+        if a.dry_run:
+            return {**check, "would_refuse": refuse, "note": "按本地记录预测（没 fetch）；实际执行 fetch 后再核实"} \
+                if check["status"] == "missing" else check
+        if refuse:
             against = check["against"]
             raise round_refusal(check, f"--target {against.partition('/')[2]}" if via_integrate else f"--base {against}",
                                 synced, carry)
@@ -1564,11 +1679,7 @@ def cmd_wt(a: argparse.Namespace) -> dict:
             sync, planned, base_ref, warnings = plan_source_sync(repo, base, prefetched)
             cmd = create_cmd(base_ref)
         planned.append("herdr " + shlex.join(cmd))
-        check = round_check(repo, pushes, base_ref, remotes, also) if not reused else ROUND_REUSED
-        if check["status"] == "missing":
-            # 按本地记录预测，不报错：实际执行时 fetch 后再核实，还不过就拒绝建（带 --carry 时建好后先带上缺的提交）
-            check = {**check, "would_refuse": not carry or bool(check.get("unknown")),
-                     "note": "按本地记录预测（没 fetch）；实际执行 fetch 后再核实"}
+        check = check_round(base_ref, False) if not reused else ROUND_REUSED
         return {
             "ok": True, "dry_run": True, "repo": repo, "branch": branch,
             "branch_renamed_from": renamed_from, "reused": reused,
@@ -1640,12 +1751,13 @@ def cmd_wt(a: argparse.Namespace) -> dict:
         # fetch 列出每次 fetch 和尝试次数，remote_default 是本地记录的远端默认分支（如 origin/main）。
         "source_sync": sync,
         # 编排者要在汇报里提一句的事：主目录没更新、worktree 带着没推送的提交、没法判断上游（含上游在远端已删）、
-        # 主目录不在远端默认分支上、--no-sync。
+        # 主目录不在远端默认分支上、--no-sync、上一轮的推送推到了别处（remote 换过地址）。
         "warnings": warnings,
         "copied": copied,
         # 新一轮的起点：task 是推送记录按哪个任务取的（没有就是 null）；base_from 非空表示起点是按推送记录定的；
         # round_check 的 status：no_records（第一轮，起点照旧）、ok（含上一轮推的提交，how 是 ancestor / patch）、
-        # missing（带了 --carry，carried 是带上的提交）、skipped（复用）。
+        # missing（带了 --carry，carried 是带上的提交）、skipped（复用）、other_remote（推送全推到了别处：remote 换过地址，
+        # 起点照第一轮的规则定）；other_remote 列出推到别处的推送（有的推到这里时也在，只核实推到这里的）。
         "task": slug, "base_from": base_from, "round_check": check,
         **({"carried": carried} if carried else {}),
         "note": ("复用了已有 worktree：BASE_SHA 用状态文件里原来记录的，没有记录才用 head_sha 并在汇报里说明。"
@@ -8041,6 +8153,8 @@ def cmd_push(a: argparse.Namespace) -> dict:
                              "note": "HEAD 已经在上游里，没有要推的提交"})
     commits = git_out(wt, "log", "--oneline", f"{upstream}..HEAD").splitlines()
     old = git_out(wt, "rev-parse", "--short=9", upstream)
+    # 推到的地址（remote 名只是本地别名，换了托管地址以后同一个名字指的是另一个仓库，见 push_moved）
+    remote_url = remote_push_url(wt, a.remote)
     ps, push_tries = git_net(wt, "push", a.remote, f"HEAD:{a.target}")
     if ps.returncode != 0:
         raise DroverError(f"git push 失败（试了 {push_tries} 次）", stderr=tail(ps.stderr))
@@ -8048,15 +8162,16 @@ def cmd_push(a: argparse.Namespace) -> dict:
     remote_sha = ls.stdout.split()[0] if ls.returncode == 0 and ls.stdout.strip() else None
     verified = remote_sha == head_before
     result = {"ok": verified, "pushed": True, "range": f"{old}..{head_before[:9]}", "commits": commits,
-              "remote_sha": remote_sha, "head": head_before, "verified": verified,
+              "remote_sha": remote_sha, "head": head_before, "verified": verified, "remote_url": remote_url,
               "tries": {"fetch": tries, "push": push_tries, "ls_remote": ls_tries}}
     if not verified:
         result["error"] = "push 返回成功，但 ls-remote 读到的远端分支不是 HEAD（或没读到）：手动 ls-remote 再核对一次"
     # 推送记录（任务级，见 PUSHES_FILE 上面的说明）：推上去了就记，verified 不是 true 的也记（wrapup 会提醒核对）。
     record = {"at": stamp, "ts": round(time.time(), 3), "repo": str(git_common_dir(wt).parent), "remote": a.remote,
-              "target": a.target, "upstream": upstream, "branch": current_branch(wt), "worktree_path": wt,
-              "from": upstream_sha, "remote_sha": remote_sha, "head": head_before, "range": result["range"],
-              "commits": commits, "verified": verified, **({"state_file": str(state_path)} if state_path else {})}
+              "remote_url": remote_url, "target": a.target, "upstream": upstream, "branch": current_branch(wt),
+              "worktree_path": wt, "from": upstream_sha, "remote_sha": remote_sha, "head": head_before,
+              "range": result["range"], "commits": commits, "verified": verified,
+              **({"state_file": str(state_path)} if state_path else {})}
     append_jsonl(record_file, record)
     result["push_record"] = str(record_file)
     return state_fields(result)
@@ -8226,6 +8341,15 @@ def wrapup_remote(repo: str, upstream: str, pushed: str, fetch: bool) -> dict:
     return out
 
 
+def wrapup_push_remote(repo: str, upstream: str, push: dict, pushed: str, fetch: bool) -> dict:
+    """最后一次推送的远端核对：推到了别处（remote 换过地址，见 push_moved）时不拿现在的地址核对，写明两个地址（拿新地址
+    核对推到旧地址的提交只会误报"远端不含"）；否则 wrapup_remote。"""
+    moved = push_moved(repo, push)
+    if moved:
+        return {"checked": False, "reason": f"{moved_text([moved])}：没拿现在的地址核对"}
+    return wrapup_remote(repo, upstream, pushed, fetch)
+
+
 def wrapup_groups(family: list, warnings: list) -> list:
     """收尾汇总的一行 = 一个任务的一个仓库的一条目标分支（upstream）：推送来自 task_pushes（pushes.jsonl 和旧
     integrate-*.json 的 pushes），同一组的 integrate 状态文件（含改名归档、复制的）附上。返回 [{slug, states, pushes}]。"""
@@ -8335,7 +8459,7 @@ def wrapup_line(g: dict, a: argparse.Namespace, warnings: list) -> dict:
     elif not pushed_sha:
         line["remote"] = {"checked": False, "reason": "没有推送记录" if not pushes else "推送记录里的提交本地找不到"}
     else:
-        r = wrapup_remote(repo, upstream, pushed_sha, a.fetch)
+        r = wrapup_push_remote(repo, upstream, last, pushed_sha, a.fetch)
         line["remote"] = r
         if r.get("contains") is False:
             warnings.append(f"{label}：{r.get('note') or '推送的提交已不在远端分支里'}")
