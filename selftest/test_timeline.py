@@ -22,7 +22,7 @@ import time
 import unittest
 
 from selftest_screens import BASH_DIALOG
-from selftest_support import DROVER
+from selftest_support import DROVER, rollup_digest
 from test_board import API_ERROR, HOUR, MINUTE, NORMAL, SLACK, BoardTestCase
 
 
@@ -205,7 +205,8 @@ class ObserverTimelineTests(TimelineCase):
         waiting = self.rewrite("t-a", "等你决定", 10 * MINUTE)
         self.board("--plain")
         answered = time.time() - 5 * MINUTE
-        (self.state / "t-a" / "answered.json").write_text(json.dumps({"at": answered, "rollup_digest": "x"}))
+        (self.state / "t-a" / "answered.json").write_text(json.dumps(
+            {"at": answered, "rollup_digest": rollup_digest(self.state / "t-a" / "rollup.md")}))
         self.board("--json")
         done = self.rewrite("t-a", "完成（已收尾）", 2 * MINUTE)
         task = self.tasks_json()["t-a"]
@@ -279,6 +280,27 @@ class ObserverTimelineTests(TimelineCase):
         self.assertEqual([(e["since"], e["source"]) for e in stalled], [(round(since, 3), "board")])
         self.assertGreater(stalled[0]["at"], since + 15 * MINUTE)
         self.assertEqual(self.events("t-u", "stalled"), [])
+
+    def test_stalled_more_ways(self) -> None:
+        """停了没更新（时间线、看板"主会话在处理"、watch --main 同一个判定）：没写 rollup 就停了、herdr 报 unknown 也算停着，
+        满 10 分钟记 stalled、看板写"停了 N 分钟没更新"；状态栏挂着后台命令（waiting-background）的，过了 Monitor 的 30 分钟
+        上限才开始算停（起点是挂上之后 30 分钟），挂了 35 分钟不算、45 分钟算（停了 15 分钟）"""
+        self.task("t-n", "orch-n")  # 两小时前派发，没写 rollup
+        self.started("t-n")
+        self.task("t-u", "orch-u", "进行中", age=HOUR)
+        self.task("t-g", "orch-g", "进行中", age=2 * HOUR)
+        self.set_agents(**{"orch-n": {"status": "done", "screen": NORMAL}, "orch-u": {"status": "unknown", "screen": NORMAL},
+                           "orch-g": {"status": "done", "screen": NORMAL.replace("· ← 1 agent", "· 1 shell · ← 1 agent")}})
+        self.stopped("t-n", "orch-n", "done", 12 * MINUTE)
+        self.stopped("t-u", "orch-u", "unknown", 12 * MINUTE)
+        self.stopped("t-g", "orch-g", "waiting-background(1)", 35 * MINUTE)
+        tasks = self.tasks_json()
+        self.assertEqual({s: (t["reason"], len(self.events(s, "stalled"))) for s, t in tasks.items()},
+                         {"t-n": ("停了 12 分钟没更新", 1), "t-u": ("停了 12 分钟没更新", 1), "t-g": (None, 0)})
+        self.stopped("t-g", "orch-g", "waiting-background(1)", 45 * MINUTE)
+        since = json.loads((self.state / "t-g" / "agent-state.json").read_text())["since"]
+        self.assertEqual(self.tasks_json()["t-g"]["reason"], "停了 15 分钟没更新")
+        self.assertEqual([e["since"] for e in self.events("t-g", "stalled")], [round(since + 30 * MINUTE, 3)])
 
     def test_observe_gap(self) -> None:
         """观察中断：观察者每一轮记最后一次看的时间（observe.json），离上次超过 60 秒才在 observe-gaps.jsonl 记一条

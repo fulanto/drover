@@ -17,7 +17,7 @@ import unittest
 from typing import Optional
 
 from selftest_screens import CODEX_QUOTE_WORKING, QUOTE_NAMED, SUBAGENT_DIALOG
-from selftest_support import DROVER, DroverTestCase
+from selftest_support import DROVER, DroverTestCase, rollup_digest
 
 # 写完 rollup 还挂着 Monitor 的编排者（herdr 报 done，屏幕修正成 waiting-background(1)）
 MONITOR = """⏺ 两个 worker 都在干活，等 monitor 的事件。
@@ -349,7 +349,8 @@ class OrchStatusTests(DroverTestCase):
             (d / "orch.json").write_text(json.dumps({"slug": slug, "name": name, "kind": "claude", "parent": None}))
             (d / "rollup.md").write_text(f"# {slug}\n状态：{status}\n{body}")
         self.main_rollup("--slug", "t6")
-        (self.state / "t6" / "answered.json").write_text(json.dumps({"at": time.time() + 5, "rollup_digest": "x"}))
+        (self.state / "t6" / "answered.json").write_text(json.dumps({"at": time.time() - 5,
+                                                                     "rollup_digest": rollup_digest(self.state / "t6" / "rollup.md")}))
         self.set_agents(**{"orch-t1": {"status": "done"}, "orch-t2": {"status": "idle"}, "orch-t5": {"status": "working"},
                            "orch-t6": {"status": "done"}})
         out = self.drover_json("orch-status", "--all")
@@ -364,6 +365,17 @@ class OrchStatusTests(DroverTestCase):
         out = self.drover_json("orch-status", "--all")
         self.assertEqual(out["needs_attention"], ["t2", "t4"])
         self.assertFalse({r["slug"]: r for r in out["orchestrators"]}["t1"]["unread"])
+
+    def test_unread_done_after_exit_needs_attention(self) -> None:
+        """编排者写完"完成"就退出了、主会话还没读（orch-start 派发的，有时间线）→ 进 needs_attention；主会话读过这一版才算收尾完
+        关掉的、不算；装上已读记录之前的老任务（没有时间线）算已读、不算"""
+        self.orch("t1", "orch-t1", "完成")
+        (self.state / "t1" / "timeline.jsonl").write_text(json.dumps({"at": time.time(), "event": "start"}) + "\n")
+        self.orch("t2", "orch-t2", "完成")
+        self.set_agents()
+        self.assertEqual(self.drover_json("orch-status", "--all")["needs_attention"], ["t1"])
+        self.main_rollup("--slug", "t1")
+        self.assertEqual(self.drover_json("orch-status", "--all")["needs_attention"], [])
 
     def test_no_orch_json_no_rows(self) -> None:
         """一个 orch.json 都没有：orchestrators 为空，没有 without_orch_json 键（没有 orch- 开头的活 agent）"""

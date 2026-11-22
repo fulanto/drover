@@ -73,6 +73,114 @@ class WatchMainTests(DroverTestCase):
         path = self.state / slug / "main-watch.json"
         return json.loads(path.read_text()) if path.exists() else {}
 
+    def started(self, slug: str) -> None:
+        """这个任务是 orch-start 派发的（时间线里有派发那条）：装上已读记录之前的老任务没有时间线。"""
+        with open(self.state / slug / "timeline.jsonl", "a") as fh:
+            fh.write(json.dumps({"at": time.time() - 3600, "logged": time.time(), "event": "start", "source": "orch-start"})
+                     + "\n")
+
+    def test_unread_done_after_exit_reported(self) -> None:
+        """编排者写完"完成"就退出、主会话还没读（orch-start 派发的、有时间线）→ 报一次 rollup:完成（不报 gone），重挂不再报；
+        主会话读过这一版才算收尾完关掉的历史任务，什么都不报；读过之后完成又改了 → 照报。装上已读记录之前的老任务（已退出 + 完成、
+        没读过、没有时间线）算已读：不报、不写 main-watch.json"""
+        self.orch("task-d", "orch-d")
+        self.started("task-d")
+        self.rollup("task-d", "完成", "- 推送了")
+        self.orch("task-old", "orch-old")
+        self.rollup("task-old", "完成", "- 很久以前做完的")
+        self.set_agents()
+        self.assertEqual(self.main_watch(), ["EVENT orch-d rollup:完成"])
+        self.assertEqual(self.main_watch(), ["EVENT timeout"])
+        self.main_rollup("--slug", "task-d")
+        self.assertEqual(self.main_watch(), ["EVENT timeout"])
+        self.rollup("task-d", "完成", "- 推送了\n- 补了一句上线步骤", later=2)
+        self.assertEqual(self.main_watch(), ["EVENT orch-d rollup:完成"])
+        self.assertFalse((self.state / "task-old" / "main-watch.json").exists())
+
+    def test_unread_and_dialog_repeat_after_10_minutes(self) -> None:
+        """报过却没处理：rollup 还是未读、同一个弹框还在，满 10 分钟再报一次（30 秒一轮跑 700 秒假时间：0 秒、600 秒各报一次）；
+        旧版本写的 main-watch.json（只有 digest / 指纹、没有报出的时间）从现在起算、不立刻重报，记下的时间满 10 分钟了才报；
+        处理了（读了、弹框没了）就不再报"""
+        self.orch("task-a", "orch-a")
+        self.rollup("task-a", "等你决定", "- 选 A 还是 B")
+        self.orch("task-b", "orch-b")
+        self.rollup("task-b", "进行中")
+        self.set_agents(**{"orch-a": {"status": "done", "screen": NORMAL},
+                           "orch-b": {"status": "blocked", "screen": BASH_DIALOG}})
+        rc, evs, _ = self.watch("--main", "--interval", "30", "--timeout", "700")
+        self.assertEqual((rc, evs), (0, ["EVENT orch-a rollup:等你决定", "EVENT orch-b blocked",
+                                         "EVENT orch-a rollup:等你决定", "EVENT orch-b blocked", "EVENT timeout"]))
+        keys = {"task-a": "rollup_emitted", "task-b": "blocked_fp"}
+        for slug, key in keys.items():
+            (self.state / slug / "main-watch.json").write_text(json.dumps({key: self.main_state(slug)[key]}))
+        self.assertEqual(self.main_watch(), ["EVENT timeout"])
+        for slug in keys:
+            state = self.main_state(slug)
+            for k in [k for k in state if k.endswith("_at")]:
+                state[k] -= 601
+            (self.state / slug / "main-watch.json").write_text(json.dumps(state))
+        self.assertEqual(self.main_watch(), ["EVENT orch-a rollup:等你决定", "EVENT orch-b blocked"])
+        self.main_rollup("--slug", "task-a")
+        self.set_agents(**{"orch-a": {"status": "done", "screen": NORMAL}, "orch-b": {"status": "working", "screen": NORMAL}})
+        rc, evs, _ = self.watch("--main", "--interval", "30", "--timeout", "700")
+        self.assertEqual((rc, evs), (0, ["EVENT timeout"]))
+
+    def test_stalled_same_rule_as_board(self) -> None:
+        """停了没更新和看板、时间线同一套判定：显示状态是进行中（没写 rollup、状态写成别的词的也算）或已转答复，编排者 done / idle /
+        unknown 满 --idle-minutes（默认 10）报 stalled；状态栏挂着后台命令的，过了 Monitor 的 30 分钟上限还挂着，再停满
+        --idle-minutes 也报（第 40 分钟）；接口错误被后台命令盖住时照样报 api-error（接口错误排在后台命令前面）"""
+        self.orch("task-n", "orch-n")  # 没写 rollup 就停了
+        self.orch("task-o", "orch-o")
+        self.rollup("task-o", "已完成")  # 状态写成别的词
+        self.orch("task-u", "orch-u")
+        self.rollup("task-u", "进行中")
+        self.orch("task-g", "orch-g")
+        self.rollup("task-g", "进行中")
+        self.orch("task-e", "orch-e")
+        self.rollup("task-e", "进行中")
+        self.set_agents(**{"orch-n": {"status": "done", "screen": NORMAL}, "orch-o": {"status": "idle", "screen": NORMAL},
+                           "orch-u": {"status": "unknown", "screen": NORMAL}, "orch-g": {"status": "done", "screen": MONITOR},
+                           "orch-e": {"status": "done", "screen": API_ERROR.replace("· ← 1 agent", "· 1 monitor · ← 1 agent")}})
+        rc, evs, _ = self.watch("--main", "--interval", "60", "--timeout", str(45 * 60))
+        self.assertEqual((rc, evs), (0, ["EVENT orch-e api-error", "EVENT orch-n stalled(10m)", "EVENT orch-o stalled(10m)",
+                                         "EVENT orch-u stalled(10m)", "EVENT orch-g stalled(10m)", "EVENT timeout"]))
+
+    def test_gone_again_after_replacement(self) -> None:
+        """编排者意外退出报 gone；同名的编排者换上来（活着）之后又退出 → 再报一次 gone"""
+        self.orch("task-g", "orch-g")
+        self.rollup("task-g", "进行中")
+        self.set_agents()
+        self.assertEqual(self.main_watch(), ["EVENT orch-g gone"])
+        self.set_agents(**{"orch-g": {"status": "working", "screen": NORMAL}})
+        self.assertEqual(self.main_watch(timeout="1"), ["EVENT timeout"])
+        self.set_agents()
+        self.assertEqual(self.main_watch(), ["EVENT orch-g gone"])
+
+    def test_answered_by_content(self) -> None:
+        """转过答复之后 rollup 没变，按内容判断（answered.json 里的 digest），不按修改时间：编排者把 rollup 一字不改重写一遍再停下
+        → 还是已转答复，停满报 stalled；内容改了 → 不算转过答复（等你决定已读，不报）"""
+        self.orch("task-q", "orch-q")
+        self.rollup("task-q", "等你决定", "- 选 A 还是 B")
+        self.main_rollup("--slug", "task-q")
+        digest = json.loads((self.state / "task-q" / "main-seen.json").read_text())["digest"]
+        (self.state / "task-q" / "answered.json").write_text(json.dumps({"at": time.time() - 60, "rollup_digest": digest}))
+        self.rollup("task-q", "等你决定", "- 选 A 还是 B", later=2)  # 原样重写，修改时间在转答复之后
+        self.set_agents(**{"orch-q": {"status": "done", "screen": NORMAL}})
+        rc, evs, _ = self.watch("--main", "--until-event", *FAST, "--timeout", "20", "--idle-minutes", "0.02")
+        self.assertEqual((rc, evs), (0, ["EVENT orch-q stalled(0m)"]))
+        self.rollup("task-q", "等你决定", "- 选 A 还是 B\n- 又多了一个问题", later=4)
+        self.main_rollup("--slug", "task-q")
+        self.assertEqual(self.main_watch("--idle-minutes", "0.02", timeout="5"), ["EVENT timeout"])
+
+    def test_heartbeat_each_round(self) -> None:
+        """watch --main 每一轮写心跳 ~/.drover/main-watch-live.json（pid、at）：看板靠它发现主会话的追踪断了"""
+        rc, evs, secs = self.watch("--main", *FAST, "--timeout", "1")
+        beat = json.loads((self.state / "main-watch-live.json").read_text())
+        self.assertEqual(set(beat), {"pid", "at"})
+        self.assertEqual(beat["pid"], os.getpid())  # 进程里跑
+        self.assertLessEqual(time.time() - 5, beat["at"])
+        self.assertGreater(secs, 0)
+
     def test_quiet_start_prints_nothing(self) -> None:
         """没有新东西：working + 进行中、挂着 Monitor 的 done + 进行中、已读的等你决定 → 不带 --until-event 跑到 timeout，
         整个输出只有 EVENT timeout 一行（启动不再输出当前状态）"""
@@ -141,7 +249,7 @@ class WatchMainTests(DroverTestCase):
         self.assertEqual(self.main_watch(), ["EVENT orch-a rollup:等你决定"])
 
     def test_working_background_in_progress_not_reported(self) -> None:
-        """working、waiting-background（done + 挂着 Monitor）、rollup:进行中 都不报；waiting-background 不计停下的时间"""
+        """working、waiting-background（done + 挂着 Monitor，还没过 Monitor 的 30 分钟上限）、rollup:进行中 都不报"""
         self.orch("task-w", "orch-w")
         self.rollup("task-w", "进行中")
         self.orch("task-m", "orch-m")
@@ -149,7 +257,7 @@ class WatchMainTests(DroverTestCase):
         self.set_agents(**{"orch-w": {"status": "working", "screen": NORMAL},
                            "orch-m": {"status": "done", "screen": MONITOR}})
         self.assertEqual(self.main_watch("--idle-minutes", "0"), ["EVENT timeout"])
-        self.assertNotIn("idle_since", self.main_state("task-m"))
+        self.assertNotIn("stalled_since", self.main_state("task-m"))
 
     def test_same_dialog_once_new_dialog_again(self) -> None:
         """herdr 报 blocked：同一个弹框跨重挂只报一次；换了弹框再报；弹框没了清掉记录，再弹（同一个）又报。
@@ -184,8 +292,8 @@ class WatchMainTests(DroverTestCase):
         self.assertEqual(self.main_watch(), ["EVENT orch-e api-error"])
 
     def test_unexpected_gone_once(self) -> None:
-        """编排者不在 herdr 里：rollup 进行中、没有 rollup → 报 gone 一次（重挂不再报）；rollup 完成的（历史任务）什么都不报；
-        需要换编排者的不报 gone、按未读的 rollup 报"""
+        """编排者不在 herdr 里：rollup 进行中、没有 rollup → 报 gone 一次（重挂不再报）；装上已读记录之前的老任务（rollup 完成、
+        没有时间线）什么都不报；需要换编排者的不报 gone、按未读的 rollup 报"""
         self.orch("task-f", "orch-f")
         self.rollup("task-f", "完成")
         self.orch("task-g", "orch-g")
@@ -217,15 +325,18 @@ class WatchMainTests(DroverTestCase):
         self.assertEqual(self.main_watch("--idle-minutes", "0.02", timeout="20"), ["EVENT orch-s stalled(0m)"])
 
     def test_stalled_after_answer(self) -> None:
-        """等你决定已读、转过答复（answered.json 晚于 rollup）却没更新、编排者 done → 停满报 stalled；
-        假时钟：main-watch.json 里的 idle_since 是一小时前 → 第一轮就报 stalled(60m)。没转过答复的已读等你决定不报"""
+        """等你决定已读、转过答复（answered.json 的 digest 就是现在的内容）却没更新、编排者 done → 停满报 stalled；
+        假时钟：编排者停下（agent-state.json）和转答复都是一小时前 → 第一轮就报 stalled(60m)。没转过答复的已读等你决定不报"""
         self.orch("task-q", "orch-q")
         self.rollup("task-q", "等你决定", "- 选 A 还是 B")
         self.main_rollup("--slug", "task-q")
         self.set_agents(**{"orch-q": {"status": "done", "screen": NORMAL}})
         self.assertEqual(self.main_watch("--idle-minutes", "0"), ["EVENT timeout"])
-        (self.state / "task-q" / "answered.json").write_text(json.dumps({"at": time.time() + 5, "rollup_digest": "x"}))
-        (self.state / "task-q" / "main-watch.json").write_text(json.dumps({"idle_since": time.time() - 3600}))
+        digest = json.loads((self.state / "task-q" / "main-seen.json").read_text())["digest"]
+        hour_ago = time.time() - 3600
+        (self.state / "task-q" / "answered.json").write_text(json.dumps({"at": hour_ago, "rollup_digest": digest}))
+        path = self.state / "task-q" / "agent-state.json"
+        path.write_text(json.dumps({**json.loads(path.read_text()), "since": hour_ago}))
         self.assertEqual(self.main_watch(), ["EVENT orch-q stalled(60m)"])
         self.assertEqual(self.main_watch(), ["EVENT timeout"])
 

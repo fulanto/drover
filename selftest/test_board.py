@@ -56,7 +56,7 @@ from pathlib import Path
 from typing import Optional
 
 from selftest_screens import BASH_DIALOG, PARALLEL_SECOND, PARALLEL_SECOND_BLINK, WEBFETCH, bash_dialog
-from selftest_support import DROVER, DroverTestCase
+from selftest_support import DROVER, DroverTestCase, rollup_digest
 
 NORMAL = """⏺ rollup 已更新。
 
@@ -77,7 +77,8 @@ MINUTE = 60
 SLACK = 30  # 修改时间往前多拨 30 秒：跑到看板时不会跨过分钟 / 小时的边界
 JSON_KEYS = {"slug", "name", "group", "status", "agent_status", "screen_status", "reason", "reasons", "summary",
              "age_minutes", "rollup_mtime", "unread", "answered_after_rollup", "wrapup", "wrapup_reason", "deliverables",
-             "title", "ask", "display_state", "state_since", "state_seconds", "total_seconds", "wrapup_clicked", "note"}
+             "title", "ask", "display_state", "state_since", "state_seconds", "total_seconds", "wrapup_clicked", "note",
+             "tab_id"}
 HEAD_MD = r"^\*\*drover 看板\*\* · \d\d-\d\d \d\d:\d\d · "
 HEAD_PLAIN = r"^drover 看板 · \d\d-\d\d \d\d:\d\d · "
 # 假的 herdr-oncall bin/run-node.sh：不跑 node，记下工作目录和参数，打印 send-reply.json（send-main.mjs 的一行 JSON）。
@@ -94,7 +95,7 @@ class BoardTestCase(DroverTestCase):
              deliver: list = None, wrapup: str = None, title: str = None, ask: str = None, note: str = None) -> None:
         """建一个任务：orch.json；status 不是 None 时写 rollup.md（开头按 dispatch.md 的顺序：状态、标题、摘要、要你做、收尾、
         提醒，再是旧的"## 交付"、各节），修改时间拨到 age 秒前；read 时主会话用 drover rollup 读一遍（已读，main_rollup）；answered_ago 不是 None
-        时写 answered.json（那么多秒前转过答复）。"""
+        时写 answered.json（那么多秒前转过答复，digest 是现在这份 rollup 的：转答复之后 rollup 没变）。"""
         d = self.state / slug
         d.mkdir(parents=True, exist_ok=True)
         (d / "orch.json").write_text(json.dumps({"slug": slug, "name": name, "kind": "claude", "parent": parent,
@@ -113,7 +114,19 @@ class BoardTestCase(DroverTestCase):
             if read:
                 self.main_rollup("--slug", slug)
         if answered_ago is not None:
-            (d / "answered.json").write_text(json.dumps({"at": time.time() - answered_ago, "rollup_digest": "x"}))
+            (d / "answered.json").write_text(json.dumps({"at": time.time() - answered_ago,
+                                                         "rollup_digest": rollup_digest(d / "rollup.md")}))
+
+    def started(self, slug: str) -> None:
+        """这个任务是 orch-start 派发的（时间线里有派发那条）：装上已读记录之前的老任务没有时间线。"""
+        with open(self.state / slug / "timeline.jsonl", "a") as fh:
+            fh.write(json.dumps({"at": time.time() - 2 * HOUR, "logged": time.time(), "event": "start",
+                                 "source": "orch-start"}) + "\n")
+
+    def stopped(self, slug: str, name: str, shown: str, ago: float, seq: int = 0) -> None:
+        """编排者 ago 秒前就停在 shown 上了（agent-state.json，watch --main / 看板记的；seq 要和假 herdr 的一致）。"""
+        (self.state / slug / "agent-state.json").write_text(json.dumps(
+            {"name": name, "shown": shown, "since": time.time() - ago - SLACK, "seq": seq}))
 
     def board(self, *args: str, rc: int = 0) -> str:
         return self.drover("board", *args, rc=rc).stdout
@@ -207,7 +220,7 @@ class BoardGroupTests(BoardTestCase):
         self.task("t-replace", "orch-rep", "需要换编排者", sections={"当前进度": ["- 上下文快满了"]}, age=4 * HOUR, read=True)
         self.task("t-closed", "orch-closed", "完成（已收尾）", age=30 * HOUR)  # 退出了、完成了：不显示
         self.task("t-stall", "orch-stall", "进行中", sections={"当前进度": ["- 跑测试"]}, age=HOUR)
-        (self.state / "t-stall" / "main-watch.json").write_text(json.dumps({"idle_since": time.time() - 20 * MINUTE - SLACK}))
+        self.stopped("t-stall", "orch-stall", "done", 20 * MINUTE)
         self.task("t-dialog", "orch-dialog", "进行中", sections={"当前进度": ["- 改 watch"]}, age=30 * MINUTE)
         self.set_agents(**{"orch-unread": {"status": "done", "screen": NORMAL},
                            "orch-user": {"status": "done", "screen": NORMAL},
@@ -285,9 +298,10 @@ class BoardGroupTests(BoardTestCase):
         """--line：按新的组数任务（等你 / 进行中 / 完成），不读屏幕，herdr agent read 一次都没调、不写 agent-state.json、时间线
         （setUp 里 drover rollup 读过的那几个已经有 main-read 那一条，--line 不往里加）、observe.json"""
         timelines = {p: p.read_text() for p in self.state.glob("*/timeline.jsonl")}
+        agent_states = {p: p.read_text() for p in self.state.glob("*/agent-state.json")}  # setUp 里 t-stall 预先写的那份
         self.assertEqual(self.board("--line").strip(), "drover 等你 2 · 进行中 6 · 完成 1")
         self.assertEqual([c for c in self.herdr_calls() if c[:2] == ["agent", "read"]], [])
-        self.assertEqual(list(self.state.glob("*/agent-state.json")), [])  # 没修正过的状态不记
+        self.assertEqual({p: p.read_text() for p in self.state.glob("*/agent-state.json")}, agent_states)  # 没修正过的状态不记
         self.assertEqual({p: p.read_text() for p in self.state.glob("*/timeline.jsonl")}, timelines)
         self.assertFalse((self.state / "observe.json").exists())
 
@@ -383,7 +397,7 @@ class BoardSinceTests(BoardTestCase):
         "停了 N 分钟没更新"、要换编排者后面不再接 rollup 的时长"""
         self.task("t-a", "orch-a", "等你决定", sections={"需要你决定": ["- 选 A 还是 B"]}, age=15 * MINUTE)
         self.task("t-s", "orch-s", "进行中", sections={"当前进度": ["- 跑测试"]}, age=HOUR)
-        (self.state / "t-s" / "main-watch.json").write_text(json.dumps({"idle_since": time.time() - 25 * MINUTE - SLACK}))
+        self.stopped("t-s", "orch-s", "idle", 25 * MINUTE, seq=4)
         self.task("t-r", "orch-r", "需要换编排者", age=40 * MINUTE, read=True)
         self.set_agents(**{"orch-a": {"status": "done", "seq": 3, "screen": WEBFETCH},
                            "orch-s": {"status": "idle", "seq": 4, "screen": NORMAL},
@@ -400,8 +414,8 @@ class BoardSinceTests(BoardTestCase):
         unknown；reason 是各个 text 用"、"连起来，age_minutes 照旧是 rollup 的；转过答复的（编排者在做）也有一项"""
         self.task("t-a", "orch-a", "等你决定", sections={"需要你决定": ["- 选 A 还是 B"]}, age=15 * MINUTE)
         self.task("t-s", "orch-s", "进行中", age=HOUR)
-        idle_since = time.time() - 25 * MINUTE - SLACK
-        (self.state / "t-s" / "main-watch.json").write_text(json.dumps({"idle_since": idle_since}))
+        self.stopped("t-s", "orch-s", "idle", 25 * MINUTE, seq=4)
+        idle_since = round(self.agent_state("t-s")["since"], 3)  # 停下的起点取到毫秒，同时间线（stall_since）
         self.task("t-r", "orch-r", "需要换编排者", age=40 * MINUTE, read=True)
         self.task("t-g", "orch-g", "进行中", age=HOUR)
         self.task("t-q", "orch-q", "受阻", age=HOUR, read=True, answered_ago=5 * MINUTE)
@@ -426,7 +440,7 @@ class BoardSinceTests(BoardTestCase):
                                                     "since": self.agent_state("t-g")["since"],
                                                     "since_source": "agent-state"}])
         self.assertEqual(tasks["t-s"]["reasons"], [{"kind": "stalled", "text": "停了 25 分钟没更新", "since": idle_since,
-                                                    "since_source": "main-watch"}])
+                                                    "since_source": "agent-state"}])
         self.assertEqual([(r["kind"], r["since_source"]) for r in tasks["t-r"]["reasons"]], [("replace", "rollup")])
         self.assertEqual((tasks["t-q"]["group"], tasks["t-q"]["reasons"][0]["kind"], tasks["t-q"]["reasons"][0]["text"],
                           tasks["t-q"]["reasons"][0]["since_source"]), ("orch", "answered", "已转答复，等它接着做", "answered"))
@@ -434,6 +448,56 @@ class BoardSinceTests(BoardTestCase):
 
 
 class BoardOutputTests(BoardTestCase):
+    def test_unread_done_stays_until_read(self) -> None:
+        """完成、主会话还没读：编排者已退出的（orch-start 派发、有时间线）照样留在看板，"主会话在处理"写未读、不写编排者已退出；
+        编排者还开着的不能一键收尾：wrapup 是 hold、wrapup_reason "结论还没转达"、不在 wrapup_ready，收尾格"先别：结论还没转达"、
+        没有"全部收尾"。主会话读过之后：退出的那个才算收尾完关掉（不显示），开着的能收尾。装上已读记录之前的老任务（已退出 +
+        完成、没读过、没有时间线）算已读，不显示"""
+        self.task("t-exit", "orch-exit", "完成", summary="推送了", wrapup="可以", age=HOUR)
+        self.started("t-exit")
+        self.task("t-live", "orch-live", "完成", summary="也推送了", wrapup="可以", age=HOUR)
+        self.task("t-old", "orch-old", "完成", age=30 * HOUR)
+        self.set_agents(**{"orch-live": {"status": "idle", "screen": NORMAL}})
+        out = json.loads(self.board("--json"))
+        tasks = {t["slug"]: t for t in out["tasks"]}
+        self.assertEqual(sorted(tasks), ["t-exit", "t-live"])
+        self.assertEqual((tasks["t-exit"]["group"], tasks["t-exit"]["reason"]), ("main", "新的完成（未读，1 小时前写的）"))
+        self.assertEqual((tasks["t-live"]["wrapup"], tasks["t-live"]["wrapup_reason"]), ("hold", "结论还没转达"))
+        self.assertEqual(out["wrapup_ready"], [])
+        md = self.board()
+        self.assertIn("| t-live | 也推送了 | 无 | 1 小时 | t-live | 先别：结论还没转达 |", md)
+        self.assertNotIn("全部收尾", md)
+        self.main_rollup("--slug", "t-exit")
+        self.main_rollup("--slug", "t-live")
+        out = json.loads(self.board("--json"))
+        self.assertEqual(([t["slug"] for t in out["tasks"]], out["wrapup_ready"]), (["t-live"], ["t-live"]))
+
+    def test_json_tab_id(self) -> None:
+        """--json 每个任务带 tab_id：orch.json 里编排者所在的 tab（主会话收尾、换编排者时直接 herdr tab close 它）；旧的
+        orch.json 没有这个键是 null"""
+        self.task("t-a", "orch-a", "进行中")
+        meta = self.state / "t-a" / "orch.json"
+        meta.write_text(json.dumps({**json.loads(meta.read_text()), "tab_id": "w9:t3"}))
+        self.task("t-b", "orch-b", "进行中")
+        self.set_agents(**{"orch-a": {"status": "working", "screen": NORMAL}, "orch-b": {"status": "working", "screen": NORMAL}})
+        tasks = self.tasks_json()
+        self.assertEqual((tasks["t-a"]["tab_id"], tasks["t-b"]["tab_id"]), ("w9:t3", None))
+
+    def test_answered_by_content(self) -> None:
+        """"转过答复、rollup 还没更新"按内容比（answered.json 记的 digest），不按修改时间：编排者把 rollup 原样重写（修改时间
+        在转答复之后）→ 还是已转答复；改了内容 → 不算（等你决定，已读）"""
+        self.task("t-q", "orch-q", "等你决定", sections={"需要你决定": ["- 选 A 还是 B"]}, age=HOUR, read=True,
+                  answered_ago=5 * MINUTE)
+        path = self.state / "t-q" / "rollup.md"
+        path.write_text(path.read_text())  # 原样重写：修改时间是现在
+        self.set_agents(**{"orch-q": {"status": "done", "screen": NORMAL}})
+        task = self.tasks_json()["t-q"]
+        self.assertEqual((task["display_state"], task["answered_after_rollup"]), ("已转答复", True))
+        path.write_text(path.read_text() + "- 又多了一个问题\n")
+        self.main_rollup("--slug", "t-q")
+        task = self.tasks_json()["t-q"]
+        self.assertEqual((task["display_state"], task["answered_after_rollup"]), ("等你决定", False))
+
     def test_line_zero_and_empty(self) -> None:
         """--line 为 0 的项不写；一个任务都没有（只有退出了的完成任务）→ "drover 无任务"，看板写"没有任务\""""
         self.task("t-old", "orch-old", "完成", age=HOUR)
@@ -1629,16 +1693,30 @@ class BoardPaneTests(BoardTestCase):
         return [c for c in self.herdr_calls() if c[:2] == ["agent", "rename"]]
 
     def test_live_reregisters_unnamed_main_pane(self) -> None:
-        """--live 每一轮：board-pane.json 记的主会话 pane 里的 agent 还在、没有名字（Codex /new 之后 herdr 清掉了），herdr 里
-        也没有别的 drover → 补登记成 drover，看板上留一行"已补登记主会话"；下一轮已经有名字了，不再改"""
+        """--live 每一轮：board-pane.json 记的主会话 pane 里的 agent 还在、没有名字（Codex /new 之后 herdr 清掉了）、工作目录是
+        主工作台，herdr 里也没有别的 drover → 补登记成 drover，看板上留一行"已补登记主会话"；下一轮已经有名字了，不再改"""
         (self.state / "board-pane.json").write_text(json.dumps({"pane_id": "w1:p101", "main_pane_id": "w1:p1"}))
-        self.set_panes({"w1:p1": {"agent": "codex", "tab_id": "w1:t1"}})
+        self.set_panes({"w1:p1": {"agent": "codex", "tab_id": "w1:t1", "cwd": str(self.work)}})
         out = self.live()
         self.assertEqual(self.renames(), [["agent", "rename", "w1:p1", "drover"]])
         self.assertEqual(self.herdr_state()["panes"]["w1:p1"]["name"], "drover")
         self.assertRegex(out, r"已补登记主会话（\d\d:\d\d，pane w1:p1）")
         self.live()
         self.assertEqual(len(self.renames()), 1)
+
+    def test_live_not_reregister_other_dir(self) -> None:
+        """主会话的 pane 里换成了一个在别的目录（某个仓库）开的、没名字的会话：不是主会话，不补登记（飞书的"提交推送"会送进它）；
+        herdr 没给工作目录的也不补（核实不了）；前台进程的工作目录（foreground_cwd）优先：pane 的 shell 在主工作台、会话在仓库里
+        也不补"""
+        (self.state / "board-pane.json").write_text(json.dumps({"pane_id": "w1:p101", "main_pane_id": "w1:p1"}))
+        repo = self.work / "order-service"
+        repo.mkdir()
+        for pane in ({"agent": "claude", "cwd": str(repo)}, {"agent": "claude"},
+                     {"agent": "claude", "cwd": str(self.work), "foreground_cwd": str(repo)}):
+            with self.subTest(pane=pane):
+                self.set_panes({"w1:p1": {**pane, "tab_id": "w1:t1"}})
+                self.assertNotIn("已补登记", self.live())
+        self.assertEqual(self.renames(), [])
 
     def test_live_leaves_other_names_alone(self) -> None:
         """别的 agent 已经叫 drover（另开了一个主会话）、主会话 pane 里的 agent 名字是别的、pane 里没有 agent、没有
@@ -1654,6 +1732,46 @@ class BoardPaneTests(BoardTestCase):
         self.set_panes({"w1:p1": {}})
         self.live()
         self.assertEqual(self.renames(), [])
+
+
+class BoardNudgeTests(BoardTestCase):
+    """主会话的追踪断了（watch --main 每轮写的心跳 main-watch-live.json 停了），由常驻的看板发现，经飞书插件给主会话送一句
+    "接上"（插件自己在开头加"[看板] "）。"""
+
+    def live(self) -> str:
+        return self.board("--live", "--iterations", "1", "--interval", "0")
+
+    def beat(self, ago: float) -> None:
+        (self.state / "main-watch-live.json").write_text(json.dumps({"pid": 1, "at": time.time() - ago}))
+
+    def test_nudge_once_per_gap(self) -> None:
+        """"主会话在处理"那一行不空、心跳停了 5 分钟以上 → 送一句"接上"，看板上留一行；同一段断档（心跳没变）只送一次；心跳接上
+        又停了（换了一段）再送；没有心跳文件（没跑过 watch --main，比如 Codex 主会话）、心跳还新、"主会话在处理"是空的都不送；
+        插件没装时看板上写没送成和原因"""
+        self.task("t-a", "orch-a", "等你决定", sections={"需要你决定": ["- 选 A 还是 B"]}, age=HOUR)
+        self.set_agents(**{"orch-a": {"status": "done", "screen": NORMAL}})
+        self.beat(6 * MINUTE)
+        self.assertRegex(self.live(), r"主会话的追踪停了 6 分钟，\"接上\"没送成（\d\d:\d\d）：飞书插件没装或版本太旧")
+        root = self.fake_plugin()
+        (self.state / "main-watch-live.json").unlink()
+        self.assertNotIn("主会话的追踪", self.live())
+        self.beat(4 * MINUTE)
+        self.live()
+        self.assertEqual(self.send_calls(root), [])
+        self.beat(6 * MINUTE)
+        out = self.live()
+        want = [str(root), "src/actions/send-main.mjs", "--source", "board", "--text", "接上"]
+        self.assertEqual(self.send_calls(root), [want])
+        self.assertRegex(out, r"主会话的追踪停了 6 分钟，已送\"接上\"（\d\d:\d\d）")
+        self.live()
+        self.assertEqual(len(self.send_calls(root)), 1)
+        self.beat(7 * MINUTE)
+        self.live()
+        self.assertEqual(self.send_calls(root), [want, want])
+        self.main_rollup("--slug", "t-a")
+        self.beat(8 * MINUTE)
+        self.assertNotIn("主会话的追踪", self.live())
+        self.assertEqual(len(self.send_calls(root)), 2)
 
 
 MAIN_PANE = {"name": "drover", "tab_id": "w1:t1", "workspace_id": "w1"}
@@ -1809,7 +1927,7 @@ class BoardTabTests(TabTestCase):
         """--tab 开的看板（board-pane.json 已经收掉了）照样补登记：主会话的 pane 记在 board-tab.json 的 main_pane_id"""
         self.setup_tab()
         state = self.herdr_state()
-        state["panes"]["w1:p1"] = {"agent": "codex", "tab_id": "w1:t1", "workspace_id": "w1"}
+        state["panes"]["w1:p1"] = {"agent": "codex", "tab_id": "w1:t1", "workspace_id": "w1", "cwd": str(self.work)}
         self.set_herdr_state(state)
         self.assertRegex(self.live(), r"已补登记主会话（\d\d:\d\d，pane w1:p1）")
         self.assertEqual(self.calls("agent", "rename"), [["agent", "rename", "w1:p1", "drover"]])
@@ -2405,6 +2523,23 @@ class PromptAnsweredTests(BoardTestCase):
         self.assertEqual(answered["rollup_digest"], d.read_rollup(self.state / "t-a" / "rollup.md")["digest"])
         self.assertTrue(self.prompt(d, "w1")["ok"])
         self.assertEqual([p.parent.name for p in self.state.glob("*/answered.json")], ["t-a"])
+
+    def test_prompt_warns_unread_rollup(self) -> None:
+        """发给顶层编排者之前算一次未读：rollup 在主会话上次读之后又改过（要处理的状态）→ 照发，返回里多一句 warning（先读新版本、
+        确认答复对的是哪一版）；读过的这一版不提醒；子编排者（主会话不读它的 rollup，上层编排者给它发）、worker 不提醒"""
+        self.task("t-a", "orch-a", "等你决定", sections={"需要你决定": ["- 选 A 还是 B"]}, read=True)
+        self.task("t-a-shop", "orch-a-shop", "等你决定", parent="t-a")
+        d = self.load_drover()
+        self.fake_prompt(d, (True, {"agent": {"agent_status": "working"}}))
+        self.assertNotIn("warning", self.prompt(d, "orch-a"))
+        path = self.state / "t-a" / "rollup.md"
+        path.write_text(path.read_text() + "- 又多了一个问题：C 要不要\n")
+        out = self.prompt(d, "orch-a")
+        self.assertTrue(out["ok"])
+        self.assertIn("rollup 在你上次读之后改过", out["warning"])
+        self.assertIn("drover rollup --slug t-a", out["warning"])
+        self.assertNotIn("warning", self.prompt(d, "orch-a-shop"))
+        self.assertNotIn("warning", self.prompt(d, "w1"))
 
 
 if __name__ == "__main__":

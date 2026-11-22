@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib.machinery
 import importlib.util
 import io
@@ -58,6 +59,13 @@ def load_module(name: str):
 def events(stdout: str) -> list:
     """watch 的输出里的 EVENT 行，去掉末尾的 " @时间"。"""
     return [line.split(" @")[0] for line in stdout.splitlines() if line.startswith("EVENT ")]
+
+
+def rollup_digest(path: Path) -> str:
+    """drover 记的 rollup 内容哈希（read_rollup 的 digest：每行去掉首尾空白、删掉空行，再 sha1）。用例写 answered.json 时用：
+    "转过答复之后 rollup 没变"按它比。"""
+    lines = [line.strip() for line in Path(path).read_text().splitlines() if line.strip()]
+    return hashlib.sha1("\n".join(lines).encode(errors="replace")).hexdigest()
 
 
 class FakeClock:

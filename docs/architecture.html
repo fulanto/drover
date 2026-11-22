@@ -1779,7 +1779,7 @@ footer.end { margin-top: 64px; font-size: 13px; color: var(--muted); display: fl
     <div class="role">
       <span class="n">4</span>
       <h3>跨仓总指挥</h3>
-      <p>跨仓任务一个需求只配一个编排者：它定跨仓接口和推送顺序（一般先提供接口的一方、后调用方，迁移在依赖它的代码之前）。某个仓库活太多时起子编排者（<code>orch-start --parent</code>），子编排者也只交 rollup，写“可以推送”后等上层按顺序发“推送”。</p>
+      <p>跨仓任务一个需求只配一个编排者：它定跨仓接口和推送顺序（一般先提供接口的一方、后调用方，迁移在依赖它的代码之前）。某个仓库活太多时起子编排者（<code>orch-start --parent</code>），子编排者也只交 rollup，条目验收通过后停下，等用户要求提交推送、上层按顺序转来带用户原话和目标分支的“提交推送”再做。</p>
     </div>
   </div>
   <div class="cols">

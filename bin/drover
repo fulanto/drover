@@ -2464,7 +2464,7 @@ ORCH_SUB_KICKOFF = """你是任务 {slug} 的「子编排者」，由上层编�
 2. {load_skill}
    参数里有 resume 时，是接手之前的子编排者：先读 ~/.drover/{slug}/dispatch.md 和 rollup.md 恢复进度，按 dispatch.md「子模式」的 resume 接着做，不要从头分析。
 3. request.md 里的「目标」是上层给你的目标（开头是用户的目标），直接用它，不用再复述；每份 worker 任务书（brief --goal）和最终汇报都以它开头。发现行不通或者和其他仓库的约定对不上，把证据写进 {rollup}，状态标「等你决定」后停下。
-4. 之后按 dispatch.md「编排者模式」里「子编排者」一节运行：要决定的事、阶段结论都写进 {rollup}，写完就停下，等上层编排者转达答复（上层读你的 rollup，用户和主会话不直接看）。整体检查通过后在 rollup 写「可以推送」并停下，等上层说「推送」再执行迁移和推送。不要用向用户提问的工具（{ask_tool}）。{model_note}
+4. 之后按 dispatch.md「编排者模式」里「子编排者」一节运行：要决定的事、阶段结论都写进 {rollup}，写完就停下，等上层编排者转达答复（上层读你的 rollup，用户和主会话不直接看）。条目验收通过后在 rollup 写「等上层转达提交推送」并停下；收到上层转达的「提交推送」（写明用户已要求推送、带用户原话和这个仓库的目标分支）再提交、集成、检查、迁移、推送，没带这些的不做、写进 rollup 问上层。不要用向用户提问的工具（{ask_tool}）。{model_note}
 {host_notes}
 {routing}（CLAUDE.md 引用的就是它）的路由规则是给主会话用的，你忽略它。"""
 
@@ -2678,7 +2678,12 @@ ROLLUP_ATTENTION = ("等你决定", "完成", "受阻", "需要换编排者")
 # /clear、重挂 watch 之后就分不清；记到磁盘上，watch --main、board、orch-status 都按它判断。
 MAIN_SEEN_FILE = "main-seen.json"  # 主会话用 drover rollup 读过的那一份：digest、status、规范化后的行、读的时间
 ANSWERED_FILE = "answered.json"  # drover prompt 给编排者发过答复：at、当时 rollup 的 digest
-MAIN_WATCH_FILE = "main-watch.json"  # watch --main 报过什么（去重），重挂不丢
+MAIN_WATCH_FILE = "main-watch.json"  # watch --main 报过什么、什么时候报的（去重、到时间再报），重挂不丢
+# watch --main 每一轮写的心跳（pid、at）。它报出一件事就退出，靠主会话处理完再重挂；那一轮卡在选项框上、被打断、没重挂时，
+# 以前没有任何东西发现（真实时间线：一个"等你决定"380 分钟后才被读到）。常驻的看板看到"主会话在处理"不空、心跳停了
+# MAIN_WATCH_STALE_MINUTES，就给主会话送一句"接上"（board_nudge）。
+MAIN_WATCH_LIVE_FILE = STATE_HOME / "main-watch-live.json"
+MAIN_WATCH_STALE_MINUTES = 5
 # 编排者现在的状态（按屏幕修正后）从什么时候开始：herdr 不给状态开始的时间（agent get
 # 只有 state_change_seq、revision），只能 drover 自己记。watch --main、board 每一轮都记，看板的"卡在确认框 N 分钟"按它算。
 AGENT_STATE_FILE = "agent-state.json"
@@ -2708,7 +2713,7 @@ def read_rollup(path: Path) -> Optional[dict]:
     """读 rollup.md：text、开头的字段 fields、status（"状态："去掉空白）、规范化后的 lines 和 digest、mtime（秒）；
     没有文件返回 None。
     改没改按 digest（规范化内容）判断，不按修改时间：编排者原样重写、只动了空白空行时，
-    以前 watch 会再报一次"等你决定 / 完成"。修改时间只用来展示（rollup_mtime）和比"转过答复之后 rollup 更新没有"。"""
+    以前 watch 会再报一次"等你决定 / 完成"。修改时间只用来展示（rollup_mtime）。"""
     try:
         text = path.read_text()
         mtime = path.stat().st_mtime
@@ -2815,22 +2820,35 @@ def rollup_wrapup(roll: Optional[dict]) -> tuple[bool, Optional[str], bool]:
     return (True, None, False) if roll and roll["status"].startswith("完成") else (False, "还没完成", False)
 
 
+def task_wrapup(roll: Optional[dict], unread: bool) -> tuple[bool, Optional[str]]:
+    """看板的收尾格、一键收尾名单（wrapup_ready）用的 (能不能收尾, 不能的原因)：编排者在 rollup 里说可以（rollup_wrapup），而且
+    主会话读过这一版。还没审、没转达的结论不能被一句"全部收尾"收掉（会删掉用户还没看到结论的任务的 worktree），原因写
+    WRAPUP_UNREAD_REASON；编排者自己写了先别的照它的原因。"""
+    can, hold, _ = rollup_wrapup(roll)
+    return (False, WRAPUP_UNREAD_REASON) if can and unread else (can, hold)
+
+
 def rollup_flags(slug_dir: Path, roll: Optional[dict]) -> tuple[bool, Optional[float]]:
     """(unread, answered_at)。unread：状态要主会话处理，内容又和主会话用 drover rollup 读过的（main-seen.json）不同；
-    answered_at：drover prompt 给编排者发过答复（answered.json）、时间晚于 rollup 的修改时间时是那个时间（转过答复、
-    rollup 还没更新），否则 None。"""
+    answered_at：drover prompt 给编排者发过答复（answered.json）、rollup 从那时起内容没变（answered.json 记的 digest 就是现在的，
+    和"未读"一样按规范化内容比：编排者收到答复后原样重写一遍再停下，按修改时间比就成了"等你决定"、没人再转）时是转答复的时间，
+    否则 None。"""
     if roll is None:
         return False, None
     seen = read_json_dict(slug_dir / MAIN_SEEN_FILE)
-    answered_at = as_float(read_json_dict(slug_dir / ANSWERED_FILE).get("at"))
+    answered = read_json_dict(slug_dir / ANSWERED_FILE)
     unread = roll["status"].startswith(ROLLUP_ATTENTION) and roll["digest"] != seen.get("digest")
-    return unread, answered_at if answered_at and answered_at > roll["mtime"] else None
+    return unread, as_float(answered.get("at")) if answered.get("rollup_digest") == roll["digest"] else None
 
 
-def closed_after_done(agent_status: str, rollup_status: str) -> bool:
-    """编排者已经退出、rollup 又是完成的：收尾完关掉了（用户状态目录里几十个历史任务都是这样）。watch --main 不盯，
-    看板不显示，orch-status 的 needs_attention 不算。"""
-    return agent_status == "gone" and rollup_status.startswith("完成")
+def closed_after_done(d: Path, roll: Optional[dict], agent_status: str) -> bool:
+    """收尾完关掉的历史任务（用户状态目录里几十个都是这样）：编排者已经退出、rollup 是完成、主会话读过这一版。watch --main 不盯，
+    看板不显示，orch-status 的 needs_attention 不算。没读过的不算：编排者写完结论 tab 就被关了、herdr 或电脑重启了，结论还没转。
+    没有时间线（TIMELINE_FILE，orch-start 派发时就写）的是装上已读记录之前的老任务，算读过：本机 51 个已退出、没读过的完成任务
+    都没有时间线，有时间线的完成任务都读过，不这样升级后它们会一起翻出来。"""
+    if agent_status != "gone" or roll is None or not roll["status"].startswith("完成"):
+        return False
+    return not rollup_flags(d, roll)[0] or not (d / TIMELINE_FILE).exists()
 
 
 def write_json_atomic(path: Path, obj: dict) -> None:
@@ -2920,16 +2938,37 @@ def timeline_state(d: Path, events: list, roll: Optional[dict], answered_at: Opt
     return {"state": state, "since": since, "start_at": start_at}, new
 
 
-def timeline_stalled(d: Path, events: list, info: dict, now: float, source: str) -> Optional[dict]:
-    """停了没更新（同 watch --main 报的 stalled，但按两个观察者共享的记录算，只开看板也记得到）：编排者现在是 done / idle
-    （agent-state.json，note_agent_state 记的），显示状态是进行中或已转答复；起点取这两段开始的时间里晚的那个，满
-    MAIN_IDLE_MINUTES 记一条（at 是看到的时间，since 是起点），按起点去重。"""
+# 停了没更新：编排者停着（自己不会再动），显示状态却是进行中或已转答复。watch --main 报 stalled、看板写"停了 N 分钟没更新"、
+# 时间线记 stalled 都按 stall_since 这一个判定（以前两套：watch --main 只认 done / idle 加 rollup 写着进行中，没写 rollup 就停了、
+# 状态写成别的词、herdr 报 unknown、挂着后台命令的，时间线记了 stalled、watch 却一直不报）。
+STALL_SHOWN = ("done", "idle", "unknown")
+# 状态栏挂着后台命令（waiting-background）的编排者在等它叫醒自己。Monitor 最长 30 分钟、到期必叫醒（dispatch.md 追踪那条的
+# timeout_ms 1800000），叫醒就是新的一段；同一段挂过这么久，等的就是不会自己结束的命令（验收时起的 dev server 之类），从这时起算停着。
+BACKGROUND_WAIT_MAX_SECONDS = 30 * 60
+
+
+def stall_since(d: Path, info: dict) -> Optional[float]:
+    """停了没更新从什么时候算起（见 STALL_SHOWN 上面的说明）；不算停着返回 None。info 是 timeline_state 的结果（显示状态和它
+    从什么时候开始）。编排者现在的状态看 agent-state.json（note_agent_state，watch --main 和看板谁先看到谁记）：done / idle /
+    unknown 从这一段开始算，waiting-background 从这一段开始 BACKGROUND_WAIT_MAX_SECONDS 之后算；和显示状态开始的时间取晚的那个。"""
     agent = read_json_dict(d / AGENT_STATE_FILE)
-    agent_since = as_float(agent.get("since"))
-    if info["state"] not in ("进行中", "已转答复") or agent.get("shown") not in ("done", "idle") or agent_since is None:
+    since, shown = as_float(agent.get("since")), str(agent.get("shown") or "")
+    if info["state"] not in ("进行中", "已转答复") or since is None:
         return None
-    start = round(max(agent_since, info["since"] or agent_since), 3)
-    if now - start < MAIN_IDLE_MINUTES * 60 or any(e.get("event") == "stalled" and e.get("since") == start for e in events):
+    if shown.startswith("waiting-background"):
+        since += BACKGROUND_WAIT_MAX_SECONDS
+    elif shown not in STALL_SHOWN:
+        return None
+    # 取到毫秒，同时间线里记的：显示状态刚变时 info 的 since 是原值，之后读的是时间线记的那条（取过毫秒），不取的话起点前后对不上、
+    # watch --main 会把同一段停顿当成新的一段再报
+    return round(max(since, info["since"] or since), 3)
+
+
+def timeline_stalled(d: Path, events: list, info: dict, now: float, source: str) -> Optional[dict]:
+    """停了没更新（stall_since）满 MAIN_IDLE_MINUTES 记一条（at 是看到的时间，since 是起点），按起点去重。"""
+    start = stall_since(d, info)
+    if (start is None or now - start < MAIN_IDLE_MINUTES * 60
+            or any(e.get("event") == "stalled" and e.get("since") == start for e in events)):
         return None
     return timeline_event("stalled", now, source, since=start)
 
@@ -2975,7 +3014,7 @@ def cmd_orch_status(a: argparse.Namespace) -> dict:
     if not ok:
         raise DroverError("herdr agent list 失败", error=res)
     alive = {x.get("name"): x for x in res.get("agents", []) if x.get("name")}
-    rows, seen = [], set()
+    rows, seen, attention = [], set(), []
     for meta_file in sorted(STATE_HOME.glob("*/orch.json")):
         try:
             meta = json.loads(meta_file.read_text())
@@ -2998,6 +3037,9 @@ def cmd_orch_status(a: argparse.Namespace) -> dict:
         if fixed:
             row["screen_status"] = fixed
         rows.append(row)
+        # unread 已经按前缀要求状态要处理；收尾完关掉的（编排者已退出、完成、主会话读过这一版）不算。
+        if unread and status in ("done", "idle", "gone") and not closed_after_done(meta_file.parent, roll, status):
+            attention.append(row["slug"])
     # 活着、名字是 orch- 开头、却没有对应 orch.json 的（不是 orch-start 起的，或 orch.json 被删了）：照样列出来，
     # slug 要自己对（tab 标签就是 slug）。
     unmatched = [{"name": n, "agent_status": x.get("agent_status"), "tab_id": x.get("tab_id")}
@@ -3009,9 +3051,6 @@ def cmd_orch_status(a: argparse.Namespace) -> dict:
                if "blocked" in (r["agent_status"], r.get("screen_status"))]
     if blocked:
         result["blocked"] = blocked
-    # unread 已经按前缀要求状态要处理；编排者已经退出、又是完成的（收尾完关掉了）不算。
-    attention = [r["slug"] for r in rows if r["unread"] and r["agent_status"] in ("done", "idle", "gone")
-                 and not closed_after_done(r["agent_status"], r.get("rollup_status") or "")]
     result["needs_attention"] = attention
     return result
 
@@ -3084,6 +3123,11 @@ def check_not_orch(workspace_id: Optional[str]) -> None:
                           reason="orch_workspace", workspace_id=workspace_id)
 
 
+def in_workspace(path: Optional[str]) -> bool:
+    """path 就是主工作台（软链进来的也算）：主会话的工作目录。main-register --hook、看板补登记（board_reregister）都按它认主会话。"""
+    return bool(path) and TRUSTED_ROOT is not None and os.path.realpath(path) == os.path.realpath(str(TRUSTED_ROOT))
+
+
 def main_register(hook: bool, info: dict) -> dict:
     """把当前 pane 的 agent 改名为 drover。拒绝时抛 DroverError（reason 说明是哪种情况）。
     --hook 额外要求工作目录就是主工作台，并且先等 herdr 换上 hook 输入里的那个 session。"""
@@ -3096,7 +3140,7 @@ def main_register(hook: bool, info: dict) -> dict:
         if TRUSTED_ROOT is None:
             raise DroverError(NO_WORKSPACE_ERROR, reason="no_workspace")
         cwd = str(info.get("cwd") or os.getcwd())
-        if os.path.realpath(cwd) != os.path.realpath(str(TRUSTED_ROOT)):
+        if not in_workspace(cwd):
             raise DroverError(f"工作目录 {cwd} 不是主工作台 {TRUSTED_ROOT}，不是主会话", reason="not_workspace")
     env_ws = os.environ.get("HERDR_WORKSPACE_ID")
     check_not_orch(env_ws)
@@ -3522,10 +3566,26 @@ def cmd_prompt(a: argparse.Namespace) -> dict:
     if a.dry_run:
         return {"ok": True, "dry_run": True,
                 "planned": [prompt_plan(a.name, f"<{source} 的内容，{len(text)} 字符>", a.timeout)]}
+    warning = unread_warning(a.name)
     sent = send_prompt(a.name, text, a.timeout)
     if sent["ok"]:
         record_answered(a.name, text)
-    return sent
+    return {**sent, **({"warning": warning} if warning else {})}
+
+
+def unread_warning(name: str) -> Optional[str]:
+    """发给顶层编排者之前算一次未读（rollup_flags）：rollup 在主会话上次读之后又改过时，返回给主会话的一句提醒（照发，不拦）。
+    用户的"按建议来"针对的是主会话转达的那一版，编排者手里已经是新一版的问题，会把它当成对新版的同意（真实时间线里见过转答复
+    24 秒后主会话才读到新版本）。子编排者不提醒：主会话不读它的 rollup，给它发话的是上层编排者。"""
+    task = latest_orch_metas().get(name)
+    if task is None or task["meta"].get("parent"):
+        return None
+    roll = read_rollup(task["dir"] / "rollup.md")
+    if not rollup_flags(task["dir"], roll)[0]:
+        return None
+    slug = task["meta"].get("slug") or task["dir"].name
+    return (f"rollup 在你上次读之后改过（现在是{roll['status']}）：先 drover rollup --slug {slug} 读新版本，确认刚转的答复"
+            "对的是哪一版；对的是旧版的，告诉编排者那句答复不算，把新版转给用户")
 
 
 PROMPT_HEAD_CHARS = 20  # 时间线里 answered 带 prompt 开头这么多字：统计时分得出是转答复还是"接着做"（answered.json 不分内容）
@@ -4020,18 +4080,19 @@ def api_error(screen: str) -> bool:
 
 def screen_state(screen: str) -> str:
     """herdr 报 done / idle 时按屏幕改报：底部是确认弹框 → blocked（有弹框就必须有人处理，不管后台还有没有命令）；
-    状态栏还有后台命令 → waiting-background(N)；最后一个输出块是接口错误 → api-error；否则空串。"""
+    最后一个输出块是接口错误 → api-error（这一轮被打断了，自己不会再动；后台命令替它续不上：Monitor 要到期才叫醒它，留着的
+    dev server 一直不退，以前先看后台命令、报 waiting-background 就没人管）；状态栏还有后台命令 → waiting-background(N)；否则空串。"""
     if permission_dialog(screen):
         return "blocked"
+    if api_error(screen):
+        return "api-error"
     m = BACKGROUND_SHELL_RE.search("\n".join(screen.splitlines()[-8:]))
-    if m:
-        return f"waiting-background({m.group(1)})"
-    return "api-error" if api_error(screen) else ""
+    return f"waiting-background({m.group(1)})" if m else ""
 
 
 def screen_override(status: str, screen: str, kind: Optional[str] = None) -> str:
     """按屏幕修正 herdr 报的状态，watch 和 orch-status 共用这一套规则；不用修正时返回空串。
-    - done / idle：screen_state 的结果（确认弹框 → blocked、后台命令 → waiting-background(N)、接口错误 → api-error）；
+    - done / idle：screen_state 的结果（确认弹框 → blocked、接口错误 → api-error、后台命令 → waiting-background(N)）；
     - working：屏幕底部是确认弹框 → blocked。主 agent 在等后台子 agent（"Waiting for N background agent(s) to finish"）时，
       子 agent 的确认框就在主 agent 屏幕的最底下，herdr 却报 working（见 WORKING_DIALOG_CHECK_SECONDS 上面的说明）。
       正文里引用的弹框文字（编排者 herdr agent read 出 worker 的屏幕）在自己的输入框上面，permission_dialog 不认。
@@ -4066,6 +4127,13 @@ def done_state(name: str) -> str:
 # 34 条是重挂时的启动快照（watch 的去重状态只在进程内存里，第一轮必定把当前值全打一遍）；working / waiting-background 对主会话
 # 也没有对应的动作。--main 只报主会话要处理的事，去重记录写盘（MAIN_WATCH_FILE），重挂之后只报没报过的。
 MAIN_IDLE_MINUTES = 10
+# watch --main 报过的 rollup（仍未读）、弹框（还在）隔这么久再报一次：主会话收到通知的那一轮被接口错误打断、被用户的新消息岔开，
+# 以前这件事在这个会话里就不会再有第二次提醒。
+MAIN_REPEAT_MINUTES = 10
+# 普通 watch 的 --until-event 第一轮（挂上、重挂时）看到这几种也算事件、输出完就退出：处理过就不会还在（批了弹框、续上了、换了人），
+# 还在就是没处理过。Codex 编排者没有 Monitor，处理上一个事件期间别的 worker 卡在确认框上的，以前重挂后要白等到下一次变化或
+# 1500 秒到期。done / idle 分不出处理过没有，不算（算进去的话每次重挂都立刻退出）。
+WATCH_START_EVENTS = ("blocked", "api-error", "gone")
 WATCH_DESCRIPTION = f"""\
 轮询 agent 状态，启动时输出每个 agent 的当前状态，之后变化时输出一行 EVENT <名> <状态> @<时:分:秒>。
 状态是 herdr 的 working / blocked / done / idle / unknown，agent 退出是 gone；watch 会按屏幕改报或补报：
@@ -4078,23 +4146,26 @@ WATCH_DESCRIPTION = f"""\
                           done / idle 序号变了同样重报（working 不重报）
   waiting-background(N)   herdr 报 done / idle，但状态栏还有 N 个后台命令或 Monitor：会自己接着干，继续等
   api-error               herdr 报 done / idle，最后一个输出块是接口错误（Claude Code 行首的 API Error、codex 行首 ■ 的
-                          stream error / unexpected status）：这一轮被打断了
+                          stream error / unexpected status）：这一轮被打断了（状态栏同时挂着后台命令也报它）
   working-no-output(Nm)   working 但屏幕输出 N 分钟没变、也没在跑命令
   working-no-diff(Nm)     working 但 worktree N 分钟没有改动
 有 orch.json 的 agent（编排者、子编排者）另外盯它的 rollup.md，单独输出一行 EVENT <名> rollup:<状态>：
 状态变了就报；状态没变、内容变了（按规范化内容判断：每行去掉首尾空白、删掉空行；原样重写、只改空白空行不报，
 不看"更新："行），只在 等你决定 / 完成 / 受阻 / 需要换编排者 时报（进行中不报）。
-启动时和 --once 也输出当前的 rollup 状态（--until-event 不因启动时的输出退出）。
+启动时和 --once 也输出当前的 rollup 状态。--until-event 不因启动时的输出退出，只有启动时就是 {' / '.join(WATCH_START_EVENTS)}
+的例外（处理过就不会还在，还在就是没处理：重挂时已经卡在确认框上的不白等到下一次变化）；done / idle 分不出处理过没有，不算。
 
 --main：主会话专用，只报主会话要处理的事。不写名字时每一轮自动找所有顶层编排者（orch.json 里没有 parent 的，
-watch 起来之后新起的也算），写了名字只盯这些；子编排者不盯，编排者已经退出、rollup 又是完成的不盯。每件事只报一次：
+watch 起来之后新起的也算），写了名字只盯这些；子编排者不盯，收尾完关掉的（编排者已经退出、rollup 是完成、主会话读过这一版；
+没有时间线的老任务算读过）不盯。每件事报一次，rollup 和弹框报过 {MAIN_REPEAT_MINUTES} 分钟还没处理（仍未读、弹框还在）再报一次：
   rollup:<状态>           状态以 等你决定 / 完成 / 受阻 / 需要换编排者 开头，内容和主会话用 drover rollup 读过的不同（未读），
-                          也和上次报过的不同
+                          也和上次报过的不同（编排者写完完成就退出了的照报）
   blocked                 同上（herdr 报 blocked，或按屏幕修正成 blocked）；同一个弹框只报一次，弹框换了再报
   api-error               同上，进入时报一次
-  gone                    编排者不在 herdr 里了，rollup 却不是 完成 / 需要换编排者（意外退出）
-  stalled(Nm)             herdr 报 done / idle（屏幕上不是后台命令、弹框、接口错误），rollup 是进行中，或者转过答复
-                          （drover prompt）之后 rollup 还没更新：停满 --idle-minutes 报一次，变回 working 后重新计时
+  gone                    编排者不在 herdr 里了，rollup 却不是 完成 / 需要换编排者（意外退出）；同名的编排者换上来以后又退出，再报
+  stalled(Nm)             停了没更新：显示状态是进行中（没写 rollup、状态写成别的词的也算）或已转答复（drover prompt 转过答复、
+                          rollup 内容一直没变），编排者 done / idle / unknown，或者状态栏挂着后台命令已经超过 Monitor 的
+                          {BACKGROUND_WAIT_MAX_SECONDS // 60} 分钟上限：停满 --idle-minutes 报一次（看板、时间线同一个判定），停的这一段变了重新计时
   herdr unreachable       herdr 连不上（--until-event 时退出码 1）
 drover 自己的事，名字位置写 drover（EVENT drover <事件> @<时间>），同样每件只报一次、重挂不重报：
   updated(<旧>..<新>)[ rules]  自动更新装上了新版本（两边是版本 tag，那个提交上没有 tag 时是 7 位 sha；还没报过的几次
@@ -4107,9 +4178,10 @@ drover 自己的事，名字位置写 drover（EVENT drover <事件> @<时间>�
                           source 是 clear / startup（compact、resume 不算）。/clear 之前挂着的 watch 会活到 /clear 之后，
                           它报这一行（--until-event 时退出）就叫醒了新对话
 同时跑着两个 watch --main 时，每一轮算事件、写去重记录拿同一把文件锁，同一件事只有一个进程报。
-每一轮还会触发 drover 的自动更新检查（到时间才在后台查，不等它）。
-不报 working、waiting-background、rollup:进行中、done / idle 本身。报过什么记在 ~/.drover/<slug>/{MAIN_WATCH_FILE}，
-rollup 的已读看 {MAIN_SEEN_FILE}：重挂之后只报没报过的，没有新东西时启动不输出任何一行。
+每一轮还会触发 drover 的自动更新检查（到时间才在后台查，不等它），写心跳 {MAIN_WATCH_LIVE_FILE}（pid、at）：看板看到
+"主会话在处理"不空、心跳停了 {MAIN_WATCH_STALE_MINUTES} 分钟以上，就给主会话送一句"接上"（见 drover board --help）。
+不报 working、waiting-background、rollup:进行中、done / idle 本身。报过什么、什么时候报的记在 ~/.drover/<slug>/{MAIN_WATCH_FILE}，
+rollup 的已读看 {MAIN_SEEN_FILE}：重挂之后只报没报过的（和到了时间该再报的），没有新东西时启动不输出任何一行。
 每一轮还把编排者现在的状态（按屏幕修正后）和它从什么时候开始记进 ~/.drover/<slug>/{AGENT_STATE_FILE}（看板也记，
 "卡在确认框 N 分钟"按它算），把显示状态的变化、编排者每换一段状态、停了没更新补进时间线 ~/.drover/<slug>/{TIMELINE_FILE}
 （看板也补，两边同时跑只记一次），离上一轮观察超过 {OBSERVE_GAP_SECONDS} 秒时在 {OBSERVE_GAPS_FILE} 记一条观察中断。
@@ -4210,7 +4282,8 @@ def cmd_watch(a: argparse.Namespace) -> int:
     progress: dict = {}  # name -> {"fp", "changed", "checked"}
     stall_seconds = a.stall_minutes * 60 if a.stall_minutes > 0 else 0
     quiet_seconds = a.quiet_minutes * 60 if a.quiet_minutes > 0 else 0
-    # --until-event：先输出一遍当前状态，之后第一次有变化就退出（Codex 没有 Monitor，用阻塞等待代替）。
+    # --until-event：先输出一遍当前状态，之后第一次有变化就退出（Codex 没有 Monitor，用阻塞等待代替）；第一轮就是
+    # WATCH_START_EVENTS 的也退出。
     started = time.time()
     first_round = True
     while True:
@@ -4330,7 +4403,7 @@ def cmd_watch(a: argparse.Namespace) -> int:
             if a.once or prev_shown != shown or again:
                 # 带上时间，方便事后分开算"agent 实际耗时"和"编排者自己的耗时"。
                 print(f"EVENT {name} {shown} @{time.strftime('%H:%M:%S')}", flush=True)
-                changed = changed or not first_round
+                changed = changed or not first_round or shown in WATCH_START_EVENTS
             previous[name] = (status, shown)
             # rollup 事件单独一行，和 agent 状态那行互不影响（可以同时有 waiting-background(1) 和 rollup:完成）。
             if name in rollup_files and rollup_event(name, rollup_files[name], rollups, a.once):
@@ -4347,7 +4420,8 @@ def cmd_watch(a: argparse.Namespace) -> int:
 
 def top_orch_tasks(names=()) -> list:
     """主会话盯的任务：顶层编排者（orch.json 里没有 parent；子编排者由上层追踪），每个编排者名取最新的一份 orch.json
-    （latest_orch_metas）；names 给了只留这些名字。按 slug 排序：[{slug, name, kind, dir}]。"""
+    （latest_orch_metas）；names 给了只留这些名字。按 slug 排序：[{slug, name, kind, dir, tab_id}]（tab_id 是编排者所在的 tab，
+    旧的 orch.json 没有是 None）。"""
     wanted = set(names)
     tasks = []
     for name, found in latest_orch_metas().items():
@@ -4355,7 +4429,7 @@ def top_orch_tasks(names=()) -> list:
         if meta.get("parent") or (wanted and name not in wanted):
             continue
         tasks.append({"slug": meta.get("slug") or found["dir"].name, "name": name, "kind": meta.get("kind"),
-                      "dir": found["dir"]})
+                      "dir": found["dir"], "tab_id": meta.get("tab_id")})
     return sorted(tasks, key=lambda t: t["slug"])
 
 
@@ -4407,61 +4481,74 @@ def note_agent_state(task: dict, shown: str, seq: Any, screen: Optional[str], no
     return since if same else None
 
 
+def main_repeat_due(state: dict, key: str, at_key: str, value: str, now: float) -> bool:
+    """watch --main 的去重加重报：value（rollup 的 digest、弹框指纹）和报过的（state[key]）不同，或者报过已满 MAIN_REPEAT_MINUTES
+    还是它（仍未读、弹框还在），就该报，记下 value 和这次的时间（state[at_key]）。旧版本只记了 value、没记时间的从现在起算，
+    不立刻重报。"""
+    at = as_float(state.get(at_key))
+    if state.get(key) == value and (at is None or now - at < MAIN_REPEAT_MINUTES * 60):
+        if at is None:
+            state[at_key] = now
+        return False
+    state[key], state[at_key] = value, now
+    return True
+
+
+def main_agent_events(task: dict, agent: Optional[dict], rstatus: str, state: dict, cache: dict,
+                      now: float) -> tuple[str, Optional[str], list]:
+    """watch --main 一轮里编排者本身的事件：(按屏幕修正后的状态，退出了是 gone；这一轮读到的屏幕；事件)，同时改 state
+    （main-watch.json）。gone 只报意外退出：rollup 不是完成（做完退出是常态，没读的按 rollup 事件报）、也不是需要换编排者（编排者
+    自己说要换人，按 rollup 事件报）；编排者活着时清掉 gone_reported，同名的编排者换上来以后又退出要再报。blocked 同一个弹框报一次、
+    还在就隔 MAIN_REPEAT_MINUTES 再报，读屏失败沿用报过的指纹（没报过就报）；api-error 进入时报一次。"""
+    if agent is None:
+        if rstatus.startswith(("完成", "需要换编排者")) or state.get("gone_reported") == task["name"]:
+            return "gone", None, []
+        state["gone_reported"] = task["name"]
+        return "gone", None, ["gone"]
+    state.pop("gone_reported", None)
+    shown, screen = main_shown(agent, agent.get("agent") or task["kind"], cache, now)
+    events = []
+    if shown == "blocked":
+        fp = dialog_fingerprint(screen) if screen else (state.get("blocked_fp") or "unknown")
+        if main_repeat_due(state, "blocked_fp", "blocked_at", fp, now):
+            events.append("blocked")
+    else:
+        state.pop("blocked_fp", None)  # 弹框没了：之后再弹会再报
+        state.pop("blocked_at", None)
+    if shown != "api-error":
+        state.pop("api_error", None)
+    elif not state.get("api_error"):
+        events.append("api-error")
+        state["api_error"] = True
+    return shown, screen, events
+
+
 def main_watch_task(task: dict, agent: Optional[dict], cache: dict, idle_seconds: float, now: float) -> list:
     """watch --main 一轮里一个任务要报的事件（不带名字和时间），同时更新它的 main-watch.json（变了才写）。
-    每件事只报一次、跨重挂：报过的 rollup digest、弹框指纹、api-error、退出的编排者名、停下的时间都记在 main-watch.json；
-    rollup 已读看 main-seen.json（主会话用 drover rollup 读时写）。编排者现在的状态从什么时候开始另记在 agent-state.json
-    （note_agent_state，看板也记）：它是"现在怎样"，main-watch.json 是"报过什么"，后者只有 watch --main 读写、整轮拿着 MAIN_WATCH_LOCK。
+    报过什么、什么时候报的跨重挂记在 main-watch.json：rollup digest 和弹框指纹（各带报出的时间，到时间再报，main_repeat_due）、
+    api-error、退出的编排者名、停下的起点；rollup 已读看 main-seen.json（主会话用 drover rollup 读时写）。收尾完关掉的任务
+    （closed_after_done）不盯。编排者现在的状态从什么时候开始另记在 agent-state.json（note_agent_state，看板也记）：它是"现在
+    怎样"，main-watch.json 是"报过什么"，后者只有 watch --main 读写、整轮拿着 MAIN_WATCH_LOCK。
     时间线（统计用）也在这里补：note_agent_state 记编排者换的每一段，timeline_observe 记显示状态的变化和停了没更新。"""
-    d, name = task["dir"], task["name"]
+    d = task["dir"]
     roll = read_rollup(d / "rollup.md")
-    rstatus = roll["status"] if roll else ""
-    if closed_after_done(agent.get("agent_status", "unknown") if agent else "gone", rstatus):
+    if closed_after_done(d, roll, agent.get("agent_status", "unknown") if agent else "gone"):
         return []
     path = d / MAIN_WATCH_FILE
     state = read_json_dict(path)
     before = dict(state)
-    events = []
-    if agent is None:
-        # 意外退出：rollup 不是完成（上面已经排除）、也不是需要换编排者（编排者自己说要换人，按 rollup 事件报）。
-        if not rstatus.startswith("需要换编排者") and state.get("gone_reported") != name:
-            events.append("gone")
-            state["gone_reported"] = name
-        shown, screen = "gone", None
-    else:
-        shown, screen = main_shown(agent, agent.get("agent") or task["kind"], cache, now)
-        if shown == "blocked":
-            # 同一个弹框只报一次：指纹和报过的一样就不报（重挂也不重报）。读屏失败时沿用报过的指纹，没报过就报。
-            fp = dialog_fingerprint(screen) if screen else (state.get("blocked_fp") or "unknown")
-            if fp != state.get("blocked_fp"):
-                events.append("blocked")
-                state["blocked_fp"] = fp
-        else:
-            state.pop("blocked_fp", None)  # 弹框没了：之后再弹会再报
-        if shown == "api-error":
-            if not state.get("api_error"):
-                events.append("api-error")
-                state["api_error"] = True
-        else:
-            state.pop("api_error", None)
+    shown, screen, events = main_agent_events(task, agent, roll["status"] if roll else "", state, cache, now)
     note_agent_state(task, shown, agent.get("state_change_seq") if agent else None, screen, now, "watch-main")
-    timeline_observe(task, now, "watch-main")
-    unread, answered_at = rollup_flags(d, roll)
-    # 停着却没更新（routing.md"停了却没改状态"）：rollup 是进行中，或者转过答复之后 rollup 还没更新。屏幕上是后台命令、弹框、
-    # 接口错误的不算（后台命令会自己接着干，另外两种各有事件）。从第一次看到开始计时，满了报一次；条件不成立（变回 working、
-    # rollup 改成要处理的状态）就清掉计时。stalled_emitted 记"这一段已经报过"：idle_since 要留着给看板算停了多久。
-    if shown in ("done", "idle") and (rstatus.startswith("进行中") or answered_at is not None):
-        since = as_float(state.get("idle_since")) or now
-        state["idle_since"] = since
-        if now - since >= idle_seconds and not state.get("stalled_emitted"):
-            events.append(f"stalled({int((now - since) // 60)}m)")
-            state["stalled_emitted"] = True
-    else:
-        state.pop("idle_since", None)
-        state.pop("stalled_emitted", None)
-    if unread and roll["digest"] != state.get("rollup_emitted"):
-        events.append(f"rollup:{rstatus}")
-        state["rollup_emitted"] = roll["digest"]
+    roll, info = timeline_observe(task, now, "watch-main")
+    # 停了没更新（stall_since，看板、时间线同一个判定）：满 --idle-minutes 报一次，停的这一段（起点）变了再报。
+    since = stall_since(d, info)
+    if since is None:
+        state.pop("stalled_since", None)
+    elif now - since >= idle_seconds and state.get("stalled_since") != since:
+        events.append(f"stalled({int((now - since) // 60)}m)")
+        state["stalled_since"] = since
+    if rollup_flags(d, roll)[0] and main_repeat_due(state, "rollup_emitted", "rollup_emitted_at", roll["digest"], now):
+        events.append(f"rollup:{roll['status']}")
     if state != before:
         write_json_atomic(path, state)
     return events
@@ -4470,9 +4557,9 @@ def main_watch_task(task: dict, agent: Optional[dict], cache: dict, idle_seconds
 def watch_main(a: argparse.Namespace) -> int:
     """watch --main（见 WATCH_DESCRIPTION 的 --main 一节）。和普通 watch 不同：不输出当前状态，只输出要处理、还没报过的事；
     --until-event 时启动那一轮的输出也算事件（这里输出的都是新的）。
-    每一轮还做三件 drover 自己的事：触发自动更新检查（auto_update_tick）；报自动更新的结果（drover_main_events）；
-    认出主会话重开（main-session.json 的 session_id 变了、source 是 clear / startup：/clear 之前挂着的后台 watch 会活到
-    /clear 之后，实测它退出时会叫醒新对话）。
+    每一轮还做四件 drover 自己的事：写心跳（MAIN_WATCH_LIVE_FILE，看板靠它发现追踪断了）；触发自动更新检查（auto_update_tick）；
+    报自动更新的结果（drover_main_events）；认出主会话重开（main-session.json 的 session_id 变了、source 是 clear / startup：
+    /clear 之前挂着的后台 watch 会活到 /clear 之后，实测它退出时会叫醒新对话）。
     同时跑着两个 watch --main 时（/clear 之后新对话自己挂了一个、旧的还没退）："算事件 + 写去重记录"整轮拿 MAIN_WATCH_LOCK，
     同一件事只有一个进程报。"""
     idle_seconds = a.idle_minutes * 60
@@ -4483,6 +4570,8 @@ def watch_main(a: argparse.Namespace) -> int:
         if a.timeout and time.time() - started >= a.timeout:
             print(f"EVENT timeout @{time.strftime('%H:%M:%S')}", flush=True)
             return 0
+        with contextlib.suppress(OSError):  # 写不了不管：看板只是少了个兜底
+            write_json_atomic(MAIN_WATCH_LIVE_FILE, {"pid": os.getpid(), "at": time.time()})
         auto_update_tick()
         agents = list_agents()
         if agents is None:
@@ -4575,6 +4664,7 @@ BOARD_WRAPUP_TEXT = {"ready": (BOARD_WRAPUP_BUTTON, "可以", "可以收尾"), "
                      "hold": ("先别：{}", "先别：{}", "先别收尾：{}")}
 WRAPUP_CLICK_SECONDS = 30 * 60
 WRAPUP_DONE_REASON = "已经收尾"
+WRAPUP_UNREAD_REASON = "结论还没转达"  # 完成、收尾可以、主会话还没读这一版：先别（task_wrapup）
 WRAPUP_LEFT_RE = re.compile(r"[，,]\s*留\s*(\S.*)$")
 BOARD_PENDING_MAX = 3
 BOARD_TAB_FILE = STATE_HOME / "board-tab.json"  # --tab 开的看板 tab（见 board_tab 上面的说明）
@@ -4584,8 +4674,11 @@ BOARD_TAB_LABEL = "看板"
 BOARD_LIVE_FILE = STATE_HOME / "board-live.json"
 BOARD_LIVE_STALE = 120
 BOARD_REEXEC_PROBE_TIMEOUT = 60  # --live 换新代码前试跑一下新代码（board --help）最多等这么久
-ONCALL_SEND_SCRIPT = "src/actions/send-main.mjs"  # 看板点 [收尾] 时调的 herdr-oncall 脚本（见 board_send_main）
-BOARD_NO_SEND = "点不了：飞书插件没装或版本太旧，在主对话里说'全部收尾'"
+ONCALL_SEND_SCRIPT = "src/actions/send-main.mjs"  # 看板点 [收尾]、送"接上"时调的 herdr-oncall 脚本（见 board_send_main）
+BOARD_NO_PLUGIN = "飞书插件没装或版本太旧"
+BOARD_NO_SEND = f"点不了：{BOARD_NO_PLUGIN}，在主对话里说'全部收尾'"
+BOARD_NUDGE_TEXT = "接上"  # 主会话的追踪断了时看板送进主会话的那句话（插件加"[看板] "前缀，见 board_nudge）
+BOARD_NUDGE_FILE = STATE_HOME / "board-nudge.json"  # 看板为哪一段断档（心跳的 at）送过"接上"、什么时候、送成没有
 BOARD_NOTICE_SECONDS = 8
 BOARD_COPIED = "已复制 {} 行"  # 看板 tab 里拖选复制以后显示 BOARD_NOTICE_SECONDS 秒（board_live、board_copy）
 # --live 收到的原始鼠标序列记在这里（最近 BOARD_MOUSE_LOG_KEEP 条）：herdr 把触控板左右划转成哪个 SGR 编号没在真机上看过，
@@ -4595,14 +4688,14 @@ BOARD_MOUSE_LOG_KEEP = 50
 BOARD_DESCRIPTION = f"""\
 任务看板：一行一个任务，按状态分组，一眼看清有哪些任务、各自走到哪、要你做什么、在这个状态上待了多久。每次现场生成：
 读 ~/.drover/*/ 下的 orch.json、rollup.md、request.md（标题）、{MAIN_SEEN_FILE}（主会话用 drover rollup 读过的）、{ANSWERED_FILE}
-（drover prompt 转过答复）、{MAIN_WATCH_FILE}（watch --main 记的）、{TIMELINE_FILE}（时间线）、{WRAPUP_CLICKED_FILE}（看板上点过
+（drover prompt 转过答复）、{AGENT_STATE_FILE}（编排者现在的状态）、{TIMELINE_FILE}（时间线）、{WRAPUP_CLICKED_FILE}（看板上点过
 收尾），加上 herdr agent list 和屏幕（同 orch-status 的修正规则），不存看板文件。文本、--plain、--json、--live 是观察者：顺带把编排者
 现在的状态记进 {AGENT_STATE_FILE}，把显示状态的变化、编排者每换一段状态、停了没更新补进 {TIMELINE_FILE}（同 watch --main，两边
-同时跑只记一次），没人观察的时段记进 {OBSERVE_GAPS_FILE}。收活着的顶层编排者，和已经退出、rollup 又不是完成的（意外退出或者要换人）；
-退出了、rollup 是完成的不显示。
+同时跑只记一次），没人观察的时段记进 {OBSERVE_GAPS_FILE}。收所有顶层编排者，收尾完关掉的不显示：编排者已经退出、rollup 是完成、
+主会话读过这一版（没读过的照样显示，"主会话在处理"写未读；没有时间线的老任务算读过）。
 分组（一组一张表，空组不画，组内按状态持续长的在前）：
   等你     rollup 是等你决定、受阻（"当前状态"前面加"受阻："），而且答复没转过
-  进行中   进行中、已转答复（等你决定 / 受阻，drover prompt 转过答复、rollup 还没更新："{BOARD_ANSWERED}"）、
+  进行中   进行中、已转答复（等你决定 / 受阻，drover prompt 转过答复、rollup 内容还没变："{BOARD_ANSWERED}"）、
            需要换编排者（前面加"换编排者中："）；没有 rollup 的也算进行中
   完成     完成；多一列"{BOARD_WRAPUP_HEAD}"
 列（按显示宽度算，中文两格；截断的末尾加"..."，算 3 格。Markdown、--pending 按下面的上限截；--plain 只截任务名；--live 的
@@ -4619,13 +4712,15 @@ BOARD_DESCRIPTION = f"""\
   代号       slug；{BOARD_LIMITS[4]} 格
   收尾       {BOARD_WRAPUP_BUTTON}（能收尾）/ 收尾中（看板上点过、rollup 还没在点了之后重写、不到 {WRAPUP_CLICK_SECONDS // 60} 分钟）/
              已收尾（"收尾：先别，已经收尾过了"）/ 已收尾，留 <留了什么，≤10 字>（"…，留 <留了什么>"：收尾做完但留了东西，
-             不能点）/ 先别：<原因，≤10 字>；不截
+             不能点）/ 先别：<原因，≤10 字>（主会话还没读这一版的写"先别：{WRAPUP_UNREAD_REASON}"）；不截
 提醒（rollup 的"提醒："）跟着它的任务写（几个任务写了同一句各自都写）：--live 写在那个任务最后一行下面，任务列空着、后面
 画出来的几列合成一格"提醒：<原文>"（按这一格的宽度折行，最多 {BOARD_WRAP_LINES} 行，超了末尾"..."；滚动以后跟着画出来的列
 重新折），和任务行之间有一条线，合并的几列在线上收成 ┴；--plain 和退回的列表是这个任务的第三行；Markdown 表格不能合并格子，
 每张表下面一条一段"提醒（<标题>）：<原文>"，只列这张表里的任务。最底下一行「主会话在处理：<任务> <原因>」：卡在确认框、接口错误、
-编排者已退出（这个状态本身持续了多久，从 watch --main 或看板第一次看到算起，{AGENT_STATE_FILE}；这次才看到的写"（刚发现）"）、
-未读的 rollup、要换编排者（N 分钟前写的）、停了 N 分钟没更新。标题行、各组、主会话在处理之间空一行。
+编排者意外退出（这个状态本身持续了多久，从 watch --main 或看板第一次看到算起，{AGENT_STATE_FILE}；这次才看到的写"（刚发现）"）、
+未读的 rollup（编排者写完完成就退出了的也在）、要换编排者（N 分钟前写的）、停了 N 分钟没更新（同 watch --main 的 stalled：显示状态
+是进行中或已转答复，编排者 done / idle / unknown，或者挂着后台命令超过 {BACKGROUND_WAIT_MAX_SECONDS // 60} 分钟）。标题行、各组、
+主会话在处理之间空一行。
 写法：
   默认      Markdown（每组一张 GFM 表），主会话在终端里原样回给用户；完成组标题后面写"可以收尾 K 个：回"全部收尾""
   --plain   纯文字，给飞书：每组一个标题，每个任务两行（"· <标题>（<代号>）"、"  <当前状态>｜要你：…｜已持续 …"，当前状态、
@@ -4635,9 +4730,10 @@ BOARD_DESCRIPTION = f"""\
             不画线，任务名、代号、状态持续、收尾写在第一行）；比终端宽时任务列固定、其余整列左右滚（几张表一起滚，不切半个字），
             表下面一行写左右还剩哪几列；任务列加最宽的一列都放不下时退回 --plain 那样的列表
   --json    tasks 每项加 title、ask、display_state、state_since（epoch）、state_seconds、total_seconds（派发到现在，完成的算到
-            这一段完成开始）、wrapup_clicked、note（提醒原文，没有是 null）；deliverables 只解析旧 rollup 的"## 交付"（没有是 []）
-能一键收尾（--json 的 wrapup_ready）：完成、rollup 的"收尾："是可以（没写这一行时完成就算可以）、编排者还开着；点过的也算
-（主会话收到看板送的口令时拿它核对），K 是其中还没点过的。
+            这一段完成开始）、wrapup_clicked、note（提醒原文，没有是 null）、tab_id（编排者所在的 tab，orch.json 里记的，主会话收尾、
+            换编排者时 herdr tab close 它；旧的 orch.json 没有是 null）；deliverables 只解析旧 rollup 的"## 交付"（没有是 []）
+能一键收尾（--json 的 wrapup_ready）：完成、主会话读过这一版、rollup 的"收尾："是可以（没写这一行时完成就算可以）、编排者还开着；
+点过的也算（主会话收到看板送的口令时拿它核对），K 是其中还没点过的。
 第一行末尾是 drover 自己的版本（· drover <7 位 sha>，--plain 不写）。下面按需多几行 drover 自己的状态：最近 24 小时更新过的
 「drover 已自动更新 <旧>→<新>（<版本 tag>，MM-DD HH:MM）」（手动 drover update 换了版本的写「drover 已更新 <旧>→<新>
 （<版本 tag>，MM-DD HH:MM，手动）」；新版本那个提交上没有版本 tag 时不写 tag）；
@@ -4657,8 +4753,12 @@ BOARD_DESCRIPTION = f"""\
 插件回的一句话、"已复制"在看板上显示 {BOARD_NOTICE_SECONDS} 秒；插件没装或太旧时显示"{BOARD_NO_SEND}"。收到的原始鼠标序列
 （拖动不记）记在 {BOARD_MOUSE_LOG}（最近 {BOARD_MOUSE_LOG_KEEP} 条），用来核对触控板左右划的编号。
 --live 每一轮还看主会话的名字丢了没有：board-tab.json（或 --pane 的 board-pane.json）记的主会话 pane 里的 agent 还在、
-没有名字、herdr 里也没有别的 agent 叫 {MAIN_AGENT_NAME}，就替它补登记（Codex /new 之后 herdr 会清掉名字，飞书消息就送不进
-主会话），看板上留一行「已补登记主会话」；名字是别的不动。
+没有名字、工作目录是主工作台（前台进程的工作目录优先；herdr 没给的不补）、herdr 里也没有别的 agent 叫 {MAIN_AGENT_NAME}，就替它补登记
+（Codex /new 之后 herdr 会清掉名字，飞书消息就送不进主会话），看板上留一行「已补登记主会话」；名字是别的、在别的目录开的会话不动。
+--live 每一轮还看主会话的追踪断了没有：「主会话在处理」那一行不空、watch --main 的心跳（{MAIN_WATCH_LIVE_FILE.name}）停了
+{MAIN_WATCH_STALE_MINUTES} 分钟以上，就把"{BOARD_NUDGE_TEXT}"交给 herdr-oncall 的 {ONCALL_SEND_SCRIPT} 送进主会话（它加"[看板] "，主会话按
+routing.md 接上），看板上留一行「主会话的追踪停了 N 分钟，已送"{BOARD_NUDGE_TEXT}"」（没送成写原因）；同一段断档只送一次，记在
+{BOARD_NUDGE_FILE.name}；没有心跳文件（没跑过 watch --main）不送。
 --live 自己换代码：启动时记下这份代码的版本，每一轮和磁盘上装着的比（link 模式 clone 的 HEAD，copy 模式副本标记 .drover-copy
 里的 commit），两边都取得到、又不一样就先试跑新代码（board --help），过了恢复终端、带原来的参数重新执行自己（进程号不变，
 tab 名、记录照旧）；没换成（新代码跑不起来、exec 报错）在看板上留一行原因，接着用旧代码，下一轮再试。
@@ -4731,8 +4831,8 @@ def held_for(label: str, since: Optional[float], now: float, note: str = "") -> 
 
 def board_reason(kind: str, text: str, since: Optional[float], source: str) -> dict:
     """--json 的 reasons 里的一项。since 是这个原因从什么时候开始（epoch 秒），source 是它从哪来：agent-state（编排者的
-    状态，agent-state.json）、rollup（rollup 的修改时间）、main-watch（watch --main 记的停下时间）、answered（转答复的时间）；
-    since 是 None 时写 unknown。"""
+    状态，agent-state.json；停了没更新是停下的时间和显示状态开始的时间里晚的那个，stall_since）、rollup（rollup 的修改时间）、
+    answered（转答复的时间）；since 是 None 时写 unknown。"""
     return {"kind": kind, "text": text, "since": since, "since_source": source if since is not None else "unknown"}
 
 
@@ -4779,7 +4879,7 @@ def board_row(task: dict, agent: Optional[dict], roll: Optional[dict], screen_st
     agent_status = agent.get("agent_status", "unknown") if agent else "gone"
     shown = screen_status or agent_status
     unread, answered_at = rollup_flags(d, roll)
-    idle_since = as_float(read_json_dict(d / MAIN_WATCH_FILE).get("idle_since"))
+    stalled = stall_since(d, info)
     reasons = []
     if unread:
         reasons.append(board_reason("unread", f"新的{status}（未读，{ago(now - roll['mtime'], '写的')}）",
@@ -4792,12 +4892,11 @@ def board_row(task: dict, agent: Optional[dict], roll: Optional[dict], screen_st
         if not unread:
             reasons.append(board_reason("replace", f"要换编排者（{ago(now - roll['mtime'], '写的')}）",
                                         roll["mtime"], "rollup"))
-    elif agent is None:
+    elif agent is None and not status.startswith("完成"):  # 做完就退出是常态，没读的结论按上面的未读转
         reasons.append(board_reason("gone", held_for("编排者已退出", since, now, f"rollup：{status or '没有'}"),
                                     since, "agent-state"))
-    if idle_since and shown in ("done", "idle") and now - idle_since >= MAIN_IDLE_MINUTES * 60:
-        reasons.append(board_reason("stalled", f"停了 {int((now - idle_since) // 60)} 分钟没更新", idle_since,
-                                    "main-watch"))
+    if stalled is not None and now - stalled >= MAIN_IDLE_MINUTES * 60:
+        reasons.append(board_reason("stalled", f"停了 {int((now - stalled) // 60)} 分钟没更新", stalled, "agent-state"))
     waiting = status.startswith(("等你决定", "受阻"))
     answered = waiting and answered_at is not None
     if reasons:
@@ -4811,7 +4910,7 @@ def board_row(task: dict, agent: Optional[dict], roll: Optional[dict], screen_st
         if answered:
             reasons.append(board_reason("answered", BOARD_ANSWERED, answered_at, "answered"))
     reason = "、".join(r["text"] for r in reasons) or None
-    can_wrapup, hold, _ = rollup_wrapup(roll)
+    can_wrapup, hold = task_wrapup(roll, unread)
     state, state_since = info["state"], info["since"]
     end = state_since if state == "完成" else now  # 总耗时：完成的算到这一段完成开始
     clicked_at = as_float(read_json_dict(d / WRAPUP_CLICKED_FILE).get("at"))
@@ -4829,6 +4928,7 @@ def board_row(task: dict, agent: Optional[dict], roll: Optional[dict], screen_st
             "state_since": state_since, "state_seconds": int(now - state_since) if state_since is not None else None,
             "total_seconds": int(end - info["start_at"]) if end is not None and info["start_at"] else None,
             "wrapup_clicked": clicked, "note": (roll["fields"].get("提醒") or None) if roll else None,
+            "tab_id": task.get("tab_id"),
             "_mtime": roll["mtime"] if roll else float("inf"), "_done": status.startswith("完成"),
             "_state_text": board_state_text(state, roll)}
 
@@ -4849,7 +4949,7 @@ def board_rows(read_screens: bool, now: float) -> list:
         agent = by_name.get(task["name"])
         roll = read_rollup(task["dir"] / "rollup.md")
         agent_status = agent.get("agent_status", "unknown") if agent else "gone"
-        if closed_after_done(agent_status, roll["status"] if roll else ""):
+        if closed_after_done(task["dir"], roll, agent_status):
             continue
         shown, since = agent_status, None
         if read_screens:
@@ -4866,7 +4966,8 @@ def board_rows(read_screens: bool, now: float) -> list:
 
 
 def wrapup_ready(rows: list) -> list:
-    """能一键收尾的任务（--json 的 wrapup_ready、看板的 [收尾]）：完成、收尾可以（rollup_wrapup）、编排者还开着。"""
+    """能一键收尾的任务（--json 的 wrapup_ready、看板的 [收尾]）：完成、收尾可以（task_wrapup：编排者说可以、主会话读过这一版）、
+    编排者还开着。"""
     return [r["slug"] for r in rows if r["_done"] and r["wrapup"] == "ready" and r["agent_status"] != "gone"]
 
 
@@ -5281,7 +5382,7 @@ def wrap_fix(prev: list, cur: list, width: int) -> None:
 def board_live(a: argparse.Namespace) -> int:
     """--live：清屏、画看板（board_frame：框线表）、等 --interval 秒，循环（给 herdr 的看板 tab / 分屏用）。herdr 连不上时
     显示一行提示接着循环；Ctrl-C 正常退出。--iterations（隐藏参数，自测用）刷新够这么多轮就退出。每一轮先触发自动更新检查，
-    再看主会话的名字丢了没有（board_reregister），补登记过就在看板上留一行。
+    再看主会话的名字丢了没有（board_reregister），补登记过就在看板上留一行；主会话的追踪断了（board_nudge）也留一行。
     跑在 --tab 开的看板 tab 里时（own_board_tab；找到之前每轮找一次）：tab 名改成汇总（board_tab_label，变了才
     herdr tab rename）；stdin、stdout 都是终端时打开鼠标上报，等的时候读点击、拖选和左右滚（board_wait）。点一下是左键按下加松开，
     松开时和按下在同一格算单击：
@@ -5330,6 +5431,7 @@ def board_live(a: argparse.Namespace) -> int:
                 want = board_tab_label(view)
                 if tab and want != label and herdr(["tab", "rename", tab, want], timeout=30)[0]:
                     label = want  # 改失败了下一轮再改
+                extra += board_nudge(view, now)
             except DroverError as exc:
                 view = f"drover 看板 · {clock(now, '%m-%d %H:%M')} · {exc.message}，{a.interval:g} 秒后重试"
             rounds += 1
@@ -5820,6 +5922,27 @@ def board_send_main(text: str) -> tuple[bool, str]:
     return False, f"没送进主会话（{error or f'退出码 {p.returncode}'}），在主对话里说'{text}'"
 
 
+def board_nudge(view: dict, now: float) -> tuple:
+    """--live 每一轮：主会话的追踪断了没有（见 MAIN_WATCH_LIVE_FILE）。"主会话在处理"那一行不空、watch --main 的心跳停了
+    MAIN_WATCH_STALE_MINUTES 以上，就给主会话送一句"接上"（board_send_main：插件加"[看板] "前缀，主会话卡在确认框、输入框有
+    草稿时排队），主会话照 routing.md 接上（处理"主会话在处理"那一行、重挂 watch）。同一段断档（心跳的 at 没变）只送一次，送没送过
+    记在 BOARD_NUDGE_FILE（看板换代码、重开都不重送），没送成也不重试（看板上留着原因）。没有心跳文件的（没跑过 watch --main：
+    Codex 主会话只在用户说"等着"时才挂）不送。返回看板上要多显示的行（没断是空的）。"""
+    beat = as_float(read_json_dict(MAIN_WATCH_LIVE_FILE).get("at"))
+    if beat is None or now - beat < MAIN_WATCH_STALE_MINUTES * 60 or not view["main"]:
+        return ()
+    sent = read_json_dict(BOARD_NUDGE_FILE)
+    if sent.get("beat") != beat:
+        ok, notice = board_send_main(BOARD_NUDGE_TEXT)
+        # 插件没装时 board_send_main 的那句是给点按钮写的（"在主对话里说'全部收尾'"），这里只要原因
+        sent = {"beat": beat, "at": now, "ok": ok, "notice": BOARD_NO_PLUGIN if notice == BOARD_NO_SEND else notice}
+        with contextlib.suppress(OSError):
+            write_json_atomic(BOARD_NUDGE_FILE, sent)
+    when = clock(as_float(sent.get("at")) or now, "%H:%M")
+    head = f"主会话的追踪停了 {span(now - beat)}"
+    return (f'{head}，已送"接上"（{when}）' if sent.get("ok") else f'{head}，"接上"没送成（{when}）：{sent.get("notice")}',)
+
+
 def board_mark_wrapup(slugs: list, all_: bool, text: str) -> None:
     """看板上点收尾送出去了：每个任务写 WRAPUP_CLICKED_FILE（at、送的那句话），这一格变"收尾中"（board_row 的 wrapup_clicked），
     时间线记 wrapup-clicked（all：是不是点的全部收尾）。"""
@@ -5833,15 +5956,17 @@ def board_mark_wrapup(slugs: list, all_: bool, text: str) -> None:
 
 def board_reregister() -> Optional[tuple]:
     """--live 每一轮：board-tab.json（--tab）或 board-pane.json（--pane）记的主会话 pane（main_pane_id）里的 agent 还在、
-    却没有名字，herdr 里也没有别的 agent 叫 drover，就替它补登记（herdr agent rename <pane> drover）。返回 (时间, pane)；
-    没补返回 None。名字是别的不动，没有记录、pane 里没有 agent、herdr 出错都不动。
+    却没有名字、工作目录是主工作台（in_workspace，同 main-register --hook；前台进程的 foreground_cwd 优先），herdr 里也没有别的
+    agent 叫 drover，就替它补登记（herdr agent rename <pane> drover）。返回 (时间, pane)；没补返回 None。名字是别的不动，没有记录、
+    pane 里没有 agent、herdr 出错、工作目录不是主工作台（用户在这个 pane 里换进某个仓库开的会话：登记了，飞书发的"提交推送"就送进
+    一个没有路由规则的会话）、herdr 没给工作目录（核实不了）都不动。
     来由：Codex /new 之后 herdr 会清掉名字（实测），Codex 又没有 SessionStart hook，要等用户第一条消息才重新登记，
     这段时间飞书消息送不进主会话；看板不受 /new 影响，每 15 秒一轮，由它补上。常见路径只调一次 herdr agent get。"""
     pane = read_json_dict(BOARD_TAB_FILE).get("main_pane_id") or read_json_dict(BOARD_PANE_FILE).get("main_pane_id")
     if not isinstance(pane, str) or not pane:
         return None
     agent = pane_agent(pane)
-    if agent is None or agent.get("name"):
+    if agent is None or agent.get("name") or not in_workspace(agent.get("foreground_cwd") or agent.get("cwd")):
         return None
     agents = list_agents()
     if agents is None or any(x.get("name") == MAIN_AGENT_NAME for x in agents):
@@ -11011,7 +11136,8 @@ def build_parser() -> argparse.ArgumentParser:
                                    f"的 name，多条取最新的）时，发送成功后写 ~/.drover/<slug>/{ANSWERED_FILE}（发送时间、当时 rollup 的 "
                                    "digest）：看板据此把\"等你决定、已转答复\"的任务算成编排者在做；同时在任务的时间线"
                                    f"（{TIMELINE_FILE}）记一条 answered（带开头 {PROMPT_HEAD_CHARS} 个字），内容以\"收尾\"开头的再记一条"
-                                   " wrapup-sent；发给 worker 不写。")
+                                   " wrapup-sent；发给 worker 不写。发给顶层编排者时，它的 rollup 在主会话上次读之后又改过（未读），"
+                                   "照发，返回里多一个 warning：先读新版本、确认答复对的是哪一版。")
     p.add_argument("--name", required=True, help="agent 名")
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--file", help="prompt 文件路径")
@@ -11026,10 +11152,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("agents", nargs="*", help="要追踪的 agent 名；--main 时可以不写（自动找所有顶层编排者）")
     p.add_argument("--main", action="store_true",
                    help="主会话专用：只报要主会话处理的事（未读的 rollup、确认框、接口错误、编排者意外退出、停着没更新），"
-                        f"报过的记在 ~/.drover/<slug>/{MAIN_WATCH_FILE}，重挂不重报，没有新东西时不输出；不写名字时每轮自动找"
-                        "所有顶层编排者。--once、--stall-minutes、--quiet-minutes 等只给普通 watch 用")
+                        f"报过的记在 ~/.drover/<slug>/{MAIN_WATCH_FILE}，重挂不重报（rollup 仍未读、弹框还在的 {MAIN_REPEAT_MINUTES} 分钟后"
+                        "再报），没有新东西时不输出；每轮写心跳。不写名字时每轮自动找所有顶层编排者。--once、--stall-minutes、"
+                        "--quiet-minutes 等只给普通 watch 用")
     p.add_argument("--idle-minutes", type=float, default=MAIN_IDLE_MINUTES,
-                   help="只给 --main 用：编排者 done / idle、rollup 是进行中（或转过答复之后 rollup 还没更新），"
+                   help="只给 --main 用：编排者停着（done / idle / unknown，或挂着后台命令超过 "
+                        f"{BACKGROUND_WAIT_MAX_SECONDS // 60} 分钟）、显示状态却是进行中或已转答复，"
                         f"停满这么多分钟报一次 stalled(Nm)。默认 {MAIN_IDLE_MINUTES}")
     p.add_argument("--interval", type=float, default=5, help="轮询间隔秒数，默认 5")
     p.add_argument("--once", action="store_true", help="只查一次并输出全部状态（用于 status 子模式）")
@@ -11043,7 +11171,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-interval", type=float, default=30, help="取屏幕输出指纹的间隔秒数，默认 30")
     p.add_argument("--until-event", action="store_true",
                    help="先输出一遍当前状态，之后第一次有事件（状态变化、重报、rollup 事件）就退出（没有 Monitor 的宿主，如 Codex，"
-                        "用它阻塞等待）；和 --main 一起用时启动那一轮的输出也算事件（输出的都是新的），有输出就退出")
+                        f"用它阻塞等待），启动时就有 {' / '.join(WATCH_START_EVENTS)} 的输出完就退出；和 --main 一起用时启动那一轮的"
+                        "输出也算事件（输出的都是新的），有输出就退出")
     p.add_argument("--timeout", type=float, default=0,
                    help="最多等这么多秒，到了输出 EVENT timeout 后退出（退出码 0）；0 不限。配合 --until-event 用")
 
@@ -11069,8 +11198,8 @@ def build_parser() -> argparse.ArgumentParser:
                            "agent_status、screen_status、reason、reasons（每个原因的 kind、text、since、since_source）、summary、"
                            "age_minutes、rollup_mtime、unread、answered_after_rollup、wrapup（ready / hold）、wrapup_reason、"
                            "deliverables（旧 rollup 的\"## 交付\"：kind：look / doing / user / note、item、status；没有是 []）、"
-                           "title、ask、display_state、state_since、state_seconds、total_seconds、wrapup_clicked）、"
-                           "wrapup_ready（能一键收尾的 slug，点过的也算）、"
+                           "title、ask、display_state、state_since、state_seconds、total_seconds、wrapup_clicked、note、tab_id）、"
+                           "wrapup_ready（能一键收尾的 slug，点过的也算；主会话还没读这一版的不算）、"
                            "drover（version：7 位 sha；auto_update：enabled、result、last_attempt、error、from、to、count、"
                            "titles、routing_changed、flow_changed、updated_at、announced；rules_changed：AGENTS.md 里的 "
                            "drover 区块和主会话载入时的不同，跑 drover rules 读入）")
@@ -11218,8 +11347,9 @@ def build_parser() -> argparse.ArgumentParser:
                        description="列出编排者：herdr 状态（agent_status，原值）+ rollup 的状态行；按屏幕修正的状态放 screen_status"
                                    "（和原值不同时才有，规则同 watch），卡在确认框上的编排者列进顶层 blocked（没有就不出这个键）。"
                                    "每行另有 rollup_summary（rollup 的\"摘要：\"，没有就从正文取一行）、unread（状态要处理、内容和 "
-                                   "主会话用 drover rollup 读过的不同）、answered_after_rollup（drover prompt 转过答复、rollup 还没更新）。"
-                                   "needs_attention：unread、herdr 原值是 done / idle / gone 的任务（gone 且完成的不算）。")
+                                   "主会话用 drover rollup 读过的不同）、answered_after_rollup（drover prompt 转过答复、rollup 内容还没变）。"
+                                   "needs_attention：unread、herdr 原值是 done / idle / gone 的任务（编排者写完完成就退出了的也算；"
+                                   "没有时间线的老任务 gone 且完成的不算：装上已读记录之前就收尾了）。")
     p.add_argument("--all", action="store_true", help="也列出 agent 已经退出（gone）的编排者")
     p.add_argument("--with-sub", action="store_true", help="也列出子编排者（默认不列：子编排者由上层追踪）")
 

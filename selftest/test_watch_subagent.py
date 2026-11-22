@@ -116,12 +116,12 @@ class WorkingDialogCliTests(DroverTestCase):
         self.assertEqual(clock.elapsed(), 10)
 
     def test_dialog_gone_reports_working(self) -> None:
-        """working + 子 agent 弹框 → blocked；批完弹框消失（只剩 Waiting 行）→ 下一轮就报回 working 并退出
-        （判成 blocked 的每轮都读，不等节流间隔）"""
+        """working + 子 agent 弹框 → blocked；批完弹框消失（只剩 Waiting 行）→ 下一轮就报回 working
+        （判成 blocked 的每轮都读，不等节流间隔）。开头就是 blocked，--until-event 第一轮就会退出（test_watch_states），所以不带它"""
         self.set_agents(a={"status": "working", "screen": DIALOG_A})
-        rc, first, rest = self.watch_then(["a", *FAST, "--until-event", "--timeout", "8"], 1,
+        rc, first, rest = self.watch_then(["a", *FAST, "--timeout", "1"], 1,
                                           lambda: self.set_agents(a={"status": "working", "screen": SUBAGENT_WAITING}))
-        self.assertEqual((rc, first, rest), (0, ["EVENT a blocked"], ["EVENT a working"]))
+        self.assertEqual((rc, first, rest), (0, ["EVENT a blocked"], ["EVENT a working", "EVENT timeout"]))
 
 
 class ConsecutiveDialogTests(DroverTestCase):

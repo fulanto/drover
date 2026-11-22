@@ -14,8 +14,8 @@
   - pane list：返回固定的假 ID；workspace list：state["workspaces"]（默认空列表）；status：server 在运行
   - 按 pane 登记的 agent（main-register 用）：state["panes"][pane_id] = {name（没有 = 没名字）, workspace_id, agent,
     session（agent_session.value，没有就不输出）, present（False = herdr 里还没有这个 agent）, pending（每次 agent get
-    之前先弹出一项 update 进记录，模拟 /clear 后 herdr 过一会儿才换 session、清名字）}。agent list 同时列出它们，
-    agent get <pane 或名字> 查得到，agent rename <pane> <名字> 改 name（名字被别的 agent 占着时报错）
+    之前先弹出一项 update 进记录，模拟 /clear 后 herdr 过一会儿才换 session、清名字）, cwd / foreground_cwd（设了才输出）}。
+    agent list 同时列出它们，agent get <pane 或名字> 查得到，agent rename <pane> <名字> 改 name（名字被别的 agent 占着时报错）
   - pane get / split / run / close（board --pane / --tab 用）：pane get <id> 返回 state["panes"][id] 的 pane_id、tab_id、
     workspace_id、scroll.viewport_rows（rows，默认 50），不在 panes 里报 pane_not_found；pane split --pane <id> 在同一个 tab
     里加一个没有 agent 的 pane（present: False，id 是 <workspace>:p<序号>）；pane run <id> <命令> 记进 state["pane_runs"]
@@ -117,6 +117,9 @@ def pane_record(pane_id, p):
         rec["name"] = p["name"]
     if p.get("tab_id"):
         rec["tab_id"] = p["tab_id"]
+    for key in ("cwd", "foreground_cwd"):
+        if p.get(key):
+            rec[key] = p[key]
     if p.get("session"):
         rec["agent_session"] = {"agent": rec["agent"], "kind": "id", "source": "herdr:" + rec["agent"],
                                 "value": p["session"]}

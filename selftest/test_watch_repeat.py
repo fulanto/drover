@@ -53,22 +53,28 @@ class RepeatCliTests(DroverTestCase):
         self.set_agents(a=before)
         return self.watch_then(["a", *FAST, "--timeout", timeout], 1, lambda: self.set_agents(a=after))
 
+    def change_blocked(self, before: dict, after: dict) -> tuple:
+        """同 change，但开头就是 blocked：--until-event 第一轮有 blocked 就退出（test_watch_states），所以不带它、跑满 3 秒
+        假时间。返回 (退出码, 第一行事件, 之后的事件，末尾是 EVENT timeout)。"""
+        self.set_agents(a=before)
+        return self.watch_then(["a", *FAST[1:], "--timeout", "3"], 1, lambda: self.set_agents(a=after))
+
     def test_blocked_seq_changed_reports_again(self) -> None:
-        """blocked → (序号变了，中间那下 working 没轮询到) → blocked、弹框一样 → 再报一次 blocked，--until-event 第二次时退出"""
-        rc, first, rest = self.change({"status": "blocked", "seq": 10, "screen": BASH_NAMED},
-                                      {"status": "blocked", "seq": 12, "screen": BASH_NAMED})
-        self.assertEqual((rc, first, rest), (0, ["EVENT a blocked"], ["EVENT a blocked"]))
+        """blocked → (序号变了，中间那下 working 没轮询到) → blocked、弹框一样 → 再报一次 blocked"""
+        rc, first, rest = self.change_blocked({"status": "blocked", "seq": 10, "screen": BASH_NAMED},
+                                              {"status": "blocked", "seq": 12, "screen": BASH_NAMED})
+        self.assertEqual((rc, first, rest), (0, ["EVENT a blocked"], ["EVENT a blocked", "EVENT timeout"]))
 
     def test_blocked_dialog_changed_reports_again(self) -> None:
         """blocked、序号没变，弹框换了（并行两个工具调用，批完第一个，第二个立刻弹出来）→ 再报一次 blocked"""
-        rc, first, rest = self.change({"status": "blocked", "seq": 10, "screen": PARALLEL_FIRST},
-                                      {"status": "blocked", "seq": 10, "screen": PARALLEL_SECOND})
-        self.assertEqual((rc, first, rest), (0, ["EVENT a blocked"], ["EVENT a blocked"]))
+        rc, first, rest = self.change_blocked({"status": "blocked", "seq": 10, "screen": PARALLEL_FIRST},
+                                              {"status": "blocked", "seq": 10, "screen": PARALLEL_SECOND})
+        self.assertEqual((rc, first, rest), (0, ["EVENT a blocked"], ["EVENT a blocked", "EVENT timeout"]))
 
     def test_blocked_unchanged_not_reported(self) -> None:
         """blocked、序号和弹框都不变（弹框上方那行的 ⏺ 一直在闪）→ 不重报，到期 timeout"""
         self.set_agents(a={"status": "blocked", "seq": 10, "screens": [PARALLEL_SECOND, PARALLEL_SECOND_BLINK] * 30})
-        rc, evs, _ = self.watch("a", *FAST, "--timeout", "3")
+        rc, evs, _ = self.watch("a", *FAST[1:], "--timeout", "3")
         self.assertEqual((rc, evs), (0, ["EVENT a blocked", "EVENT timeout"]))
         self.assertGreater(self.herdr_state()["agents"]["a"]["reads"], 3)  # 确实每轮都在读屏幕取指纹
 
@@ -81,9 +87,9 @@ class RepeatCliTests(DroverTestCase):
     def test_done_dialog_changed_reports_again(self) -> None:
         """herdr 报 done 的 WebFetch 弹框 → 序号没变、换成另一个域名的弹框 → 再报一次 blocked"""
         other = webfetch_dialog("docs.example.invalid") + "\n" + NAMED_RULE
-        rc, first, rest = self.change({"status": "done", "seq": 10, "screen": WEBFETCH_NAMED},
-                                      {"status": "done", "seq": 10, "screen": other})
-        self.assertEqual((rc, first, rest), (0, ["EVENT a blocked"], ["EVENT a blocked"]))
+        rc, first, rest = self.change_blocked({"status": "done", "seq": 10, "screen": WEBFETCH_NAMED},
+                                              {"status": "done", "seq": 10, "screen": other})
+        self.assertEqual((rc, first, rest), (0, ["EVENT a blocked"], ["EVENT a blocked", "EVENT timeout"]))
 
     def test_waiting_background_seq_changed_not_reported(self) -> None:
         """挂着 Monitor 的编排者处理完一个 worker 事件（序号变了），还是同一个 waiting-background(1) → 不重报"""

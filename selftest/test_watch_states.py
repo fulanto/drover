@@ -165,13 +165,31 @@ class DoneStateTests(DroverTestCase):
         """正常 done → 空串（watch 照报 done）"""
         self.assertEqual(self.done_state(NORMAL), "")
 
-    def test_background_wins_over_api_error(self) -> None:
-        """既有接口错误又有后台命令 → 报 waiting-background（后台命令结束会把 agent 叫醒）"""
-        self.assertEqual(self.done_state(API_503.replace("· ← 1 agent", "· 1 shell · ← 1 agent")),
-                         "waiting-background(1)")
+    def test_api_error_wins_over_background(self) -> None:
+        """既有接口错误又有后台命令 → 报 api-error：这一轮被打断了、编排者自己不会再动；后台命令（Monitor 到期前最多 30 分钟，
+        留着的 dev server 一直不退）不会替它续上，以前报 waiting-background 就一直没人管"""
+        self.assertEqual(self.done_state(API_503.replace("· ← 1 agent", "· 1 shell · ← 1 agent")), "api-error")
 
 
 class WatchStateCliTests(DroverTestCase):
+    def test_until_event_first_round_needs_handling(self) -> None:
+        """--until-event 第一轮（重挂时）就有 blocked / api-error / gone → 输出完当前状态就退出（这三种处理过就不会还在，Codex
+        编排者处理上一个事件期间别的 worker 卡住的不白等 25 分钟）；只有 done / idle / working / waiting-background 的不退出，
+        到期 timeout（done / idle 分不出处理过没有）"""
+        for name, agents, want in (
+                ("blocked", {"a": {"status": "blocked", "screen": BASH_DIALOG}}, "EVENT a blocked"),
+                ("api-error", {"a": {"status": "done", "screen": API_503}}, "EVENT a api-error"),
+                ("gone", {}, "EVENT a gone")):
+            with self.subTest(name):
+                self.set_agents(w={"status": "done", "screen": NORMAL}, **agents)
+                rc, evs, secs = self.watch("w", "a", "--until-event", "--interval", "1", "--stall-minutes", "0",
+                                           "--quiet-minutes", "0", "--timeout", "30")
+                self.assertEqual((rc, evs, secs), (0, ["EVENT w done", want], 0))
+        self.set_agents(w={"status": "done", "screen": NORMAL}, x={"status": "idle", "screen": NORMAL},
+                        b={"status": "done", "screen": SHELL}, y={"status": "working", "screen": NORMAL})
+        rc, evs, secs = self.watch("w", "x", "b", "y", "--until-event", "--interval", "1", "--stall-minutes", "0",
+                                   "--quiet-minutes", "0", "--timeout", "5")
+        self.assertEqual((rc, evs[-1], secs >= 5), (0, "EVENT timeout", True))
     def test_once_reports_each_state(self) -> None:
         """watch --once：done / idle 看屏幕改报 blocked（确认弹框）/ waiting-background / api-error，working 也读屏幕
         （只认确认框，停在 API Error 的屏幕照样报 working），不在列表里的报 gone"""

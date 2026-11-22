@@ -97,14 +97,14 @@ drover 是这套派发体系的名字，也是它的命令（Claude Code 的 `/d
 1. 用 Write 写 `~/.drover/<上层 slug>-<仓库>/request.md`：用户原话（从你的 request.md 原样抄）；"目标"：开头是用户的目标，后面接这个仓库要做成的事；这个仓库的条目和范围；你定下的跨仓约定（接口字段、发布顺序、迁移先后）；不做什么。
 2. 启动：`drover orch-start --slug <上层 slug>-<仓库> --name orch-<缩写>-<仓库缩写> --parent <上层 slug> --request-file <上一步的文件> --args "@<仓库> <用户写的参数>"`。脚本会在你的状态文件里追加一行子编排者的记录，在子任务目录写 `parent.json`。
 3. 用 watch 把子编排者和你自己的 worker 一起追踪。它变成 done / idle，或者 watch 报它的 `rollup:<状态>` 事件时（它写完 rollup 可能还挂着 watch 盯自己的 worker，这时状态行是 `waiting-background(N)`，只有 rollup 事件会叫醒你），读它的 `rollup.md`（直接读文件，或者 `drover rollup --slug <子 slug>` 都行；看别的任务的 rollup 也一样。`drover rollup` 只有主会话读才记成已读，你读不会让主会话漏转，输出开头会多一行"不是主会话，没记已读"）：能定的事你直接定，用 `drover prompt --name <子编排者>` 回复；要用户定的，写进你自己的 rollup 交给用户。你的 rollup 里只写汇总，不转贴子编排者的原文。
-4. 子编排者 rollup 写"可以推送"时，按跨仓推送顺序给它发"推送"（第 9.1 节），推完再发下一个仓库的。
+4. 用户要求提交推送之后（第 9.1 节的前提，没要求就不发），按跨仓推送顺序逐个给子编排者转"提交推送"：写明"用户已要求推送"，带用户原话和这个仓库的目标分支（以用户这次的授权为准，同第 9.1 节第 5 步）；它推完写"完成"再发下一个仓库的。
 5. 用户说"收尾"时，给每个子编排者发"收尾"，它们各自先写自己的 wrapup.md 再清理（第 9 节"任务收尾"）。它们的 rollup 都写了收尾的"完成"后，读它们的 wrapup.md（子编排者的汇总，不是 worker 原文，可以读），合进你自己的 wrapup.md：`drover wrapup --slug <上层 slug>` 会自动带上子任务的推送记录，变更总结、数据库、配置、上线这几节从它们的 wrapup.md 里合进来。然后用 `herdr tab close` 关掉它们的 tab，再做你自己的清理。
 6. 子编排者上下文用满（rollup 标"需要换编排者"）时，由你用 `orch-start --parent … --args "resume <子 slug>"` 换人。
 
 **你是子编排者时**（参数带 `--parent <上层 slug>`）：
 
 - 照本文件做你这个仓库的条目、验收和集成检查。要决定的事、阶段结论写进你自己的 `rollup.md` 后停下，由上层读、上层转达；不用向用户提问的工具。rollup 开头的"状态："下面加一行 `上层：<上层 slug>`（"标题："、"摘要："这些排在它下面）。停下时照上面"编排者模式"的规则：写"等你决定"不停盯 worker 的 watch，写"完成 / 受阻 / 需要换编排者"之前停掉所有 Monitor 和后台命令；上层靠 watch 的 `rollup:<状态>` 事件收到信号。
-- 整体检查通过后，状态标"等你决定"，"需要你决定"里写"可以推送"（附整体检查结果和要执行的迁移），然后停下。收到上层发的"推送"后再按第 9.1 节第 4、5 步执行迁移和推送，推完写"完成"。
+- 条目验收都通过后，状态标"等你决定"，"需要你决定"里写"等上层转达提交推送"（附条目验收结果），然后停下；用户没要求之前不提交、不集成（同顶层：第 9.1 节在用户明确要求后才做）。收到上层转达的"提交推送"（写明用户已要求推送、带用户原话和这个仓库的目标分支）后按第 9.1 节做完（目标分支以转达里的为准），推完写"完成"；没带原话或目标分支的不做，写进 rollup 问上层。
 - 收到上层发的"收尾"后，照第 9 节"任务收尾"先写你自己的 wrapup.md 再清理，rollup 写收尾的"完成"后停下；你的 tab 由上层关。
 - 跨仓约定和你仓库的代码对不上时，不要自己改约定，写进 rollup 让上层定。
 
@@ -733,7 +733,7 @@ worktree、workspace 保留到用户说"清理"或"收尾"（下面"任务收尾
 - **入口**：`~/.codex/skills/drover/SKILL.md`（`$drover`）只是一层壳，让你完整读本文件；herdr 技能是 `$herdr`（`~/.codex/skills/herdr`：drover 的 install.py 安装时已有就不动，没有时软链到 `~/.claude/skills/herdr`，没有那份就用 `herdr --skill` 生成）。
 - **开始前先读**（Codex 不会自动加载）：`~/.claude/CLAUDE.md`（用户全局规则：不自行提交推送、编码规范等；里面如果有命令写法的审批规则，那是给 Claude Code 的，Codex 可以不管，附录 A"权限"那几条同理）和主工作台的记忆索引 `~/.claude/projects/<目录名>/memory/MEMORY.md`（目录名是主工作台 `workspace` 的绝对路径把非字母数字字符换成 `-`，如 `/home/me/work` → `-home-me-work`；有就读，和任务相关的条目读原文，比如推送目标分支这类经常变的约定）。项目规则（迁移流程、编码规范等）在项目仓库的 `AGENTS.md` / `CLAUDE.md` 里，第 2 节第 1 步读；团队 profile（可选）第 2 节用 `drover playbook` 读。`<workspace>/AGENTS.md` 会自动加载，编排者忽略其中的路由规则。
 - **沙箱**：Codex 编排者（主会话是 Codex 时默认就是，或者 `orch-start --kind codex`）由 orch-start 以 `-s danger-full-access -a on-request` 启动。workspace-write 沙箱挡住 AF_UNIX socket，连不上 herdr（用 `codex sandbox -P :workspace -- herdr agent list` 实测报 Operation not permitted），也写不了 `~/.drover`、不能联网。主会话跑在 Codex 里时同样要 danger-full-access（`~/.codex/config.toml` 的 `sandbox_mode`）。worker 仍用 workspace-write（第 4 节），它只跑 `drover heavy`，不碰 herdr；`agent-start` 用 `--add-dir` 放行 heavy 的调度目录 `~/.drover/locks/heavy/`，它的测试、构建照样进全机调度。
-- **追踪**（没有 Monitor）：`~/.drover/bin/drover watch --until-event --timeout 1500 <agent名>...`。它先输出一遍当前状态，然后在第一个事件（状态变化、同一状态的重报、子编排者的 `rollup:<状态>`）、1500 秒到期（`EVENT timeout`）或 herdr 连不上时退出。用 exec_command 启动（最多等 30 秒就会返回 session_id），没退出就用 write_stdin 空轮询（`yield_time_ms: 300000`），直到拿到 exit_code；处理完事件再挂下一轮。开头那几行是当前状态，已经处理过的不用再处理。编排者的窗口没人看，长时间阻塞等待是预期的，不受"阻塞不要超过 60 秒"那条的限制。写"等你决定"结束这一轮后就没人盯 worker 了（编排者模式里的已知局限），收到答复恢复追踪时先 `watch --once` 看一遍。
+- **追踪**（没有 Monitor）：`~/.drover/bin/drover watch --until-event --timeout 1500 <agent名>...`。它先输出一遍当前状态，然后在第一个事件（状态变化、同一状态的重报、子编排者的 `rollup:<状态>`）、1500 秒到期（`EVENT timeout`）或 herdr 连不上时退出。用 exec_command 启动（最多等 30 秒就会返回 session_id），没退出就用 write_stdin 空轮询（`yield_time_ms: 300000`），直到拿到 exit_code；处理完事件再挂下一轮。开头那几行是当前状态，已经处理过的不用再处理；开头就有 `blocked` / `api-error` / `gone` 时输出完就退出（这三种处理过就不会还在），所以已经退出、不再追踪的 agent 别再写进名单。编排者的窗口没人看，长时间阻塞等待是预期的，不受"阻塞不要超过 60 秒"那条的限制。写"等你决定"结束这一轮后就没人盯 worker 了（编排者模式里的已知局限），收到答复恢复追踪时先 `watch --once` 看一遍。
 - **长命令**（带全量测试的 accept、integrate 装依赖）：同样 exec_command 启动、write_stdin 轮询到退出，不用 sleep 干等。
 - **向用户提问**：编排者不用 request_user_input，一律写 rollup。主会话直接编排时：选项明确的用 request_user_input_async（不会结束这一轮，用户的回复作为新消息到达），其他用文字。
 - **子代理**：有 spawn_agent（多 agent 功能）就派一个做只读搜索，没有就自己用 `rg` / `git grep` 搜。
