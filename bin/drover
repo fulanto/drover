@@ -9247,7 +9247,7 @@ def cmd_wrapup(a: argparse.Namespace) -> dict:
 # 推过的远端分支（的历史）里、里面的 agent 没在干活，才删 worktree（herdr worktree remove 会关掉 workspace 和里面所有 agent）、删本地
 # 分支；核实不过的不动、列原因，照旧问用户。探测 / 调研用的 worktree（--probe）不要求在远端：先把本地独有的提交和没提交
 # 的改动存成 patch 放进任务目录，存成了再删。主检出永远不动。误判只允许落在"不删"这一边：核对的远端分支先 fetch 到最新，
-# fetch 不了的不拿来核对；看不清的（agent 列表读不到、合并提交、补丁对不上）一律不删。
+# fetch 不了的不拿来核对；看不清的（agent 列表读不到、合并提交、补丁对不上、内嵌 git 仓库）一律不删。
 CLEANUP_IDLE = ("idle", "done")  # agent 只有这两种状态（按屏幕修正之后）才算没在干活
 CLEANUP_LIST_LIMIT = 10
 CLEANUP_HISTORY_LIMIT = 200  # 没提交的改动在一条核对分支的历史里，每个文件（和整份补丁）最多往回查这么多个碰过它的提交
@@ -9302,14 +9302,13 @@ def cleanup_agents(agents: Optional[list], path: str, ws_id: Optional[str]) -> t
     return names, reasons
 
 
-def cleanup_commits(where: str, rev: str, refs: list) -> list:
-    """rev 上的提交都在核对分支里吗：不是任一核对分支祖先的提交，要在某条分支的 git cherry 里是 "-"（补丁内容相同，挑过去
-    的也算）。git cherry 不看合并提交，所以本地独有的合并提交直接算没过。返回没过的原因（空 = 过）；没过的由 cleanup_content /
-    cleanup_branch 再按文件三方合并核实（解过冲突的 cherry-pick、合并提交）。"""
+def unverified_commits(where: str, rev: str, refs: list) -> tuple[list, set]:
+    """rev 上没核实过的提交（rev-list 的顺序，从新到旧）和本地独有的合并提交：不是任一核对分支祖先的提交，要在某条分支的
+    git cherry 里是 "-"（补丁内容相同，挑过去的也算）才算核实过。git cherry 不看合并提交，所以合并提交直接算没过。"""
     shas = [r["sha"] for r in refs]
     local = git_out(where, "rev-list", rev, "--not", *shas).splitlines()
     if not local:
-        return []
+        return [], set()
     merges = set(git_out(where, "rev-list", "--merges", rev, "--not", *shas).splitlines())
     equal: set = set()
     for r in refs:
@@ -9317,6 +9316,13 @@ def cleanup_commits(where: str, rev: str, refs: list) -> list:
         if c.returncode == 0:
             equal |= {line.split()[1] for line in c.stdout.splitlines() if line.startswith("- ")}
     bad = [s for s in local if s in merges or s not in equal]
+    return bad, merges
+
+
+def cleanup_commits(where: str, rev: str, refs: list) -> list:
+    """rev 上的提交都在核对分支里吗（unverified_commits）。返回没过的原因（空 = 过）；没过的由 cleanup_content /
+    cleanup_branch 再按文件三方合并核实（解过冲突的 cherry-pick、合并提交）。"""
+    bad, merges = unverified_commits(where, rev, refs)
     names = "、".join(r["ref"] for r in refs)
     reasons = [f"提交 {s[:9]} {git_out(where, 'log', '-1', '--format=%s', s)}："
                + ("合并提交，核实不了补丁内容" if s in merges else f"不在 {names} 里（不是祖先，补丁内容也对不上）")
@@ -9326,16 +9332,33 @@ def cleanup_commits(where: str, rev: str, refs: list) -> list:
     return reasons
 
 
+def compare_bases(where: str, head: str, refs: list) -> dict:
+    """三方合并的对比起点 {核对分支: 提交}：没核实过的内容开始之前。head 上的提交都核实过（只剩没提交的改动）是 head 自己；
+    有没过的是最老那个的父提交（没有合并提交时本地独有的提交是一条链，rev-list 列出的最后一个最老）；没过的里有合并提交、
+    或者最老那个没有父提交，退回 head 和这条分支的分叉点（merge-base）。不一律用分叉点：条目提交推上去之后又删掉其中几行，
+    相对分叉点只是"加得比远端少"，全删回去就和分叉点一样，都会判成已包含。和这条分支没有共同历史的是 None（没法合并）。"""
+    bad, merges = unverified_commits(where, head, refs)
+    since = None if merges else rev_commit(where, f"{bad[-1]}^" if bad else head)
+    forks = {r["ref"]: git(where, "merge-base", head, r["sha"]).stdout.strip() or None for r in refs}
+    return {ref: fork and (since or fork) for ref, fork in forks.items()}
+
+
 def worktree_index(wt: str, tmp: str) -> dict:
     """整个工作区（已跟踪文件的改动、暂存的、没被 .gitignore 忽略的未跟踪文件）读进临时 index（只建一次），不动 worktree
     自己的 index：read-tree HEAD → add -A。返回用这个 index 的 git 环境变量。add -A 会往对象库写 blob（gc 会清），
-    不改分支、index、工作区。"""
+    不改分支、index、工作区。工作区里有内嵌 git 仓库（子目录自己有 .git：自己 git init / clone 的、初始化过的子模块）就
+    报错：index 里只记得下它的一个提交号（160000），里面的文件、提交、改动核实不了，也存不进 patch。"""
     env = {"GIT_INDEX_FILE": str(Path(tmp) / "worktree.index"), "GIT_LITERAL_PATHSPECS": "1"}
     if not (Path(tmp) / "worktree.index").exists():
-        for args in (("read-tree", "HEAD"), ("add", "-A")):
+        for args in (("read-tree", "HEAD"), ("add", "-A"), ("ls-files", "--stage", "-z")):
             p = git(wt, *args, env=env, timeout=600)
             if p.returncode != 0:
                 raise DroverError(f"git {' '.join(args)}（临时 index）失败：{tail(p.stderr, 300)}", worktree_path=wt)
+        nested = [path for meta, path in z_entries(p.stdout)  # 最后那条 ls-files 的输出
+                  if meta.startswith("160000 ") and (Path(wt) / path / ".git").exists()]
+        if nested:
+            raise DroverError(f"worktree 里有内嵌 git 仓库 {'、'.join(nested[:CLEANUP_LIST_LIMIT])}（子目录自己有 .git）："
+                              "临时 index 只记得下它的提交号，里面的文件和提交核实不了、也存不进 patch", worktree_path=wt)
     return env
 
 
@@ -9347,45 +9370,66 @@ def worktree_tree(wt: str, tmp: str) -> str:
     return p.stdout.strip()
 
 
-def worktree_patch(wt: str, tmp: str, path: Optional[str] = None) -> tuple[bytes, list]:
+def worktree_patch(wt: str, tmp: str, path: Optional[str] = None) -> tuple[bytes, list, dict]:
     """整个工作区相对 HEAD 的改动（worktree_index）：diff --cached --binary HEAD。path 给了只要这一个文件的。
-    返回 (补丁, 改动的文件)。"""
+    返回 (补丁, 改动的文件, {模式变了的文件（新增的也算）: 现在的模式})。"""
     env = worktree_index(wt, tmp)
     only = ["--", path] if path else []
     diff = git_bytes(wt, "diff", "--cached", "--binary", "--no-renames", "HEAD", *only, env=env)
-    names = git(wt, "-c", "core.quotePath=false", "diff", "--cached", "--name-only", "--no-renames", "HEAD", *only, env=env)
-    if diff.returncode != 0 or names.returncode != 0:
-        raise DroverError(f"git diff --cached（临时 index）失败：{tail(names.stderr, 300)}", worktree_path=wt)
-    return diff.stdout, names.stdout.splitlines()
+    raw = git(wt, "diff", "--cached", "--raw", "-z", "--no-renames", "HEAD", *only, env=env)
+    if diff.returncode != 0 or raw.returncode != 0:
+        raise DroverError(f"git diff --cached（临时 index）失败：{tail(raw.stderr, 300)}", worktree_path=wt)
+    parts = raw.stdout.split("\0")  # :<旧模式> <新模式> <旧对象> <新对象> <状态>\0<路径>\0…
+    files, modes = [], {}
+    for meta, name in zip(parts[0::2], parts[1::2]):
+        old, new = meta.lstrip(":").split()[:2]
+        files.append(name)
+        if new not in (old, "000000"):
+            modes[name] = new
+    return diff.stdout, files, modes
 
 
-def patch_in_ref(wt: str, tmp: str, patch: bytes, sha: str) -> bool:
-    """补丁在 sha 的树上反向应用得上（临时 index 读那棵树，git apply --cached --check -R）= 这些改动那棵树里都有。
-    临时 index 每次复用同一个文件（read-tree 整个覆盖）。"""
+def z_entries(out: str) -> list:
+    """git ls-files --stage -z / ls-tree -z 的输出切成 [(<模式> <对象> …, 路径)]。"""
+    return [(meta, path) for meta, _, path in (e.partition("\t") for e in out.split("\0") if e)]
+
+
+def modes_at(where: str, rev: str, paths: list) -> dict:
+    """rev 里这些路径的模式 {路径: 模式（100644 / 100755 / 120000 / 160000）}；rev 里没有的路径不在里面。"""
+    p = git(where, "ls-tree", "-z", "--full-tree", rev, "--", *paths, env={"GIT_LITERAL_PATHSPECS": "1"})
+    return {path: meta.split()[0] for meta, path in z_entries(p.stdout)}
+
+
+def patch_in_ref(wt: str, tmp: str, patch: bytes, modes: dict, sha: str) -> bool:
+    """补丁在 sha 的树上反向应用得上（临时 index 读那棵树，git apply --cached --check -R）= 这些改动那棵树里都有。git apply
+    不看权限位（对不上只打警告），所以模式变了的文件（modes，worktree_patch 给的）另外核 sha 里的模式。临时 index 每次复用
+    同一个文件（read-tree 整个覆盖）。"""
     env = {"GIT_INDEX_FILE": str(Path(tmp) / "remote.index")}
     if git(wt, "read-tree", sha, env=env).returncode != 0:
         return False
-    return git_bytes(wt, "apply", "--cached", "--check", "-R", env=env, input_bytes=patch).returncode == 0
+    if git_bytes(wt, "apply", "--cached", "--check", "-R", env=env, input_bytes=patch).returncode != 0:
+        return False
+    return not modes or modes_at(wt, sha, list(modes)) == modes
 
 
 def history_candidates(wt: str, ref_sha: str, files: list, pushed: list, head: str = "HEAD") -> tuple[list, bool]:
-    """核对分支历史里可能含这些改动的提交，按先后试：推送记录里推上去的提交（是这条分支祖先的，从新到旧），再是 head
-    （worktree 的 HEAD，没有 worktree 的分支是它自己）之后、碰过这些文件的提交（git rev-list <head>..<分支> -- <文件>，
-    从新到旧），最多 CLEANUP_HISTORY_LIMIT 个。返回 (提交, 碰过这些文件的提交是否超了上限、没查完)。"""
-    out = [s for s in pushed if s != ref_sha and is_ancestor(wt, s, ref_sha)]
+    """核对分支历史里可能含这些改动的提交，按先后试：分支头，推送记录里推上去的提交（是这条分支祖先的，从新到旧），再是
+    head（worktree 的 HEAD，没有 worktree 的分支是它自己）之后、碰过这些文件的提交（git rev-list <head>..<分支> -- <文件>，
+    从新到旧），最多 CLEANUP_HISTORY_LIMIT 个。是 head 祖先的不算：它比 worktree 现有的内容还旧，改动在它上面对得上只说明
+    退回了它之后的东西（撤回以前推过的改动），不说明推上去了。返回 (提交, 碰过这些文件的提交是否超了上限、没查完)。"""
+    out = [s for s in dict.fromkeys([ref_sha, *pushed]) if is_ancestor(wt, s, ref_sha) and not is_ancestor(wt, s, head)]
     p = git(wt, "rev-list", f"--max-count={CLEANUP_HISTORY_LIMIT + 1}", f"{head}..{ref_sha}", "--", *files,
             env={"GIT_LITERAL_PATHSPECS": "1"})
     revs = p.stdout.split() if p.returncode == 0 else []
-    out += [s for s in revs[:CLEANUP_HISTORY_LIMIT] if s not in out and s != ref_sha]
+    out += [s for s in revs[:CLEANUP_HISTORY_LIMIT] if s not in out]
     return out, len(revs) > CLEANUP_HISTORY_LIMIT
 
 
-def patch_in_history(wt: str, tmp: str, patch: bytes, ref: dict, files: list, pushed: list) -> tuple[Optional[str], bool]:
-    """补丁在核对分支 ref 的历史里有没有：先试分支头（最快），再试 history_candidates。返回 (对上的提交或 None, 没查完)。"""
-    if patch_in_ref(wt, tmp, patch, ref["sha"]):
-        return ref["sha"], False
+def patch_in_history(wt: str, tmp: str, patch: bytes, modes: dict, ref: dict, files: list,
+                     pushed: list) -> tuple[Optional[str], bool]:
+    """补丁在核对分支 ref 的历史里有没有：按 history_candidates 的先后逐个试 patch_in_ref。返回 (对上的提交或 None, 没查完)。"""
     candidates, more = history_candidates(wt, ref["sha"], files, pushed)
-    hit = next((sha for sha in candidates if patch_in_ref(wt, tmp, patch, sha)), None)
+    hit = next((sha for sha in candidates if patch_in_ref(wt, tmp, patch, modes, sha)), None)
     return hit, more and not hit
 
 
@@ -9508,10 +9552,10 @@ def lines_fit(changed: list, new: list, seg: list) -> bool:
 
 def side_contained(tmp: str, base: list, ours: list, theirs: list) -> bool:
     """ours 相对 base 的改动都已在 theirs 里吗：按行三方合并后，每个冲突块换成 theirs 一侧，结果要和 theirs 完全相同（不冲突处
-    ours 的改动 theirs 都有）；每个冲突块里 ours 一侧要作为连续的一段出现在 theirs 一侧里（theirs 在同一处加了更多东西，
-    比如表格相邻的行），ours 一侧是空的（我们删了、对方改了）只有 theirs 一侧也空才算。对不上的冲突块在这一块里先按行、
-    再对两边都改过的行按词判（edits_contained + lines_fit）：块里有我们没改、对方改了的行，表格相邻几行两边各改，或者两边
-    改了同一长行（对方解冲突时又在同一行里插了字、换了词）。按词只在冲突块里两边都改过的行上做，不冲突的地方照样要整行
+    ours 的改动 theirs 都有）；每个冲突块先按行、再对两边都改过的行按词判（edits_contained + lines_fit）：块里有我们没改、
+    对方改了的行，表格相邻几行两边各改，或者两边改了同一长行（对方解冲突时又在同一行里插了字、换了词）。我们删掉 / 换掉的
+    行 theirs 原样留着就不算包含：不能只看 ours 一侧是不是作为连续的一段出现在 theirs 一侧里（换掉一行、远端新旧两行都在，
+    或者删一行、远端只带了旁边那行的改动时，那样会判成包含）。按词只在冲突块里两边都改过的行上做，不冲突的地方照样要整行
     相同，所以"加的一行在文件别处出现过"不会算包含。"""
     blocks = merge3(tmp, base, ours, theirs)
     if blocks is None:
@@ -9523,8 +9567,7 @@ def side_contained(tmp: str, base: list, ours: list, theirs: list) -> bool:
             continue
         _, th, ba, ou = b
         rebuilt += th
-        inside = run_in(ba, ou, th) if ou else not th
-        if not inside and not edits_contained(ba, ou, th, lines_fit):
+        if not edits_contained(ba, ou, th, lines_fit):
             return False
     return rebuilt == theirs
 
@@ -9544,27 +9587,34 @@ def file_contained(tmp: str, base: Optional[bytes], ours: Optional[bytes], their
 
 
 def blob_at(wt: str, rev: str, path: str) -> Optional[bytes]:
-    """rev 里这个文件的内容；没有这个文件返回 None。"""
+    """rev 里这个文件的内容；子模块 / 内嵌仓库（160000，对象库里没有它的内容）写成 git diff 的样子 "Subproject commit <提交号>"，
+    不然两边都取不到、比起来一样；没有这个文件返回 None。"""
     p = git_bytes(wt, "cat-file", "blob", f"{rev}:{path}")
-    return p.stdout if p.returncode == 0 else None
+    if p.returncode == 0:
+        return p.stdout
+    link = git(wt, "rev-parse", "--verify", "--quiet", f"{rev}:{path}")
+    return f"Subproject commit {link.stdout.strip()}\n".encode() if link.returncode == 0 else None
 
 
-def file_in_history(wt: str, tmp: str, path: str, ours: Optional[bytes], refs: list, bases: dict,
+def file_in_history(wt: str, tmp: str, path: str, tree: str, refs: list, bases: dict,
                     pushed: list, head: str = "HEAD") -> tuple[Optional[dict], bool]:
-    """path 的改动（ours 相对这条分支和 head 的分叉点 bases[ref]）在哪条核对分支历史里的某个提交上已包含（file_contained）：
-    候选同 patch_in_history（分支头、推送记录推上去的提交、之后碰过它的提交，最多 CLEANUP_HISTORY_LIMIT 个）。分叉点上
-    就是这样（没改）的直接算。返回 ({ref, commit, how} 或 None, 碰过它的提交超了上限、没查完)。"""
+    """path 在 tree 里的样子相对这条分支的对比起点 bases[ref]（compare_bases）的改动，在哪条核对分支历史里的某个提交上已
+    包含：内容按 file_contained；模式变了的（可执行位，新增、删除也算）那个提交里的模式也得一样。候选同 patch_in_history
+    （history_candidates）。起点上就是这样（内容和模式都没改）的直接算。返回 ({ref, commit, how} 或 None, 碰过它的提交超了
+    上限、没查完)。"""
+    ours, mode = blob_at(wt, tree, path), modes_at(wt, tree, [path]).get(path)
     over = False
     for r in refs:
         fork = bases.get(r["ref"])
         if not fork:
             continue
-        base = blob_at(wt, fork, path)
-        if base == ours:
+        base, base_mode = blob_at(wt, fork, path), modes_at(wt, fork, [path]).get(path)
+        if (base, base_mode) == (ours, mode):
             return {"ref": r["ref"], "commit": fork[:12], "how": "分叉点上就是这样"}, False
         candidates, more = history_candidates(wt, r["sha"], [path], pushed, head)
-        for sha in [r["sha"], *candidates]:
-            if file_contained(tmp, base, ours, blob_at(wt, sha, path)):
+        for sha in candidates:
+            if file_contained(tmp, base, ours, blob_at(wt, sha, path)) and \
+                    (mode == base_mode or modes_at(wt, sha, [path]).get(path) == mode):
                 return {"ref": r["ref"], "commit": sha[:12], "how": "三方合并"}, False
         over = over or more
     return None, over
@@ -9572,20 +9622,20 @@ def file_in_history(wt: str, tmp: str, path: str, ours: Optional[bytes], refs: l
 
 def files_in_history(where: str, tmp: str, head: str, tree: str, refs: list, pushed: list,
                      only: Optional[list]) -> Optional[tuple]:
-    """按文件三方合并核实 tree（整个工作区，或者分支头的树）相对它和每条核对分支的分叉点（merge-base <head> <分支>）的
-    改动；only 给了只查这些文件，否则查各分叉点到 tree 的全部改动。和哪条核对分支都没有共同历史返回 None（没法合并）。
-    返回 ({文件: {ref, commit, how}}, 找不到的文件, 超了上限没查完的文件)。"""
-    bases = {r["ref"]: (git(where, "merge-base", head, r["sha"]).stdout.strip() or None) for r in refs}
+    """按文件三方合并核实 tree（整个工作区，或者分支头的树）相对对比起点（compare_bases：没核实过的内容开始之前）的改动；
+    only 给了只查这些文件，否则查各起点到 tree 的全部改动（只改了模式的也算）。和哪条核对分支都没有共同历史返回 None
+    （没法合并）。返回 ({文件: {ref, commit, how}}, 找不到的文件, 超了上限没查完的文件)。"""
+    bases = compare_bases(where, head, refs)
     if not any(bases.values()):
         return None
     check: set = set(only or [])
     if only is None:
-        for fork in filter(None, bases.values()):
+        for fork in set(filter(None, bases.values())):
             check |= set(git(where, "-c", "core.quotePath=false", "diff", "--name-only", "--no-renames", fork,
                              tree).stdout.splitlines())
     merged, missing, unsure = {}, [], []
     for f in sorted(check):
-        hit, over = file_in_history(where, tmp, f, blob_at(where, tree, f), refs, bases, pushed, head)
+        hit, over = file_in_history(where, tmp, f, tree, refs, bases, pushed, head)
         if hit:
             merged[f] = hit
         else:
@@ -9609,8 +9659,8 @@ def content_reasons(refs: list, missing: list, unsure: list, uncommitted: list) 
 
 
 def cleanup_branch(repo: str, branch: str, refs: list, pushed: list) -> tuple[list, dict]:
-    """没有 worktree 的本地分支：提交快路径（cleanup_commits）没过时，按文件三方合并核实分支头的树相对分叉点的改动
-    （files_in_history）。返回 (不删的原因, found_in)。"""
+    """没有 worktree 的本地分支：提交快路径（cleanup_commits）没过时，按文件三方合并核实分支头的树相对对比起点
+    （compare_bases）的改动（files_in_history）。返回 (不删的原因, found_in)。"""
     rev = f"refs/heads/{branch}"
     reasons = cleanup_commits(repo, rev, refs)
     if not reasons:
@@ -9629,28 +9679,29 @@ def cleanup_content(wt: str, refs: list, pushed: list) -> dict:
     """worktree 里的东西（已提交的、没提交的、没被忽略的未跟踪文件）都在某条核对分支的历史里吗。要保证的是删了不丢东西：
     内容在远端分支历史里任何一个提交上都有就能找回，不要求还在分支头上（推上去之后后来的轮次又改了同一处也算）。
     快路径：已提交的按 cleanup_commits（祖先、git cherry）；没提交的整份补丁、再逐个文件，对分支头和历史（patch_in_history）
-    严格反向应用。快路径对不上的走按文件的三方合并（file_in_history）：base 是 worktree 和那条分支的分叉点
-    （merge-base HEAD <分支>，patch 模式 HEAD 本身就在远端里，base 就是 HEAD），ours 是整个工作区现在的文件（worktree_tree）。
-    已提交的那侧没过时（合并提交、解过冲突的 cherry-pick），查分叉点到工作区的全部改动；只有没提交的没过时，只查没过的文件。
+    严格反向应用。快路径对不上的走按文件的三方合并（file_in_history）：base 是没核实过的内容开始之前（compare_bases：提交都
+    核实过就是 HEAD，有没过的是最老那个的父提交，没过的里有合并提交才退回分叉点），ours 是整个工作区现在的文件（worktree_tree）。
+    已提交的那侧没过时（合并提交、解过冲突的 cherry-pick），查 base 到工作区的全部改动；只有没提交的没过时，只查没过的文件。
+    有内嵌 git 仓库时 worktree_index 报错（核实不了、不删）。
     返回 {files（没提交的改动）, reasons（空 = 过）, uncommitted_found_in, found_in}：后两个是 {文件或 "*": {ref, commit, how}}。"""
     commit_reasons = cleanup_commits(wt, "HEAD", refs)
     with tempfile.TemporaryDirectory(prefix="drover-cleanup-") as tmp:
 
-        def quick_hit(patch: bytes, paths: list) -> Optional[dict]:
+        def quick_hit(patch: bytes, paths: list, modes: dict) -> Optional[dict]:
             for r in refs:
-                hit = patch_in_history(wt, tmp, patch, r, paths, pushed)[0]
+                hit = patch_in_history(wt, tmp, patch, modes, r, paths, pushed)[0]
                 if hit:
                     return {"ref": r["ref"], "commit": hit[:12], "how": "快路径"}
             return None
 
-        patch, files = worktree_patch(wt, tmp)
+        patch, files, modes = worktree_patch(wt, tmp)
         quick: dict = {}
         failing: list = []
-        whole = quick_hit(patch, files) if files else None
+        whole = quick_hit(patch, files, modes) if files else None
         if whole:
             quick["*"] = whole
         for f in files if not whole else []:
-            hit = quick_hit(worktree_patch(wt, tmp, f)[0], [f])
+            hit = quick_hit(*worktree_patch(wt, tmp, f))
             if hit:
                 quick[f] = hit
             else:
@@ -9674,12 +9725,15 @@ def cleanup_content(wt: str, refs: list, pushed: list) -> dict:
 def probe_patches(wt: str, slug: str, branch: Optional[str], dry_run: bool) -> tuple[list, list, bool]:
     """探测模式：本地独有的提交（HEAD --not --remotes）存成 format-patch，没提交的改动（含没被忽略的未跟踪文件）存成
     diff，放进任务目录 probe-<分支>-<时间>.commits.patch / .worktree.patch。返回 (存下 / 会存的文件, 不删的原因, 工作区有没有
-    改动)。仓库没有远端跟踪分支（分不出本地独有的）、有本地独有的合并提交（format-patch 存不下）→ 不删。"""
+    改动)。仓库没有远端跟踪分支（分不出本地独有的）、有本地独有的合并提交（format-patch 存不下）→ 不删；有内嵌 git 仓库
+    （patch 里只会有一行 Subproject commit）→ worktree_patch 报错，什么都不存、不删。"""
     if not git_out(wt, "for-each-ref", "--format=%(refname)", "refs/remotes/"):
         return [], ["仓库没有远端跟踪分支，分不出哪些提交是本地独有的，没存 patch、没删"], False
     merges = git_out(wt, "rev-list", "--merges", "HEAD", "--not", "--remotes").splitlines()
     if merges:
         return [], [f"有本地独有的合并提交 {'、'.join(m[:9] for m in merges[:CLEANUP_LIST_LIMIT])}，format-patch 存不下，没删"], False
+    with tempfile.TemporaryDirectory(prefix="drover-probe-") as tmp:
+        patch, files, _ = worktree_patch(wt, tmp)
     commits = git_out(wt, "rev-list", "HEAD", "--not", "--remotes").splitlines()
     stem = f"probe-{re.sub(r'[^A-Za-z0-9._-]+', '-', branch or Path(wt).name)}-{time.strftime('%m%d-%H%M%S')}"
     saved, reasons = [], []
@@ -9703,8 +9757,6 @@ def probe_patches(wt: str, slug: str, branch: Optional[str], dry_run: bool) -> t
         else:
             save("commits", fp.stdout, count=len(commits),
                  subjects=git_out(wt, "log", "--format=%h %s", "HEAD", "--not", "--remotes").splitlines()[:CLEANUP_LIST_LIMIT])
-    with tempfile.TemporaryDirectory(prefix="drover-probe-") as tmp:
-        patch, files = worktree_patch(wt, tmp)
     if files:
         save("worktree", patch, count=len(files), files=files[:CLEANUP_LIST_LIMIT])
     return saved, reasons, bool(files)

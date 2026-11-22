@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import unittest
 from pathlib import Path
 
@@ -338,6 +339,121 @@ class CleanupTests(CleanupCase):
         self.assertEqual(e[r]["result"], "would_remove")
         b = {x["branch"]: x for x in res["branches"]}[f"task/{SLUG}-a-copy"]
         self.assertEqual((b["result"], b["found_in"]), ("would_remove", {"app/code.py": merged_at("origin/main", pushed)}))
+
+    def test_revert_of_earlier_push_kept(self) -> None:
+        """撤回以前推过的改动：第二轮加的 X 第三轮去掉了（没集成）。第一轮推的那个提交比 worktree 现有的内容还旧，改动在它
+        上面对得上只说明退回了后来的推送，不说明推上去了 → 提交了的、没提交的都不删，写原因"""
+        f = "app/f.py"
+        self.commit(self.wt("a"), "round1: add f", {f: "A\nB\nC\n"})
+        self.ship_commits(f"task/{SLUG}-a")
+        self.commit(self.wt("b"), "round2: add X", {f: "A\nB\nX1\nX2\nC\n"})
+        self.ship_commits(f"task/{SLUG}-b")
+        c, d = self.wt("c"), self.wt("d")
+        sha = self.commit(c, "round3: drop X", {f: "A\nB\nC\n"})
+        (d / f).write_text("A\nB\nC\n")
+        e = self.by_path(self.cleanup())
+        self.assertEqual({"提交了": e[c]["result"], "没提交": e[d]["result"]}, {"提交了": "kept", "没提交": "kept"})
+        self.assertIn(f"{sha[:9]} round3: drop X", e[c]["reasons"][0])
+        self.assertEqual(e[c]["reasons"][1:], [f"已提交的改动 {f}：在 origin/main 的历史里找不到包含这些改动的提交"])
+        self.assertEqual(e[d]["reasons"], [f"没提交的改动 {f}：在 origin/main 的历史里找不到包含这些改动的提交"])
+        self.assertTrue(c.is_dir() and d.is_dir() and self.has_branch(f"task/{SLUG}-c"))
+
+    def test_dropping_own_pushed_lines_kept(self) -> None:
+        """推上去之后又删掉自己推过的行：条目提交加了 5 行、挑到集成分支推了（上游先动过，推上去的提交号和条目的不同），之后
+        在同一个 worktree 里删掉几行。对比起点是没核实过的内容开始之前（提交都核实过就是 HEAD），相对分叉点只是"加得比远端
+        少" → 没提交删一行、没提交全删回去、提交了删两行都不删"""
+        f = "app/feat.py"
+        self.remote_commit("base file", {f: "BASE\n"})
+        w = self.wt("w")
+        self.commit(w, "add feature lines", {f: "BASE\nL1\nL2\nL3\nL4\nL5\n"})
+        self.remote_commit("others move main", {"docs/x.md": "x\n"})
+        self.ship_commits(f"task/{SLUG}-w")
+        self.assertNotEqual(self.head(w), self.remote_head())
+        got = {}
+        for name, text in (("没提交删一行", "BASE\nL1\nL2\nL4\nL5\n"), ("没提交全删回去", "BASE\n")):
+            (w / f).write_text(text)
+            got[name] = self.by_path(self.cleanup("--dry-run"))[w]
+        sha = self.commit(w, "drop L2 L3", {f: "BASE\nL1\nL4\nL5\n"})
+        got["提交了删两行"] = self.by_path(self.cleanup())[w]
+        self.assertEqual({k: v["result"] for k, v in got.items()}, dict.fromkeys(got, "kept"))
+        for name in ("没提交删一行", "没提交全删回去"):
+            self.assertEqual(got[name]["reasons"], [f"没提交的改动 {f}：在 origin/main 的历史里找不到包含这些改动的提交"])
+        self.assertIn(f"{sha[:9]} drop L2 L3", got["提交了删两行"]["reasons"][0])
+        self.assertEqual(got["提交了删两行"]["reasons"][1:],
+                         [f"已提交的改动 {f}：在 origin/main 的历史里找不到包含这些改动的提交"])
+        self.assertTrue(w.is_dir())
+
+    def test_dropped_or_replaced_line_still_in_remote_kept(self) -> None:
+        """我们删掉 / 换掉的那行远端还留着（集成时只带上了旁边的改动）：冲突块里我们这边的行作为连续一段出现在远端那边也不算
+        包含 → 不删。删掉一条危险配置、改了下一行，推上去的只有下一行；把 import legacy_auth 换成 import new_auth，远端两行都在"""
+        conf, auth = "conf/app.yml", "app/auth.py"
+        conf_text = "debug: false\nallow_all_origins: true\ntimeout: 30\nretries: 3\n"
+        auth_text = "import os\nimport legacy_auth\n\n\ndef login(u):\n    return legacy_auth.check(u)\n"
+        self.remote_commit("seed", {conf: conf_text, auth: auth_text})
+        y, z = self.wt("y"), self.wt("z")
+        (y / conf).write_text("debug: false\ntimeout: 60\nretries: 3\n")
+        (z / auth).write_text(auth_text.replace("legacy_auth", "new_auth"))
+        r = self.wt("r1")
+        self.commit(r, "ship neighbours only", {
+            conf: conf_text.replace("timeout: 30", "timeout: 60"),
+            auth: auth_text.replace("legacy_auth\n", "legacy_auth\nimport new_auth\n").replace("legacy_auth.", "new_auth.")})
+        self.assertTrue(self.drover_json("push", "--wt", str(r), "--target", "main")["verified"])
+        e = self.by_path(self.cleanup())
+        self.assertEqual({"删掉": e[y]["result"], "换掉": e[z]["result"]}, {"删掉": "kept", "换掉": "kept"})
+        for wt, path in ((y, conf), (z, auth)):
+            self.assertEqual(e[wt]["reasons"], [f"没提交的改动 {path}：在 origin/main 的历史里找不到包含这些改动的提交"])
+            self.assertTrue(wt.is_dir())
+
+    def test_nested_repo_and_mode_change_kept(self) -> None:
+        """worktree 里自己 git init 的子目录（里面有自己的提交）：临时 index 只记得下一个提交号，里面的东西核实不了、也存不进
+        patch → 不删，--probe 也不存不删。可执行位算改动、要核实（git apply 不看模式）：只 chmod +x 了一个文件、新加的脚本
+        带可执行位，远端内容一样但模式不同 → 不删"""
+        nest, probe, m, x = self.wt("nest"), self.wt("probe"), self.wt("m"), self.wt("x")
+        for wt in (nest, probe):
+            lib = wt / "vendor" / "lib"
+            lib.mkdir(parents=True)
+            self.git(lib, "init", "-q", "-b", "main")
+            self.commit(lib, "local only work", {"work.py": "IMPORTANT = 1\n"})
+        os.chmod(m / "app" / "core.py", 0o755)
+        (x / "run.sh").write_text("echo hi\n")
+        os.chmod(x / "run.sh", 0o755)
+        r = self.wt("r1")
+        self.commit(r, "ship run.sh without the exec bit", {"run.sh": "echo hi\n"})
+        self.assertTrue(self.drover_json("push", "--wt", str(r), "--target", "main")["verified"])
+        p = self.by_path(self.cleanup("--probe", "--wt", str(probe)))[probe]
+        e = self.by_path(self.cleanup())
+        self.assertEqual({"内嵌仓库": e[nest]["result"], "内嵌仓库 --probe": p["result"], "只改可执行位": e[m]["result"],
+                          "新脚本的可执行位没推": e[x]["result"]},
+                         dict.fromkeys(("内嵌仓库", "内嵌仓库 --probe", "只改可执行位", "新脚本的可执行位没推"), "kept"))
+        for entry in (e[nest], p):
+            self.assertIn("内嵌 git 仓库 vendor/lib", entry["reasons"][0])
+        for wt, path in ((m, "app/core.py"), (x, "run.sh")):
+            self.assertEqual(e[wt]["reasons"], [f"没提交的改动 {path}：在 origin/main 的历史里找不到包含这些改动的提交"])
+        self.assertTrue((nest / "vendor" / "lib" / "work.py").exists())
+        self.assertNotIn("patches", p)
+        self.assertEqual(list((self.state / SLUG).glob("probe-*.patch")), [])
+        self.assertTrue((probe / "vendor" / "lib" / "work.py").exists())
+
+    def test_submodule_pointer_change_kept(self) -> None:
+        """子模块指针（160000）在对象库里没有内容：按它指向的提交号比，不能两边都取不到就当一样。没有 worktree 的分支上一个没推
+        的提交把指针从 A 改成 B → 不删，写原因（建指针用 update-index：没有子模块目录，不能 add -A）"""
+        old = self.git(self.src, "rev-parse", "HEAD")
+        self.git(self.up, "update-index", "--add", "--cacheinfo", f"160000,{old},sub")
+        self.git(self.up, "commit", "-q", "-m", "add submodule sub")
+        self.git(self.up, "push", "-q", "origin", "main")
+        new = self.git(self.up, "rev-parse", "HEAD")
+        self.git(self.src, "fetch", "-q", "origin")
+        self.git(self.src, "checkout", "-q", "-b", f"task/{SLUG}-bump", "origin/main")
+        self.git(self.src, "update-index", "--cacheinfo", f"160000,{new},sub")
+        self.git(self.src, "commit", "-q", "-m", "bump sub")
+        sha = self.git(self.src, "rev-parse", "HEAD")
+        self.git(self.src, "checkout", "-q", "main")
+        res = self.cleanup("--target", "origin/main")
+        got = {x["branch"]: x for x in res["branches"]}[f"task/{SLUG}-bump"]
+        self.assertEqual(got["result"], "kept", got)
+        self.assertIn(f"{sha[:9]} bump sub", got["reasons"][0])
+        self.assertEqual(got["reasons"][1:], ["已提交的改动 sub：在 origin/main 的历史里找不到包含这些改动的提交"])
+        self.assertTrue(self.has_branch(f"task/{SLUG}-bump"))
 
     def test_dry_run_lists_only(self) -> None:
         """--dry-run：结论和真跑一样（would_remove / kept），不调 herdr worktree remove、不删分支"""
