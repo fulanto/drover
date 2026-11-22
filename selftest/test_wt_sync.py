@@ -144,6 +144,27 @@ class WtSyncTests(WtSyncCase):
         self.assertIn("merge --ff-only 失败", res["warnings"][0])
         self.assertIn("worktree 从 origin/main 起", res["warnings"][0])
 
+    def test_ff_failed_on_ignored_local_file_keeps_it(self) -> None:
+        """上游把主目录里一个被 .gitignore 忽略的本地文件同名提交进了仓库（git merge 默认会覆盖被忽略的文件）：不覆盖
+        用户的本地文件，按快进失败处理——主目录不动，worktree 从 origin/main 起，warnings 写原因（审核 LC-13 E10）"""
+        before = self.commit(self.src, "ignore local.cfg", {".gitignore": "local.cfg\n"})
+        self.git(self.src, "push", "-q", "origin", "main")
+        (self.src / "local.cfg").write_text("用户本机的配置\n")
+        self.git(self.up, "pull", "-q", "--ff-only", "origin", "main")
+        (self.up / "local.cfg").write_text("仓库里的模板\n")
+        self.git(self.up, "add", "-f", "local.cfg")
+        latest = self.commit(self.up, "track local.cfg", {})
+        self.git(self.up, "push", "-q", "origin", "main")
+        res = self.wt()
+        sync = res["source_sync"]
+        self.assertEqual(sync["status"], "ff_failed")
+        self.assertIn("local.cfg", sync["ff_stderr"])
+        self.assertEqual(self.head(self.src), before)
+        self.assertEqual((self.src / "local.cfg").read_text(), "用户本机的配置\n")
+        self.assertEqual((res["head_sha"], res["base_ref"]), (latest, "origin/main"))
+        self.assertIn("merge --ff-only 失败", res["warnings"][0])
+        self.assertIn("worktree 从 origin/main 起", res["warnings"][0])
+
     def test_explicit_remote_base_fetched_first(self) -> None:
         """--base origin/<别的分支>：先 fetch 它（本地原来没有），worktree 从它的最新起；主目录照样快进"""
         rel = self.remote_branch("release", {"app/rel.py": "R = 1\n"})
@@ -226,7 +247,7 @@ class WtSyncTests(WtSyncCase):
                          ("main", "origin/main", self.old, self.old, False))
         planned = res["planned"]
         self.assertIn(f"git -C {self.src} fetch origin main", planned[0])
-        self.assertIn(f"git -C {self.src} merge --ff-only origin/main", planned[1])
+        self.assertIn(f"git -C {self.src} merge --ff-only --no-overwrite-ignore origin/main", planned[1])
         self.assertTrue(planned[-1].startswith("herdr worktree create"))
         self.assertIn("--base HEAD", planned[-1])
         self.assertEqual(res["base_ref"], "HEAD")

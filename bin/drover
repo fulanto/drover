@@ -165,6 +165,10 @@ LOCKFILE_NAMES = {name for name, _ in JS_LOCKFILES} | {"uv.lock"}
 # 来由：原来只看依赖目录在不在，集成 worktree 复用时摘进来的条目改了 lockfile、加了工作区包，deps 照样跳过，
 # 新包没有 node_modules，tsc / 测试整片失败，只能手动重装。
 DEPS_STAMP = ".drover-deps.json"
+# 复刻源仓库 .venv 那条路：uv venv 建好就在 worktree 的 .venv 里放这个标记，全部做完（含可编辑安装改指向 worktree）记下
+# DEPS_STAMP 时才删。带着它的 .venv 是 drover 复刻到一半的，deps 删掉重新复刻；不当成别人建的 .venv 去按 requirements.txt
+# 补装——补装不管源 venv 的包和可编辑安装，会报"已装好"，把上次的失败盖掉。
+VENV_CLONE_UNFINISHED = ".drover-venv-clone-unfinished"
 # 包管理器在项目根目录读的安装配置，改了会改变装出来的 node_modules：工作区成员（pnpm-workspace.yaml）、hoist / node-linker /
 # registry（.npmrc、.yarnrc、.yarnrc.yml、bunfig.toml）、pnpmfile 钩子改写依赖（.pnpmfile.cjs）。npm / yarn / bun 的工作区
 # 写在 package.json 里，各包的 package.json 另外列（js_manifests）。用不到的包管理器的文件一般不存在，列上也不多花时间。
@@ -1084,6 +1088,7 @@ def default_branch_note(repo: str, branch: Optional[str], up: dict, remotes: lis
 
 def fast_forward_source(repo: str, upstream: str, up_sha: str, sync: dict, merge: bool = True) -> None:
     """主检出相对上游的位置；在分支上、没有已跟踪改动、没有进行中的操作、落后时 merge --ff-only。结果写进 sync。
+    带 --no-overwrite-ignore：git 默认会用上游新跟踪的同名文件覆盖被忽略的本地文件（用户的本地配置），不覆盖、按快进失败记。
     merge=False（update --dry-run）只判断，能快进时记 status=behind，不执行 merge。"""
     head = sync["before"]
     if head == up_sha:
@@ -1113,7 +1118,7 @@ def fast_forward_source(repo: str, upstream: str, up_sha: str, sync: dict, merge
         sync.update(status="behind", reason=f"主目录落后 {upstream} {behind} 个提交，可以快进（没执行）")
         return
     try:
-        p = git(repo, "merge", "--ff-only", upstream, timeout=300)
+        p = git(repo, "merge", "--ff-only", "--no-overwrite-ignore", upstream, timeout=300)
     except DroverError as exc:  # 超时：多半是仓库的 post-merge hook 跑太久。不阻断，按快进失败记，HEAD 以实际为准
         p = subprocess.CompletedProcess([], 1, "", exc.message)
     if p.returncode != 0:
@@ -1262,8 +1267,8 @@ def plan_source_sync(repo: str, base: Optional[str], prefetched: dict) -> tuple:
     if target and explicit != upstream:
         plan_fetch(explicit, *target, "--base 是远端分支，先 fetch 再用；失败就报错、不建 worktree")
     if upstream:
-        planned.append(f"git -C {repo} merge --ff-only {upstream}（fetch 后主检出在分支上、没有已跟踪改动、"
-                       "没有进行中的 merge / rebase / cherry-pick、落后上游时才执行；其余情况不动主目录）")
+        planned.append(f"git -C {repo} merge --ff-only --no-overwrite-ignore {upstream}（fetch 后主检出在分支上、"
+                       "没有已跟踪改动、没有进行中的 merge / rebase / cherry-pick、落后上游时才执行；其余情况不动主目录）")
     if explicit:
         base_ref = explicit
     elif not upstream or not up_sha:
@@ -1863,10 +1868,17 @@ class DepsPlan:
         self.items.append({"kind": kind, "action": action, "summary": summary, **extra})
 
     def record(self, dep_dir: Path, inputs: dict) -> None:
-        """安装成功后在依赖目录里记下这次的输入（DEPS_STAMP）；dry-run 不记。包管理器没建目录（没有要装的包）时建个空的。"""
+        """安装成功后在依赖目录里记下这次的输入（DEPS_STAMP），去掉复刻没做完的标记（VENV_CLONE_UNFINISHED）；dry-run 不记。
+        包管理器没建目录（没有要装的包）时建个空的。"""
         if not self.dry_run:
             dep_dir.mkdir(exist_ok=True)
             (dep_dir / DEPS_STAMP).write_text(json.dumps(inputs, ensure_ascii=False, indent=1) + "\n")
+            (dep_dir / VENV_CLONE_UNFINISHED).unlink(missing_ok=True)
+
+    def mark_unfinished(self, dep_dir: Path) -> None:
+        """多步的安装（复刻源 venv）开始改动依赖目录了：放上 VENV_CLONE_UNFINISHED，做完时 record 去掉；dry-run 不放。"""
+        if not self.dry_run:
+            (dep_dir / VENV_CLONE_UNFINISHED).touch()
 
     def forget(self, dep_dir: Path) -> None:
         """开始安装前删掉旧记录：装到一半失败或被打断时依赖目录可能已经动过，之后输入改回原样也不能按旧记录跳过。"""
@@ -1995,7 +2007,7 @@ def deps_python(plan: DepsPlan, repo: Path, wt: Path) -> None:
         plan.skip_link("python", wt_venv)
     elif (wt / "uv.lock").is_file():
         deps_uv_sync(plan, wt)
-    elif wt_venv.exists():
+    elif wt_venv.exists() and not (wt_venv / VENV_CLONE_UNFINISHED).exists():
         deps_venv_topup(plan, wt)
     elif not shutil.which("uv"):
         plan.add("python", "failed", "找不到 uv，未建 Python 环境；需要时请自行创建 ./.venv。")
@@ -2034,9 +2046,11 @@ def deps_venv_topup(plan: DepsPlan, wt: Path) -> None:
 
 
 def deps_venv_clone(plan: DepsPlan, repo: Path, wt: Path) -> None:
-    """worktree 里还没有 .venv、也没有 uv.lock：复刻源仓库的 .venv（同版本解释器 + 同一份包），再按 worktree 的
-    requirements.txt 补装，源 venv 里指向本仓库的可编辑安装改指向 worktree。都做完才记安装记录（requirements.txt 的指纹）。"""
+    """worktree 里还没有 .venv（或者只有上次复刻到一半的，见 VENV_CLONE_UNFINISHED）、也没有 uv.lock：复刻源仓库的 .venv
+    （同版本解释器 + 同一份包），再按 worktree 的 requirements.txt 补装，源 venv 里指向本仓库的可编辑安装改指向 worktree。
+    都做完才记安装记录（requirements.txt 的指纹）；有可编辑安装没改指过来，这一项记 failed（不报"已建好"）。"""
     src_venv, wt_venv = repo / ".venv", wt / ".venv"
+    reason = venv_clone_reason(plan, wt_venv)
     src_py = src_venv / "bin" / "python"
     if not src_py.exists():
         plan.add("python", "not_installed", "源仓库没有 .venv，worktree 里没有建 Python 环境；需要时请自行创建 ./.venv。")
@@ -2053,6 +2067,7 @@ def deps_venv_clone(plan: DepsPlan, repo: Path, wt: Path) -> None:
     if not ok:
         plan.add("python", "failed", f"uv venv 创建失败（Python {version}）。错误尾部：{out[-200:]}", error=out)
         return
+    plan.mark_unfinished(wt_venv)
     editable = clone_src_packages(plan, src_py, wt_venv, commands)
     if editable is None:
         return
@@ -2066,10 +2081,20 @@ def deps_venv_clone(plan: DepsPlan, repo: Path, wt: Path) -> None:
                      commands=commands)
             return
     reinstalled = repoint_editables(plan, editable, repo, wt, commands)
-    plan.record(wt_venv, topup)
-    plan.add("python", "installed", venv_clone_summary(version, has_req, reinstalled),
-             reason="worktree 里原来没有 .venv", commands=commands, editable=reinstalled,
+    action, summary = venv_clone_outcome(version, has_req, reinstalled)
+    if action == "installed":
+        plan.record(wt_venv, topup)
+    plan.add("python", action, summary, reason=reason, commands=commands, editable=reinstalled,
              seconds=round(time.time() - started, 1))
+
+
+def venv_clone_reason(plan: DepsPlan, wt_venv: Path) -> str:
+    """复刻之前：worktree 的 .venv 是上次复刻到一半的（带 VENV_CLONE_UNFINISHED）就删掉重来（dry-run 不删），返回这次复刻的原因。"""
+    if not (wt_venv / VENV_CLONE_UNFINISHED).exists():
+        return "worktree 里原来没有 .venv"
+    if not plan.dry_run:
+        shutil.rmtree(wt_venv)
+    return "上次复刻源仓库 .venv 没做完（中途失败、被打断，或者可编辑安装没改指过来），删掉重新复刻"
 
 
 def clone_src_packages(plan: DepsPlan, src_py: Path, wt_venv: Path, commands: list) -> Optional[list]:
@@ -2101,7 +2126,8 @@ def clone_src_packages(plan: DepsPlan, src_py: Path, wt_venv: Path, commands: li
 
 
 def repoint_editables(plan: DepsPlan, editable: list, repo: Path, wt: Path, commands: list) -> list:
-    """源 venv 里以可编辑方式装的本仓库，换成 worktree 里的同一路径重装，避免 import 到源仓库的代码。"""
+    """源 venv 里以可编辑方式装的本仓库，换成 worktree 里的同一路径重装，避免 import 到源仓库的代码。
+    失败的那一条带 error（错误尾部）。"""
     reinstalled = []
     for line in editable:
         target = line[3:].strip()
@@ -2111,17 +2137,25 @@ def repoint_editables(plan: DepsPlan, editable: list, repo: Path, wt: Path, comm
         cmd = ["uv", "pip", "install", "--python", str(wt / ".venv" / "bin" / "python"), "-e", target_path]
         commands.append(shlex.join(cmd))
         ok, out, _ = plan.step(cmd)
-        reinstalled.append({"source": target, "installed_as": target_path, "ok": ok})
+        entry = {"source": target, "installed_as": target_path, "ok": ok}
+        if not ok:
+            entry["error"] = out[-200:]
+        reinstalled.append(entry)
     return reinstalled
 
 
-def venv_clone_summary(version: str, has_req: bool, reinstalled: list) -> str:
-    summary = f"Python 环境已建好：./.venv（Python {version}）复刻了源仓库 venv 的包"
-    if has_req:
-        summary += "，并按 requirements.txt 补装"
-    if reinstalled:
-        summary += f"；{len(reinstalled)} 个可编辑安装已改指向 worktree"
-    return summary + "。"
+def venv_clone_outcome(version: str, has_req: bool, reinstalled: list) -> tuple[str, str]:
+    """复刻源 venv 的结果 (action, 摘要)。有可编辑安装没改指过来时是 failed，摘要写明是哪个、错误尾部：复刻时去掉了
+    -e 行，worktree 的环境里就没有它。"""
+    done = f"./.venv（Python {version}）复刻了源仓库 venv 的包" + ("，并按 requirements.txt 补装" if has_req else "")
+    failed = [e for e in reinstalled if not e["ok"]]
+    if failed:
+        which = "；".join(f"{e['installed_as']}（错误尾部：{e['error']}）" for e in failed)
+        return "failed", (f"Python 环境没装完：{done}，但 {len(failed)} 个可编辑安装没能改指向 worktree：{which}。"
+                          "worktree 的环境里没有它，import 不到；需要时在 worktree 里自行 uv pip install -e <路径>"
+                          "（再跑 deps 会删掉这个 ./.venv 重新复刻）。")
+    repointed = f"；{len(reinstalled)} 个可编辑安装已改指向 worktree" if reinstalled else ""
+    return "installed", f"Python 环境已建好：{done}{repointed}。"
 
 
 def cmd_deps(a: argparse.Namespace) -> dict:
@@ -6454,9 +6488,10 @@ def heavy_plan(tickets: list, capacity: float, mem: dict, now: float, starve: fl
        6～9 核，Spotlight 0.9 核、WindowServer 0.5 核），算进容量（性能核数）里，机器空着一大半就开始排队。
        放行的计入占用。
     4. 防饿死：排头等了 ≥ starve 秒还没放行时，后来的只放"装得下、并且在排头预计开跑之前就跑完"的（EASY backfill：
-       排头预计开跑 = 在跑的按各自历史最长墙钟陆续结束、空出来够它的时刻，见 heavy_shadow；后来的按自己的历史最长墙钟算，
-       没有历史的不放）。这是 CPU 可以空着、还有命令在排队的唯一情形：空出来的不够排头，又没有能在它开跑前跑完的——
-       放进来就会把排头往后推，它就一直被插队。"""
+       排头预计开跑 = 在跑的陆续结束、空出来够它的时刻，见 heavy_shadow；各条的结束按历史最长墙钟算，超过了的、没有
+       历史的按超出 / 已跑多久再估多久，见 heavy_expected_end；后来的按自己的历史最长墙钟算，没有历史的不放）。这是
+       CPU 可以空着、还有命令在排队的唯一情形：空出来的不够排头，又没有能在它开跑前跑完的——放进来就会把排头往后推，
+       它就一直被插队。"""
     running = [t for t in tickets if t.get("state") == "running" and not t.get("small")]
     used, machine = heavy_load(running, capacity, cpu, now)
     limit, logical = capacity * heavy_setting("heavy_calib_fast"), cpu.get("logical") or 1
@@ -6486,7 +6521,7 @@ def heavy_plan(tickets: list, capacity: float, mem: dict, now: float, starve: fl
             admitted.append(t["id"])
             used += usage
             machine = None if machine is None else machine + usage
-            ends.append((now + wall if wall is not None else float("inf"), usage))
+            ends.append((heavy_expected_end(t, now), usage))
             continue
         reasons[t["id"]] = reason
         enqueued = as_float(t.get("enqueued_at"))
@@ -6526,21 +6561,23 @@ def heavy_load(running: list, capacity: float, cpu: dict, now: float) -> tuple:
 
 
 def heavy_expected_end(t: dict, now: float) -> float:
-    """在跑的票预计什么时候结束：放行时刻 + 历史最长墙钟（已经超了按马上结束）；没有历史的估不出，算无穷远。"""
+    """一张票预计什么时候结束：放行时刻 + 历史最长墙钟（还没放行的按现在放行算）。已经超过了的（没有历史的算一开跑就超了）
+    按超出多久、再估多久（刚超时估得短，越超估得越长）：负载下比历史慢是常态（本机历史里约四分之一的实测比之前最长的
+    还长，中位 1.4 倍）。按"马上结束"或"估不出"算的话，防饿死会把后来的轻命令一直挡到它结束，机器空着也干等；这样估，
+    轻命令最多在它超时以后再等自己的墙钟那么久。"""
     wall, started = as_float(t.get("wall")), as_float(t.get("started_at"))
-    return max(started + wall, now) if wall is not None and started is not None else float("inf")
+    due = (now if started is None else started) + (wall or 0.0)
+    return due if due > now else 2 * now - due
 
 
 def heavy_shadow(ends: list, used: float, need: float, limit: float, alone: bool) -> Optional[float]:
     """排头预计什么时候能开跑（EASY backfill 的 shadow time）：ends 是在跑的 [(预计结束, 占用)]，按结束先后陆续空出来，
-    占用降到 limit − need 以下的那一刻；内存紧张要单独跑（alone）就是全部结束的时刻。估不出（要等的里有没有历史的，或者
-    CPU 已经够它、卡它的是整机被调度外的负载占满）返回 None。"""
+    占用降到 limit − need 以下的那一刻；内存紧张要单独跑（alone）就是全部结束的时刻。估不出（CPU 已经够它、卡它的是
+    整机被调度外的负载占满）返回 None。"""
     shadow = None
     for end, usage in sorted(ends):
         if not alone and used + need <= limit + 1e-6:
             return shadow
-        if end == float("inf"):
-            return None
         used -= usage
         shadow = end
     return shadow

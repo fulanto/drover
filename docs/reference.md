@@ -195,7 +195,8 @@ drover/
 │                                    #   （Spotlight、WindowServer、浏览器），算进容量里机器空着一大半就开始排队。刚放行的命令在
 │                                    #   `heavy_grace_seconds`（5）秒内按预留算（还没在实测里显出来）；没跑过的先按 1 核；"独占"
 │                                    #   只是需求 ≥ 容量，它的收尾、I/O 阶段实测空出来就放别的进来。防饿死：排头等了 2 分钟，后来的只放能在它
-│                                    #   预计开跑前跑完的（按历史最长墙钟，EASY backfill），这是 CPU 可以空着还有人排队的唯一情形。codex 沙箱里
+│                                    #   预计开跑前跑完的（在跑的按历史最长墙钟算结束，超过了、没有历史的按超出 / 已跑多久再估多久；EASY
+│                                    #   backfill），这是 CPU 可以空着还有人排队的唯一情形。codex 沙箱里
 │                                    #   ps 不让执行、整机实测读得到：没有进程树实测的票按预留算、但不超过整机实测；整机也读不到时退回按预留
 ├── locks/update.lock                # 更新锁：同一时间只跑一个 drover update（自动的、手动的）
 ├── board-tab.json                   # 看板 tab 是哪个（tab、pane、workspace）、主会话在哪个 pane，board --tab 复用、--live 认出自己在看板 tab 里、补登记靠它

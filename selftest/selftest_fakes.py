@@ -523,7 +523,8 @@ sys.exit(subprocess.call(["sh", "-c", " ".join(args[1:])]))
 
 # 假包管理器 pnpm / npm / uv（按需装，见 install_pkg_tools；deps 的用例用）：每次调用的工具名、参数和 stdin 的样子记进
 # pkg-calls.log（stdin：tty 是终端，eof 是马上读到 EOF，open 是没关、读不到东西的管道，data 是有内容，closed 是没有 stdin；
-# 只看不读，不会卡住）；同目录 fake-pkg.json 的 fail 里列了这个工具名时打一行错误、退出 1，什么都不建。装出来的样子：
+# 只看不读，不会卡住）；同目录 fake-pkg.json 的 fail 里列了这个工具名、或者 fail_args 里有这次调用的某个参数（如 "-e"：
+# 只让 uv pip install -e 失败）时打一行错误、退出 1，什么都不建。装出来的样子：
 #   pnpm install --dir <wt> …        在 <wt>/node_modules 里写 fake-installed（第几次装的）
 #   npm ci --prefix <wt>             和真的 npm ci 一样先删掉已有的 node_modules，再写 fake-installed
 #   uv sync --frozen --project <wt>  在 <wt>/.venv 里写 fake-installed（已有的 .venv 不删）
@@ -559,7 +560,7 @@ with (HERE / "pkg-calls.log").open("a") as f:
     f.write(json.dumps({"tool": TOOL, "args": args, "stdin": stdin_state()}) + "\n")
 spec_file = HERE / "fake-pkg.json"
 spec = json.loads(spec_file.read_text()) if spec_file.exists() else {}
-if TOOL in spec.get("fail", []):
+if TOOL in spec.get("fail", []) or set(spec.get("fail_args", [])) & set(args):
     sys.stderr.write("fake %s: install failed\n" % TOOL)
     sys.exit(1)
 

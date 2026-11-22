@@ -294,6 +294,26 @@ class MeasuredPlanTests(SchedTestCase):
         self.assertIn("heavy 已占 3.5 核", reasons["h"])  # 排头自己是真的装不下
         self.assertEqual(self.plan([a, head, quick, slow, unknown], busy=4.0, now=100.0)[0], ["quick", "slow", "unknown"])
 
+    def test_starvation_overdue_or_unknown_holder_still_backfills(self) -> None:
+        """在跑的已经超过自己的历史最长墙钟（负载下比历史慢是常态），或者没有历史：按超出多久（没有历史的按已跑多久）再估多久，
+        不按"马上结束""估不出"——整机大半空着（2.5 / 10 核、heavy 1.5 / 4 核）时，排头（独占的全量测试）等满了阈值，能在
+        这段里跑完的轻命令照样进（审核 IN-9 e6 的两种情形）；估出来的这段不够它跑完时才等，等的时间不超过它自己的墙钟"""
+        head = ticket("h", "queued", 4.0, at=0.0, exclusive=True, cores=7.0, wall=600.0)
+        lint = ticket("lint", "queued", 0.3, at=340.0, wall=20.0)
+        overdue = ticket("e2e", "running", 1.5, started=100.0, cpu_now=1.5, cpu_at=400.0, wall=200.0)  # 已跑 300 秒，超了 100 秒
+        unknown = dict(overdue, wall=None)  # 第一次跑，已跑 300 秒
+        for label, running in (("超了", overdue), ("没有历史", unknown)):
+            with self.subTest(label):
+                admitted, reasons = self.plan([running, head, lint], busy=2.5, now=400.0)
+                self.assertEqual(admitted, ["lint"], reasons)
+                self.assertIn("heavy 已占 1.5 核", reasons["h"])  # 排头自己是真的装不下
+        # 刚超了 10 秒 / 没有历史的才跑了 10 秒：估它还要 10 秒，20 秒的 lint 在排头开跑前跑不完，先等
+        for label, running in (("超了", dict(overdue, wall=290.0)), ("没有历史", dict(unknown, started_at=390.0))):
+            with self.subTest(label + " 10 秒"):
+                admitted, reasons = self.plan([running, head, lint], busy=2.5, now=400.0)
+                self.assertEqual(admitted, [])
+                self.assertIn("它开跑前跑不完", reasons["lint"])
+
 
 class CpuMeterTests(SchedTestCase):
     """整机 CPU 实测 heavy_cpu（计数是造的、时间注入）、进程树 CPU 的算法、ps 时间列的解析；本机真的读得到。"""

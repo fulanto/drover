@@ -69,8 +69,9 @@ class DepsCase(DroverTestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         return json.loads(p.stdout)
 
-    def fail_tools(self, *tools: str) -> None:
-        (self.fakebin / "fake-pkg.json").write_text(json.dumps({"fail": list(tools)}))
+    def fail_tools(self, *tools: str, args: tuple = ()) -> None:
+        """之后这些包管理器的每次调用、以及带着 args 里某个参数的调用都失败（见 selftest_fakes.FAKE_PKG）。"""
+        (self.fakebin / "fake-pkg.json").write_text(json.dumps({"fail": list(tools), "fail_args": list(args)}))
 
     def pnpm_install(self) -> list:
         return ["install", "--dir", str(self.wt), "--frozen-lockfile", "--config.confirm-modules-purge=false"]
@@ -284,6 +285,57 @@ class PythonDepsTests(DepsCase):
                                                  str(self.wt / "requirements.txt")]])
         self.assertTrue((self.wt / ".venv" / "keep.txt").is_file())
         self.assertEqual(self.deps_item("python")["action"], "skipped")
+
+    def test_editable_repoint_failure_reports_failed(self) -> None:
+        """复刻源 venv 时，把源 venv 里可编辑安装的本仓库改指向 worktree 那一步失败：这一项报失败（has_failure 为真），
+        摘要写明哪一个没装上和错误尾部，不说"已建好"——复刻时 -e 行是去掉的，改指失败 worktree 的环境里就没有本项目这个包，
+        worker 跑测试才撞上 ImportError；没做完不记安装记录（审核 LC-15）"""
+        self.make_repo({".gitignore": GITIGNORE, "requirements.txt": "requests\n"})
+        self.write_files(self.src, {".venv/bin/python": "#!/bin/sh\n", ".venv/pyvenv.cfg": "version = 3.12.1\n"})
+        self.fail_tools(args=("-e",))
+        res = self.deps()
+        self.assertTrue(res["has_failure"])
+        item = [i for i in res["items"] if i["kind"] == "python"][0]
+        self.assertEqual(item["action"], "failed")
+        self.assertIn(f"可编辑安装没能改指向 worktree：{self.wt}", item["summary"])
+        self.assertIn("fake uv: install failed", item["summary"])
+        self.assertNotIn("已建好", item["summary"])
+        self.assertIn(item["summary"], res["summary_for_prompt"])
+        self.assertEqual([(e["installed_as"], e["ok"]) for e in item["editable"]], [(str(self.wt), False)])
+        self.assertFalse((self.wt / ".venv" / STAMP).exists())
+
+    def test_editable_failure_not_hidden_on_rerun(self) -> None:
+        """可编辑安装改指失败之后再跑 deps：这个 .venv 是 drover 复刻到一半的，不能当成别人建的 .venv 去按 requirements.txt
+        补装（补装那条路不管可编辑安装，会报 installed，把改指失败盖掉），要删掉重新复刻。改指还失败就还报失败；改指成功了
+        才报 installed、记安装记录，之后没变就跳过"""
+        self.make_repo({".gitignore": GITIGNORE, "requirements.txt": "requests\n"})
+        self.write_files(self.src, {".venv/bin/python": "#!/bin/sh\n", ".venv/pyvenv.cfg": "version = 3.12.1\n"})
+        self.fail_tools(args=("-e",))
+        self.assertTrue(self.deps()["has_failure"])
+        (self.wt / ".venv" / "half.txt").write_text("复刻到一半的 .venv 里的东西\n")
+        again = self.deps()
+        self.assertTrue(again["has_failure"])
+        self.assertEqual([i["action"] for i in again["items"] if i["kind"] == "python"], ["failed"])
+        self.fail_tools()
+        fixed = self.deps_item("python")
+        self.assertEqual(fixed["action"], "installed")
+        self.assertIn("没做完", fixed["reason"])
+        self.assertEqual([(e["installed_as"], e["ok"]) for e in fixed["editable"]], [(str(self.wt), True)])
+        self.assertFalse((self.wt / ".venv" / "half.txt").exists())  # 重新复刻的，不是在半成品上补装
+        self.assertEqual([c[:2] for c in self.calls("uv")].count(["venv", "--seed"]), 3)
+        self.assertEqual(self.deps_item("python")["action"], "skipped")
+
+    def test_clone_failed_midway_rebuilt_on_rerun(self) -> None:
+        """复刻到一半就失败了（源 venv 的包没装上）：再跑也要重新完整复刻，不在半成品上只按 requirements.txt 补装、报
+        installed。只补装的话，requirements 里没写的包（pytest 这类）会一直缺着"""
+        self.make_repo({".gitignore": GITIGNORE, "requirements.txt": "requests\n"})
+        self.write_files(self.src, {".venv/bin/python": "#!/bin/sh\n", ".venv/pyvenv.cfg": "version = 3.12.1\n"})
+        self.fail_tools(args=("-r",))
+        self.assertEqual(self.deps_item("python")["action"], "failed")
+        self.fail_tools()
+        self.assertEqual(self.deps_item("python")["action"], "installed")
+        self.assertEqual([c[:2] for c in self.calls("uv")][3:],
+                         [["venv", "--seed"], ["pip", "freeze"], ["pip", "install"], ["pip", "install"], ["pip", "install"]])
 
     def test_existing_venv_without_record_tops_up(self) -> None:
         """复刻那条路、已有 .venv 但不是 drover 建的：按 requirements.txt 补装，不重建"""
