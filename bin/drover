@@ -127,7 +127,8 @@ SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,59}$")
 RESERVED_SLUGS = ("pkg", "src", "bin", "backups", "baselines", "locks", "oncall-images", "tools")
 HERDR_WORKTREES = HOME / ".herdr" / "worktrees"
 # 安装后的 CLI 固定入口（install.py 的 BIN_LINK），写进任务书让 worker 执行的命令用它。写成字面的 ~ 路径：
-# 权限规则 Bash(~/.drover/bin/drover:*) 按命令文本的字面前缀匹配，展开成 /Users/<名字>/... 就对不上，worker 每跑一次
+# 权限规则 Bash(~/.drover/bin/drover heavy:*)（install.py 加进全局，worker 也有）按命令文本的字面前缀匹配，
+# 展开成 /Users/<名字>/... 就对不上，worker 每跑一次
 # heavy 都弹确认框（实测一个 Java 任务弹了 8 次、等了 145 秒）。也不跟 DROVER_STATE_DIR 走：临时状态目录下没有 bin/drover。
 DROVER_CMD = "~/.drover/bin/drover"
 # claude / codex 在新目录启动时的信任弹窗。
@@ -239,7 +240,8 @@ HEAVY_SETTINGS = {
 HEAVY_SCRIPT_RUNNER_RE = re.compile(r"^(python(3(\.\d+)?)?|node|bun)$")
 HEAVY_EXT_RE = re.compile(r"\.[A-Za-z][A-Za-z0-9]{0,5}$")
 HEX_REV_RE = re.compile(r"^[0-9a-f]{7,40}$")
-# heavy 只排队跑构建 / 测试：白名单 Bash(~/.drover/bin/drover:*) 让 heavy 免确认，heavy 要是什么都执行，
+# heavy 只排队跑构建 / 测试：全局白名单 Bash(~/.drover/bin/drover heavy:*) 让所有会话（含 worker）跑 heavy 免确认，
+# heavy 要是什么都执行，
 # 就等于白名单放行了任意命令（git push、rm、bash -c …）。所以跳过开头的 env 和 VAR=值 之后，程序名（取 basename，
 # ./mvnw、./.venv/bin/python 都认）必须在这张表里；python 带版本号（python3.12）也算。jest、vue-tsc 是在建议名单上
 # 补的：和 vitest、tsc 同类。node 是后补的：文档的 CDP 检查（verify-*-cdp.mjs）一直用 heavy -- node 排队。
@@ -10180,6 +10182,14 @@ def update_dry_run(res: dict, sync: dict, clone: str) -> dict:
     return res
 
 
+def auto_install_done(a: argparse.Namespace, before: str, after: str) -> bool:
+    """自动更新这次不用跑 install：没有新提交、这一版也装好了（安装记录的 installed_commit 就是 clone 的 HEAD，install.py 在
+    drover 自己的各项都装好时才记）。每 30 分钟白跑一次 install 会去动 settings.json、AGENTS.md，插件没装时还会从 GitHub 装。
+    以前只看"有没有新提交"：快进以后 install 失败（或进程被杀），下一次检查就不再装，AGENTS.md 的区块、hook 一直是旧的。
+    手动 update 每次都重跑 install。"""
+    return a.auto and before == after and read_json_dict(INSTALL_STATE_FILE).get("installed_commit") == after
+
+
 def update_run(a: argparse.Namespace) -> dict:
     target = update_target()
     clone, mode, hosts = target["clone"], target["mode"], target["hosts"]
@@ -10202,11 +10212,10 @@ def update_run(a: argparse.Namespace) -> dict:
     before, after = sync["before"], sync["after"]
     res.update(after=after, from_tag=release_tag_at(clone, before), to_tag=release_tag_at(clone, after))
     res["ahead"] = sync.get("ahead", 0) if sync["status"] == "ahead" else 0
-    if a.auto and before == after:
-        # 自动更新只装新版本：没有新提交就不重跑 install、不 --check。修安装是手动 update 的事；每 30 分钟重跑一次 install
-        # 还会去动 settings.json、AGENTS.md，插件没装时还会从 GitHub 装插件。
+    if auto_install_done(a, before, after):
         res.update(ok=True, new_commits={"count": 0, "titles": []}, changed_files=[])
         return res
+    res["install_retry"] = a.auto and before == after  # 自动更新、没有新提交还走到这里：这一版上次没装好，重跑
     rev_range = f"{before}..{after}"
     res["new_commits"] = commit_summary(clone, rev_range) if before != after else {"count": 0, "titles": []}
     res["changed_files"] = git_out(clone, "diff", "--name-only", rev_range).splitlines() if before != after else []
@@ -10255,6 +10264,18 @@ def update_dry_text(res: dict) -> list:
     return lines
 
 
+def update_head(res: dict) -> str:
+    """update_text 的第一行：更新到哪；没有新提交时说已是最新，本地领先、这一版上次没装好（自动更新重跑了 install）各接一句。"""
+    before, after, tag = res["before"], res["after"], res.get("to_tag")
+    tag_part = tag + "，" if tag else ""
+    if before != after:
+        return f"drover 已更新：{before[:7]}→{after[:7]}（{tag_part}{res['new_commits']['count']} 个新提交）"
+    notes = [update_ahead_note(res)] if res.get("ahead") else []
+    if res.get("install_retry"):
+        notes.append("上次没装好，重跑了 install")
+    return f"drover 已是最新（{tag_part}{after[:7]}）" + "".join(f"；{n}" for n in notes)
+
+
 def update_text(res: dict) -> list:
     """默认输出：几行中文（目标 10 行以内）。"""
     if "sync" not in res:  # 没走到 fetch 之后（没装过、clone 不是 git 仓库、fetch 失败）
@@ -10263,14 +10284,8 @@ def update_text(res: dict) -> list:
         return update_dry_text(res)
     if "install" not in res:  # fetch 了但不能快进：没重跑 install
         return [f"drover 没更新（没快进、没重跑 install）：{res.get('error')}"]
-    before, after, tag = res["before"], res["after"], res.get("to_tag")
     commits = res["new_commits"]
-    if before != after:
-        lines = [f"drover 已更新：{before[:7]}→{after[:7]}（{tag + '，' if tag else ''}{commits['count']} 个新提交）"]
-    else:
-        lines = [f"drover 已是最新（{tag + '，' if tag else ''}{after[:7]}）"
-                 + (f"；{update_ahead_note(res)}" if res.get("ahead") else "")]
-    lines += commit_lines(commits)
+    lines = [update_head(res), *commit_lines(commits)]
     inst = res["install"]
     if inst["changed"]:
         line = f"安装：改了 {len(inst['changed'])} 项（{'、'.join(inst['changed'])}）"
@@ -10329,15 +10344,18 @@ def cmd_update(a: argparse.Namespace) -> int:
 #   每 15 秒一轮）。编排者和 worker 的命令不调。到时间了就在后台起 update --auto，自己立刻返回：SessionStart hook 只有
 #   15 秒，连不上远端时 fetch 一次最多要等 300 秒、重试 3 次，不能卡住会话。
 # - 怎么装：update --auto 走 update_run，保护全部沿用（本地改动、分叉、没上游、还没有发布的版本、连不上都什么都不改）；
-#   无人值守：只试 1 次、fetch 最多 AUTO_UPDATE_NET_TIMEOUT 秒、不弹密码和主机确认；没有新提交时不重跑 install。
+#   无人值守：只试 1 次、fetch 最多 AUTO_UPDATE_NET_TIMEOUT 秒、不弹密码和主机确认；没有新提交、这一版也装好了（安装记录的
+#   installed_commit 就是 clone 的 HEAD）时不重跑 install，没装好的每次检查都重跑。
 # - 主会话怎么用上新规则：main-rules.json 记"载入时"的区块，drover rules 给差别。Claude Code：watch --main 报
 #   EVENT drover updated(…)，UserPromptSubmit hook（rules --hook）在用户下一条消息时也带上；Codex：board --json 的 drover 字段。
 # - 正在跑的编排者和 worker：link 模式下它们下一条 drover 命令就是新代码，CLI 要保持向后兼容（docs/development.md 的开发约定）。
 #
 # AUTO_UPDATE_FILE（原子写；读-改-写拿 AUTO_UPDATE_STATE_LOCK，后台更新、tick、watch --main、drover rules 都会写）：
 #   last_attempt / finished  最近一次尝试开始 / 结束的时间（epoch 秒；tick 起后台进程前先写 last_attempt，算间隔用）
-#   result                   updated / up_to_date / blocked / unreachable / failed / disabled
-#   error                    blocked / unreachable / failed / disabled 的原因（文案同 update）；updated 但安装或检查有失败项时是那几项
+#   result                   updated / up_to_date / blocked / unreachable / failed / install_failed（快进了或在重试，install
+#                            没装好；下次检查接着重跑）/ disabled
+#   error                    blocked / unreachable / failed / disabled 的原因（文案同 update）；跑了 install、安装或检查有失败项时
+#                            是那几项（install_failed 时一直留着，装好那次才清掉）
 #   blocked_status           blocked 的类型（dirty、diverged、in_progress、no_upstream、no_release……）
 #   unreachable_since        连续 unreachable 从什么时候开始（fetch 成功一次就清掉）
 #   update                   最近一次真的更新：from、to（完整 sha）、from_tag、to_tag（那个提交上的版本 tag，没有是 null；
@@ -10498,6 +10516,8 @@ def auto_update_result(res: dict) -> str:
         return "unreachable" if "source_sync" in res else "failed"
     if "after" not in res:  # fetch 了但不能快进（update_blocked_reason）
         return "blocked"
+    if "install" in res and not res["install"]["ok"]:  # 快进了（或上次没装好在重试）但 install 没装好：下次检查接着重跑
+        return "install_failed"
     return "updated" if res["after"] != res["before"] else "up_to_date"
 
 
@@ -10538,11 +10558,20 @@ def auto_update_apply(record: dict, res: dict, result: str, started: float) -> b
         record.pop("unreachable_reported", None)
     if result in ("updated", "up_to_date"):
         record.pop("blocked_reported", None)  # 之后再被挡住会再报
-    if result == "updated":
-        record["update"] = merged_update(record.get("update"), res, record["finished"], "auto")
-        if not res["ok"]:
-            record["error"] = "；".join(line for line in update_text(res) if line.startswith(("安装：", "检查：")))
+    if "install" in res:
+        record_install_run(record, res)
     return True
+
+
+def record_install_run(record: dict, res: dict) -> None:
+    """跑了 install 的那次（换了版本，或者这一版上次没装好、这次重跑）记什么：换了版本记 update；重跑时并进还没报的那一次
+    （from 留着，routing_changed 取或：装好了 watch --main 才报它，带不带 rules 按装上的算）。没装好（install_failed）或
+    --check 有失败项：失败项记进 error，留到下一次装好为止（以前下一次检查看到没有新提交就清掉、记成已是最新）。"""
+    upd = record.get("update")
+    if res["after"] != res["before"] or (isinstance(upd, dict) and upd.get("announced") is False):
+        record["update"] = merged_update(upd, res, record["finished"], "auto")
+    if not res["ok"]:
+        record["error"] = "；".join(line for line in update_text(res) if line.startswith(("安装：", "检查：")))
 
 
 def manual_update_change(res: dict, v0: Optional[str], v1: Optional[str]) -> Optional[dict]:
@@ -10600,12 +10629,18 @@ def auto_update_run(a: argparse.Namespace) -> int:
     if a.json:
         emit(dict(res, auto_result=result))
     else:
-        head = f"[{clock(started)}] drover update --auto：{result}"
-        tag = res.get("to_tag")
-        lines = ([f"{head}（{tag + '，' if tag else ''}{res['after'][:7]}，没有要装的新版本，没重跑 install）"]
-                 if result == "up_to_date" else [head, *update_text(res)])
-        print("\n".join(lines), flush=True)
+        print("\n".join(auto_update_log(res, result, started)), flush=True)
     return 0 if result in ("updated", "up_to_date") and res.get("ok") else 1
+
+
+def auto_update_log(res: dict, result: str, started: float) -> list:
+    """update --auto 打到日志里的几行：第一行是时间和结果；没跑 install 的已是最新只有这一行（写明没重跑 install），
+    别的（包括上次没装好、这次重跑了 install 的已是最新）接 update_text。"""
+    head = f"[{clock(started)}] drover update --auto：{result}"
+    if result == "up_to_date" and "install" not in res:
+        tag = res.get("to_tag")
+        return [f"{head}（{tag + '，' if tag else ''}{res['after'][:7]}，没有要装的新版本，没重跑 install）"]
+    return [head, *update_text(res)]
 
 
 def short_sha(value: Any) -> Optional[str]:
@@ -10620,17 +10655,17 @@ def update_end(upd: dict, end: str) -> Optional[str]:
 
 def drover_take_events(record: dict, now: float, out: list) -> bool:
     """watch --main 一轮里自动更新要报的事（追加进 out，不带名字和时间），并在 record 里记上报过了；返回改没改 record。
-    updated(<旧>..<新>)[ rules]：有没报过的更新，两头是版本 tag，没有就 7 位 sha（update_end）；update-blocked：被挡住或
-    失败，同一个原因（类型 + 文案）只报一次；update-unreachable(24h)：连续连不上满 AUTO_UPDATE_UNREACHABLE_HOURS 小时，
-    这一段只报一次。"""
+    updated(<旧>..<新>)[ rules]：有没报过的更新，两头是版本 tag，没有就 7 位 sha（update_end）；install 没装好（install_failed）
+    时不报、也不标已报，装好了再报。update-blocked：被挡住、失败、install 没装好，同一个原因（类型 + 文案）只报一次；
+    update-unreachable(24h)：连续连不上满 AUTO_UPDATE_UNREACHABLE_HOURS 小时，这一段只报一次。"""
     changed = False
-    upd = record.get("update")
-    if isinstance(upd, dict) and upd.get("announced") is False:
+    upd = pending_update(record)
+    if upd:
         out.append(f"updated({update_end(upd, 'from')}..{update_end(upd, 'to')})"
                    + (" rules" if upd.get("routing_changed") else ""))
         changed = mark_announced(record)
     result = record.get("result")
-    if result in ("blocked", "failed"):
+    if result in ("blocked", "failed", "install_failed"):
         key = f"{result}:{record.get('blocked_status') or record.get('error') or ''}"
         if record.get("blocked_reported") != key:
             out.append("update-blocked")
@@ -10643,6 +10678,15 @@ def drover_take_events(record: dict, now: float, out: list) -> bool:
         record["unreachable_reported"] = since
         changed = True
     return changed
+
+
+def pending_update(record: dict) -> Optional[dict]:
+    """watch --main 该报的那次更新：还没报给主会话（announced 是 false），而且装好了——install 没装好（install_failed）时
+    代码换了、AGENTS.md 的区块和 hook 可能还是旧的，不算更新完，装好那次再报。没有返回 None。"""
+    upd = record.get("update")
+    if record.get("result") == "install_failed" or not isinstance(upd, dict) or upd.get("announced") is not False:
+        return None
+    return upd
 
 
 def drover_main_events(now: float) -> list:
@@ -10679,8 +10723,9 @@ def drover_version() -> Optional[str]:
 
 def drover_board(now: float) -> tuple[dict, list]:
     """看板上 drover 自己的状态：(board --json 的 drover 字段, 文本看板第一行下面加的行)。最近更新过的那一行按 update 的 source
-    写：手动的"drover 已更新 …（…，手动）"，自动的"drover 已自动更新 …"（安装或检查有失败项的接上 error：那是自动更新的）；
-    新版本那个提交上有版本 tag 的，括号里先写 tag（装的是哪个版本）。"""
+    写：手动的"drover 已更新 …（…，手动）"，自动的"drover 已自动更新 …"（--check 有失败项的接上 error：那是自动更新的）；
+    新版本那个提交上有版本 tag 的，括号里先写 tag。install 没装好（install_failed）时不写"已更新"，写"装失败"和失败项：
+    代码换了、AGENTS.md 的区块和 hook 可能还是旧的，算不上更新好了。"""
     record = read_json_dict(AUTO_UPDATE_FILE)
     upd = record.get("update") if isinstance(record.get("update"), dict) else {}
     last, at = as_float(record.get("last_attempt")), as_float(upd.get("at"))
@@ -10694,7 +10739,9 @@ def drover_board(now: float) -> tuple[dict, list]:
             "source": (upd.get("source") or "auto") if upd else None}
     info = {"version": short_sha(drover_version()), "auto_update": auto, "rules_changed": rules_changed()}
     notes = []
-    if at and now - at < AUTO_UPDATE_RECENT_HOURS * 3600:
+    if result == "install_failed":  # error 和它一起写（record_install_run）
+        notes.append(f"drover 自动更新装失败（下次自动检查重试）：{error}")
+    elif at and now - at < AUTO_UPDATE_RECENT_HOURS * 3600:
         when = (f"{auto['to_tag']}，" if auto["to_tag"] else "") + clock(at, "%m-%d %H:%M")
         notes.append(f"drover 已更新 {auto['from']}→{auto['to']}（{when}，手动）" if auto["source"] == "manual" else
                      f"drover 已自动更新 {auto['from']}→{auto['to']}（{when}）"
@@ -10707,7 +10754,7 @@ def drover_board(now: float) -> tuple[dict, list]:
 # ---------------------------------------------------------------- rules：主会话不重开就用上新规则
 # Claude Code 只在会话开始和 /compact 时从磁盘读 CLAUDE.md（@AGENTS.md），别的时候不重读（官方文档 memory 一节）；
 # 以前规则变了要 /clear。现在 drover 记下主会话"载入时"的区块（MAIN_RULES_FILE：SessionStart hook、Codex 的 main-register、
-# 每次 drover rules 读完都写），drover rules 把现在的区块和它的差别送进主会话的上下文。
+# 每次主会话跑 drover rules 读完都写），drover rules 把现在的区块和它的差别送进主会话的上下文。
 
 def routing_block() -> Optional[str]:
     """主工作台 AGENTS.md 里的 drover 区块（从 begin 行到 end 行，含标记）；没配主工作台、没有文件、标记不成对返回 None。"""
@@ -10784,15 +10831,21 @@ def rules_read(block: str) -> None:
 
 
 def cmd_rules(a: argparse.Namespace) -> int:
+    """drover rules：输出区块和主会话载入时的差别。只有主会话（main_caller，同 drover rollup）跑的才记成载入时、标成已报：
+    以前谁跑都记，你在终端里看一眼规则、编排者跑一次，主会话之后再跑只会得到"和载入时一样"，新规则到不了它手里。
+    别人跑照样输出，开头多一行说明没记。"""
     if ROUTING_FILE is None:
         raise DroverError(NO_WORKSPACE_ERROR)
     block = routing_block()
     if block is None:
         raise DroverError(f"{home_path(ROUTING_FILE)} 里没有 drover 区块（没有这个文件，或者区块标记不成对），"
                           f"跑 {UPDATE_CMD} 或重跑 install.py 补上")
-    sys.stdout.write(rules_text(block, read_json_dict(MAIN_RULES_FILE), a.full))
+    is_main, why = main_caller()
+    head = "" if is_main else f"# 不是主会话（{why}），没记成主会话已读；下面是和主会话载入时的比\n"
+    sys.stdout.write(head + rules_text(block, read_json_dict(MAIN_RULES_FILE), a.full))
     sys.stdout.flush()
-    rules_read(block)
+    if is_main:
+        rules_read(block)
     return 0
 
 
@@ -11209,19 +11262,23 @@ def build_parser() -> argparse.ArgumentParser:
                         "本地改动、分叉、还没有发布的版本、连不上都什么都不改），另外无人值守——fetch 只试 1 次、最多 60 秒，"
                         "git 不问账号密码"
                         "（GIT_TERMINAL_PROMPT=0），ssh 不问密码和主机确认（BatchMode；你自己配了 GIT_SSH_COMMAND / "
-                        "core.sshCommand 的不覆盖）；没有新提交时不重跑 install。和别的 update 同一把机器级的锁，"
+                        "core.sshCommand 的不覆盖）；没有新提交、这一版也装好了（安装记录的 installed_commit 就是 clone 的 HEAD）"
+                        "时不重跑 install，上次没装好的每次都重跑。和别的 update 同一把机器级的锁，"
                         "有别的在跑就不跑。结果写 ~/.drover/auto-update.json（result：updated / up_to_date / blocked / "
-                        "unreachable / failed / disabled，见 watch --main、board 的说明）。开关：config.json 的 "
+                        "unreachable / failed / install_failed（install 没装好，error 留到装好）/ disabled，见 watch --main、"
+                        "board 的说明）。开关：config.json 的 "
                         "auto_update（默认开）、环境变量 DROVER_AUTO_UPDATE=0；间隔 auto_update_minutes（默认 30）")
 
     p = sub.add_parser("rules", help="主会话读 drover 规则的改动（不用 /clear）：AGENTS.md 里的 drover 区块和主会话载入时的比，"
                                      "只给差别，读完记成载入时",
                        description="主会话载入时的区块记在 ~/.drover/main-rules.json（SessionStart hook、Codex 的 "
-                                   "main-register、每次 drover rules 读完都写）。输出纯文本：开头一句\"drover <旧>→<新> "
+                                   "main-register、主会话每次 drover rules 读完都写）。输出纯文本：开头一句\"drover <旧>→<新> "
                                    f"更新了主会话规则：{RULES_REPLACE}\"，再是改动的行（@@ 所在的节、- 删掉的、+ 新的）；"
-                                   "没有载入时的记录、改动超过区块的一半、--full 时给整个区块；没变时说一句没变。读完把"
+                                   "没有载入时的记录、改动超过区块的一半、--full 时给整个区块；没变时说一句没变。主会话读完把"
                                    "载入时更新成现在的，并把 ~/.drover/auto-update.json 里最近一次更新标成已报（announced，"
-                                   "watch --main 不再报 drover updated，board --json 的 drover.auto_update.announced 变成 true）。"
+                                   "watch --main 不再报 drover updated，board --json 的 drover.auto_update.announced 变成 true）；"
+                                   "不是主会话（HERDR_PANE_ID 不是 main-session.json 记的 pane，同 drover rollup）跑的照样输出，"
+                                   "开头多一行说明，什么都不记。"
                                    "没配主工作台、AGENTS.md 里没有区块时报错（JSON），退出码 1。")
     p.add_argument("--full", action="store_true", help="给整个区块，不只改动")
     p.add_argument("--hook", action="store_true",

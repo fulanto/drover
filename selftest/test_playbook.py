@@ -454,7 +454,7 @@ class BriefCodingRulesTests(PlaybookTestBase):
                 self.assertIn(line, rules)
 
     def test_heavy_path_is_literal_tilde(self) -> None:
-        # 任务书里 heavy 写成字面的 ~/.drover/bin/drover（命中 install.py 的白名单 Bash(~/.drover/bin/drover:*)，
+        # 任务书里 heavy 写成字面的 ~/.drover/bin/drover（命中 install.py 加进全局的 Bash(~/.drover/bin/drover heavy:*)，
         # 展开成绝对路径时 worker 每跑一次都弹框）：不展开成 HOME 的绝对路径，也不指向 DROVER_STATE_DIR
         for kind in ("claude", "codex"):
             prompt = self.brief(kind, self.repo)["prompt"]

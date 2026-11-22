@@ -215,11 +215,11 @@ python3 install.py --workspace ~/work --repo-dir ~/work/company --repo-dir ~/wor
 
 - `~/.claude/commands/drover.md` → `~/.drover/pkg/flow/dispatch.md`（`/drover` 命令，编排者用的流程正文）
 - `~/.claude/skills/herdr/SKILL.md`：没有时用 `herdr --skill` 生成
-- 权限规则追加进 `~/.claude/settings.json` 的 `permissions.allow`：drover CLI（`Bash(~/.drover/bin/drover:*)`），`~/.drover` 和 `~/.herdr/worktrees` 的读写（`Read(~/.drover/**)`、`Edit(~/.drover/**)` 等），`herdr agent` / `pane` / `worktree` / `workspace list` / `tab list` / `status`
-- `~/.claude/settings.json` 的 `hooks.PreToolUse` 加一项 cd+git 拦截 hook（matcher `Bash`，跑装好的包里的 `~/.drover/pkg/hooks/cd_git_guard.py`，timeout 5 秒）：拒绝 `cd <目录> && git …` 这类"先 cd 再跑 git"的命令，把 `git -C <目录> …` 的改法（能改写时直接给出整条命令）回给 agent，让它自己改写重试。为什么要它：这种写法会触发 Claude Code 内置的安全确认，这个确认不走白名单、也没有 "don't ask again"，每条都要人批；编排者和 worker 派出去的子代理（Explore 等）看不到 CLAUDE.md 和任务书里"用 `git -C`"的规则，最爱这么写。hook 对子代理也生效，而且在内置确认之前执行。你已有的其他 hook（比如 herdr 的 `SessionStart`）、其他 `PreToolUse` 项原样保留；hook 自己出任何问题都放行，不会挡住正常命令
+- 权限规则追加进 `~/.claude/settings.json` 的 `permissions.allow`（这里的规则对本机所有 Claude Code 会话生效，包括 worker）：drover CLI 只放行 `heavy`（`Bash(~/.drover/bin/drover heavy:*)`：worker 只用它，它只执行构建 / 测试工具），`~/.drover` 和 `~/.herdr/worktrees` 的读写（`Read(~/.drover/**)`、`Edit(~/.drover/**)` 等），`herdr agent` / `pane` / `worktree` / `workspace list` / `tab list` / `status`。以前的版本在这里放行整个 drover CLI（`Bash(~/.drover/bin/drover:*)`），worker 跑 `accept --verify "<任意命令>"`、`push`、`cleanup` 也不弹框；重跑 install（自动更新也会跑）时把它从这里删掉、挪到主工作台
+- `~/.claude/settings.json` 的 `hooks.PreToolUse` 加一项 cd+git 拦截 hook（matcher `Bash`，跑装好的包里的 `~/.drover/pkg/hooks/cd_git_guard.py`，timeout 5 秒）：拒绝同一条命令里既有 cd 又有 git 的命令（不分先后：`cd <目录> && git …`、`git … && cd <目录>` 都算，和 Claude Code 内置检查的范围一样），把 `git -C <目录> …` 的改法（`cd <目录> && git …` 这种形状直接给出整条命令）回给 agent，让它自己改写重试。为什么要它：这种写法会触发 Claude Code 内置的安全确认，这个确认不走白名单、也没有 "don't ask again"，每条都要人批；编排者和 worker 派出去的子代理（Explore 等）看不到 CLAUDE.md 和任务书里"用 `git -C`"的规则，最爱这么写。hook 对子代理也生效，而且在内置确认之前执行。你已有的其他 hook（比如 herdr 的 `SessionStart`）、其他 `PreToolUse` 项原样保留；hook 自己出任何问题都放行，不会挡住正常命令
 - `~/.claude/settings.json` 的 `hooks.SessionStart` 加一项主会话登记 hook（不设 matcher，跑 `~/.drover/pkg/bin/drover main-register --hook`，timeout 15 秒）：每次会话开始（新开、`/clear`、resume），把主会话在 herdr 里改名为 `drover`，飞书 oncall 靠这个名字认主会话。为什么每次都跑：herdr 的名字跟着 pane 里当前的 agent 走，`/clear`、退出重开都会被清掉。不是主会话的（工作目录不是主工作台、在编排者的 `orch` workspace 里、没在 herdr 里）直接跳过；它不往会话里输出任何东西，出错也一律放过
 - `~/.claude/settings.json` 的 `hooks.UserPromptSubmit` 加一项主会话读新规则 hook（不设 matcher，跑 `~/.drover/pkg/bin/drover rules --hook`，timeout 10 秒）：[自动更新](auto-update.md)改了 `AGENTS.md` 里的 drover 规则后，你的下一条消息提交时把规则的改动一起送进主会话，不用 `/clear`。本机每个 Claude Code 会话的每条消息都会跑它：不是主会话（`session_id` 不是 `~/.drover/main-session.json` 记的）、规则没变时什么都不输出，常见路径不调 herdr、不跑 git；出错也一律放过，退出码恒为 0，不会拦你的消息
-- 权限规则追加进 `<workspace>/.claude/settings.local.json`：`Skill(drover)`、`Skill(herdr)`、`Bash(herdr workspace *)`、`Bash(herdr tab *)`
+- 权限规则追加进 `<workspace>/.claude/settings.local.json`：整个 drover CLI（`Bash(~/.drover/bin/drover:*)`：主会话和编排者都在主工作台里起，拿得到这条；worker 在 worktree 里，拿不到）、`Skill(drover)`、`Skill(herdr)`、`Bash(herdr workspace *)`、`Bash(herdr tab *)`
 - `<workspace>/CLAUDE.md` 里要有 `@AGENTS.md` 这一行（文件没有就新建，有但缺这一行就追加）
 - `herdr integration install claude`：装 agent 状态 hook，Herdr 靠它判断 agent 是 working、idle 还是 blocked。已经是 current 时不执行
 
@@ -236,7 +236,7 @@ python3 install.py --workspace ~/work --repo-dir ~/work/company --repo-dir ~/wor
 - 要替换的位置原来是实体文件 / 目录（或者指向别处的软链），而且内容和要装的不同：先备份成 `<原名>.bak-drover-<YYYYmmdd-HHMMSS>` 再换。内容相同的直接换成软链，不备份。
 - 改 settings、`CLAUDE.md`、往没有标记的 `AGENTS.md` 追加区块之前，先复制一份备份。替换已有区块不备份，区块归 drover 管。
 - Codex 技能目录的备份**不放在原地**，而是放到 `~/.drover/backups/codex-skills/`。Codex 会递归扫描 skills 目录，备份放在那里会多出一个同名的 drover 技能。
-- 权限规则只追加缺的，不删、不重排你已有的规则，JSON 里的其他键原样保留。cd+git 拦截 hook、主会话登记 hook、读新规则 hook 同理：只追加这一项，脚本路径变了就更新那一项。同一个文件（`~/.claude/settings.json` 的规则和 hook）一次只备份一份。
+- 权限规则只追加缺的，不删、不重排你已有的规则，JSON 里的其他键原样保留（唯一会删的是 drover 以前加进全局的 `Bash(~/.drover/bin/drover:*)`，见上）。cd+git 拦截 hook、主会话登记 hook、读新规则 hook 同理：只追加这一项，脚本路径变了就更新那一项。同一个文件（`~/.claude/settings.json` 的规则和 hook）一次只备份一份。
 - 已经装对的项跳过：重跑 install 是幂等的，不会产生新备份，也不会重复加规则。
 
 ## 检查、更新、卸载

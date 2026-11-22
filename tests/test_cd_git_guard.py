@@ -86,6 +86,14 @@ class MustBlockTests(GuardCase):
                         "echo `cd /a && git log`", "cd /a && (git log)", "cd /a # 先进去\ngit log"]:
             self.assert_blocked(command)
 
+    def test_block_git_before_cd(self) -> None:
+        """git 在前、cd 在后同样拦：Claude Code 内置的检查是"同一条命令里有 cd 也有 git"，不看先后（2.1.330 的实现是
+        some(cd) && some(git)），hook 放过去照样弹那个没法加白名单的框。这种形状没有一条命令的改写，只给通用的改法"""
+        for command in ["git status && cd /a", "git -C /a status && cd /a && bun test", "git log | head; cd /a",
+                        "git fetch\ncd /a", "ls | xargs git add; pushd /a", "(git log) && popd",
+                        "GIT_PAGER=cat git log && cd /a && npm test"]:
+            self.assertIsNone(self.assert_blocked(command), command)
+
 
 # ---------------------------------------------------------------- 必须放行
 
@@ -100,8 +108,10 @@ class MustAllowTests(GuardCase):
     def test_allow_cd_without_git(self) -> None:
         self.assert_allowed("cd /a && npm test")
 
-    def test_allow_cd_after_git(self) -> None:
-        self.assert_allowed("git status && cd /a")
+    def test_allow_cd_or_git_only_as_argument(self) -> None:
+        """cd / git 只是参数、不是命令的，不论先后都放行"""
+        for command in ["git log && echo cd", "echo git && cd /a", "git -C /a log | grep cd", "cd /a && make git"]:
+            self.assert_allowed(command)
 
     def test_allow_double_quoted(self) -> None:
         self.assert_allowed('git commit -m "cd x && git y"')
@@ -171,6 +181,7 @@ class SuggestionTests(GuardCase):
         self.assertIn("没法加白名单", with_fix)
         self.assertIn("管道接在后面照用", with_fix)
         self.assertIn("拆成单独的调用", with_fix)
+        self.assertIn("不分先后", with_fix)
         self.assertTrue(with_fix.endswith("这条可以直接改成：git -C /a log"))
         self.assertNotIn("直接改成", guard.deny_reason(None))
 

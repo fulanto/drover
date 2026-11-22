@@ -21,7 +21,7 @@ import sys
 import time
 import unittest
 
-from selftest_support import DROVER, PKG, DroverTestCase, events, wait_for
+from selftest_support import DROVER, MAIN_PANE, PKG, DroverTestCase, events, wait_for
 
 FAST = ["--interval", "0.2"]
 HOUR = 3600
@@ -75,8 +75,17 @@ class AutoUpdateCase(DroverTestCase):
     def main_rules(self) -> dict:
         return json.loads((self.state / "main-rules.json").read_text())
 
-    def rules(self, *args: str, rc: int = 0) -> str:
-        return self.drover("rules", *args, rc=rc, cwd=self.work).stdout
+    def rules(self, *args: str, rc: int = 0, env: dict = None) -> str:
+        """drover rules，默认在主会话的 pane 里跑（HERDR_PANE_ID 是 main-session.json 记的 pane；还没有记录就先登记 MAIN_PANE）：
+        只有主会话跑的才记成载入时、标成已报。env 给了就用它（别的 pane、普通终端）。"""
+        if env is None:
+            path = self.state / "main-session.json"
+            pane = (json.loads(path.read_text()) if path.exists() else {}).get("pane_id")
+            if not pane:
+                pane = MAIN_PANE
+                path.write_text(json.dumps({"session_id": None, "pane_id": pane, "source": None, "at": time.time()}))
+            env = {"HERDR_ENV": "1", "HERDR_PANE_ID": pane}
+        return self.drover("rules", *args, rc=rc, cwd=self.work, env=env).stdout
 
     def pkg_sha7(self) -> str:
         return self.git(PKG, "rev-parse", "HEAD")[:7]
@@ -283,6 +292,29 @@ class RulesTests(AutoUpdateCase):
         self.rules()
         self.assertEqual(self.auto()["update"]["announced_at"], at)
 
+    def test_not_main_session_records_nothing(self) -> None:
+        """不是主会话跑的（普通终端、别的 pane）：照样输出改动，开头多一行说明没记；不写 main-rules.json、不把更新标成已报。
+        以前谁跑都记成主会话已读：你在终端里看一眼规则，主会话之后再跑只会得到"和载入时一样"，新规则就到不了它手里"""
+        self.write_block(rules_block())
+        self.rules()  # 主会话载入了 v1
+        loaded = self.main_rules()
+        v2 = rules_block("- 追踪第 2 条：新的写法")
+        self.write_block(v2)
+        self.auto_record(result="updated", update={"from": SHA_A, "to": SHA_B, "announced": False, "routing_changed": True})
+        for env in ({}, {"HERDR_ENV": "1", "HERDR_PANE_ID": "w9:p9"}):
+            with self.subTest(env=env):
+                out = self.rules(env=env)
+                self.assertTrue(out.splitlines()[0].startswith("# 不是主会话（"), out)
+                self.assertIn("没记成主会话已读", out.splitlines()[0])
+                self.assertIn("+ - 追踪第 2 条：新的写法", out)
+                self.assertEqual(self.main_rules(), loaded)
+                self.assertFalse(self.auto()["update"]["announced"])
+        out = self.rules()  # 主会话自己跑：拿到同样的改动，记下
+        self.assertTrue(out.startswith("drover "), out)
+        self.assertIn("+ - 追踪第 2 条：新的写法", out)
+        self.assertEqual(self.main_rules()["text"], v2)
+        self.assertTrue(self.auto()["update"]["announced"])
+
     def test_errors(self) -> None:
         """AGENTS.md 里没有区块、标记不成对：报错（JSON），退出码 1，不写 main-rules.json；没配主工作台：报错让先跑 install"""
         out = json.loads(self.rules(rc=1))
@@ -409,6 +441,21 @@ class WatchDroverEventTests(AutoUpdateCase):
         self.auto_file.write_text(json.dumps(record))
         self.assertEqual(self.main_watch(), ["EVENT drover update-blocked"])
 
+    def test_install_failed_blocked_not_updated(self) -> None:
+        """快进了但 install 没装好（result install_failed）：报 update-blocked（同一个原因一次），不报 updated、不标已报——没装好
+        不算更新完；重跑 install 装好以后（result 回到 up_to_date），这时才报 updated(…) rules"""
+        self.auto_record(result="install_failed", error="安装：没改动；失败：主工作台路由区块（没法处理）",
+                         update={"from": SHA_A, "to": SHA_B, "routing_changed": True, "announced": False,
+                                 "at": time.time()})
+        self.assertEqual(self.main_watch(), ["EVENT drover update-blocked"])
+        self.assertFalse(self.auto()["update"]["announced"])
+        self.assertEqual(self.main_watch("1"), ["EVENT timeout"])
+        record = self.auto()
+        record["result"] = "up_to_date"
+        record.pop("error")
+        self.auto_file.write_text(json.dumps(record))
+        self.assertEqual(self.main_watch(), ["EVENT drover updated(aaaaaaa..bbbbbbb) rules"])
+
     def test_unreachable_only_after_24h(self) -> None:
         """连不上：不满 24 小时不报；满了报一次 EVENT drover update-unreachable(24h)，重挂不重报；新的一段重新计时"""
         self.auto_record(result="unreachable", unreachable_since=time.time() - 23 * HOUR, error="连不上远端")
@@ -526,6 +573,20 @@ class BoardDroverTests(AutoUpdateCase):
         self.auto_record(result="up_to_date",
                          update={"from": SHA_B, "to": SHA_C, "at": time.time() - 25 * HOUR, "source": "manual"})
         self.assertEqual(len(self.board_lines()), 1)
+
+    def test_install_failed_line(self) -> None:
+        """快进了但 install 没装好（result install_failed）：不写"已自动更新"，写"drover 自动更新装失败（下次自动检查重试）：
+        <失败项>"，--plain 一样；装好以后（up_to_date）回到"已自动更新 a→b（…）\""""
+        at = time.time() - HOUR
+        error = "安装：没改动；失败：主工作台路由区块（没法处理）"
+        upd = {"from": SHA_A, "to": SHA_B, "at": at, "announced": False}
+        self.auto_record(result="install_failed", error=error, update=upd)
+        want = f"drover 自动更新装失败（下次自动检查重试）：{error}"
+        self.assertEqual(self.board_lines()[1:], [want])
+        self.assertIn(want, self.board("--plain").splitlines())
+        self.auto_record(result="up_to_date", update=upd)
+        self.assertEqual(self.board_lines()[1:],
+                         [f"drover 已自动更新 aaaaaaa→bbbbbbb（{time.strftime('%m-%d %H:%M', time.localtime(at))}）"])
 
     def test_json_drover_field(self) -> None:
         """--json 的 drover：version（7 位）、auto_update（enabled、result、last_attempt、error、from、to、from_tag、to_tag、

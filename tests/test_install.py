@@ -104,6 +104,10 @@ elif args[:2] == ["plugin", "install"]:
     if state.get("plugin_install_fail"):
         print("fake: could not reach github.com", file=sys.stderr)
         sys.exit(1)
+    appends = state.get("plugin_install_appends")  # [文件, 内容]：装插件这段时间里别人改了这个文件
+    if appends:
+        with open(appends[0], "a") as f:
+            f.write(appends[1])
     plugins.append({"plugin_id": PLUGIN, "version": state.get("install_version", "0.7.0"), "enabled": True,
                     "plugin_root": str(HERE / "plugin-root"),
                     "source": {"kind": "github", "owner": "fulanto", "repo": "herdr-oncall", "requested_ref": "stable"}})
@@ -190,13 +194,20 @@ def place_fake(path: Path, body: str) -> None:
         shutil.copy2(src, path)
 
 GLOBAL_RULES = [
-    "Bash(~/.drover/bin/drover:*)", "Read(~/.drover/**)", "Edit(~/.drover/**)",
+    "Bash(~/.drover/bin/drover heavy:*)", "Read(~/.drover/**)", "Edit(~/.drover/**)",
     "Read(~/.herdr/worktrees/**)", "Edit(~/.herdr/worktrees/**)", "Bash(herdr agent:*)", "Bash(herdr pane:*)",
     "Bash(herdr worktree:*)", "Bash(herdr workspace list:*)", "Bash(herdr tab list:*)", "Bash(herdr status:*)",
 ]
-WORKSPACE_RULES = ["Skill(drover)", "Skill(herdr)", "Bash(herdr workspace *)", "Bash(herdr tab *)"]
+# 整个 drover CLI 的放行只在主工作台（主会话、编排者在那里起）；全局（含 worker）只放行 heavy。旧版本把它加在全局。
+CLI_RULE = "Bash(~/.drover/bin/drover:*)"
+HEAVY_RULE = "Bash(~/.drover/bin/drover heavy:*)"
+WORKSPACE_RULES = [CLI_RULE, "Skill(drover)", "Skill(herdr)", "Bash(herdr workspace *)", "Bash(herdr tab *)"]
 # 改名前的名字：新装后不能出现在任何入口、规则、计划路径里（用户自己写的同名命令 / 技能除外，install 不碰它们）。
 OLD_NAMES = [".herdr/dispatch", "commands/dispatch", "skills/dispatch", "Skill(dispatch)", "bin/dispatch"]
+
+
+def dump_steps(out: dict) -> str:
+    return json.dumps(out.get("steps"), ensure_ascii=False, indent=1)[:4000]
 
 
 class InstallTestBase(unittest.TestCase):
@@ -634,10 +645,125 @@ class BackupIdempotencyTests(InstallTestBase):
         self.assertEqual(len(self.backups(self.state_home, "config.json")), 1)
 
 
+# ---------------------------------------------------------------- 权限规则的范围
+
+
+class PermissionScopeTests(InstallTestBase):
+    """全局 settings 对本机所有 Claude Code 会话生效（含 worker）：只放行 drover heavy（worker 只用它，它有命令名单）。
+    整个 drover CLI（accept --verify 跑任意命令、push、cleanup、prompt……）只在主工作台的 settings 里放行：主会话、编排者
+    都在主工作台里起。旧版本加进全局的宽规则，重跑 install（含自动更新）时换掉。"""
+
+    def test_global_only_heavy_workspace_whole_cli(self) -> None:
+        out = self.install_json("--host", "claude", *self.ws_args())
+        self.assertTrue(out["ok"], dump_steps(out))
+        allow = self.load(self.settings)["permissions"]["allow"]
+        self.assertEqual([r for r in allow if "/bin/drover" in r], [HEAVY_RULE])
+        self.assertIn(CLI_RULE, self.load(self.ws_settings)["permissions"]["allow"])
+        record = self.load(self.state)["added_rules"]
+        self.assertNotIn(CLI_RULE, record[str(self.settings)])
+        self.assertIn(CLI_RULE, record[str(self.ws_settings)])
+
+    def test_rerun_replaces_old_wide_rule(self) -> None:
+        """旧版本装出来的样子：全局有 Bash(~/.drover/bin/drover:*)（安装记录里也记着）、主工作台没有。--check 报这两项没装对；
+        重跑 install 把宽规则从全局删掉、加上 heavy 那条，主工作台加上整个 CLI；用户自己的规则不动、不重排，改之前备份一份；
+        安装记录跟着改（--uninstall 按它撤）；再跑一次什么都不改，--check 通过"""
+        self.install_json("--host", "claude", *self.ws_args())
+        settings = self.load(self.settings)
+        allow = settings["permissions"]["allow"]
+        allow[allow.index(HEAVY_RULE)] = CLI_RULE
+        allow.insert(0, "Bash(git:*)")
+        self.write_json(self.settings, settings)
+        ws_settings = self.load(self.ws_settings)
+        ws_settings["permissions"]["allow"].remove(CLI_RULE)
+        self.write_json(self.ws_settings, ws_settings)
+        record = self.load(self.state)
+        record["added_rules"] = {str(self.settings): [CLI_RULE, *GLOBAL_RULES[1:]],
+                                 str(self.ws_settings): WORKSPACE_RULES[1:]}
+        self.write_json(self.state, record)
+
+        check = self.install_json("--check", rc=1)
+        verdicts = dict(zip([s["key"] for s in check["steps"]], check["verdicts"]))
+        self.assertEqual((verdicts["claude-settings"], verdicts["workspace-settings"]), ("fail", "fail"))
+        self.assertIn(CLI_RULE, self.step(check, "claude-settings")["action"])
+
+        out = self.install_json("--host", "claude")
+        self.assertTrue(out["ok"], dump_steps(out))
+        allow = self.load(self.settings)["permissions"]["allow"]
+        self.assertNotIn(CLI_RULE, allow)
+        self.assertEqual(allow[0], "Bash(git:*)")
+        self.assertEqual(allow.count(HEAVY_RULE), 1)
+        self.assertEqual(len(self.backups(self.claude, "settings.json")), 1)
+        self.assertEqual(self.load(self.ws_settings)["permissions"]["allow"].count(CLI_RULE), 1)
+        rules = self.load(self.state)["added_rules"]
+        self.assertNotIn(CLI_RULE, rules[str(self.settings)])
+        self.assertIn(HEAVY_RULE, rules[str(self.settings)])
+        self.assertIn(CLI_RULE, rules[str(self.ws_settings)])
+
+        again = self.install_json("--host", "claude")
+        self.assertEqual([s["key"] for s in again["steps"] if s["changes"]], [])
+        self.assertTrue(self.install_json("--check")["ok"])
+
+
+# ---------------------------------------------------------------- 安装记录的 installed_commit
+
+
+class InstalledCommitTests(InstallTestBase):
+    """安装记录的 installed_commit：drover 自己的各项都装好时，记下包所在仓库（clone）的 HEAD。自动更新拿它和 clone 的 HEAD
+    比，不一样（上次没装好、进程被杀）就重跑 install；有失败项时不改，留着上次装好的那个。"""
+
+    @staticmethod
+    def pkg_head() -> str:
+        return subprocess.run(["git", "-C", str(PKG), "rev-parse", "HEAD"], capture_output=True, text=True,
+                              check=True, timeout=60).stdout.strip()
+
+    def test_recorded_on_success_kept_on_failure(self) -> None:
+        self.install_json("--host", "claude", *self.ws_args())
+        self.assertEqual(self.load(self.state)["installed_commit"], self.pkg_head())
+        record = self.load(self.state)
+        record["installed_commit"] = "0" * 40  # 当成上次装好的是一个旧提交
+        self.write_json(self.state, record)
+        good = self.agents.read_text()
+        self.agents.write_text(good + BEGIN + "\n多出来的开头标记\n")  # 标记不成对：路由区块那一项失败
+        out = self.install_json("--host", "claude", rc=1)
+        self.assertFalse(out["ok"])
+        self.assertEqual(self.load(self.state)["installed_commit"], "0" * 40)
+        self.agents.write_text(good)
+        out = self.install_json("--host", "claude")
+        self.assertEqual([s["key"] for s in out["steps"] if s["changes"]], ["state"])  # 别的项都不用改，照样补记
+        self.assertEqual(self.load(self.state)["installed_commit"], self.pkg_head())
+
+    def test_old_record_without_commit_gets_it(self) -> None:
+        """旧版本写的安装记录没有 installed_commit、各项都已装好：重跑只改安装记录这一项、补上；再跑什么都不改"""
+        self.install_json("--host", "claude", *self.ws_args())
+        record = self.load(self.state)
+        record.pop("installed_commit")
+        self.write_json(self.state, record)
+        out = self.install_json("--host", "claude")
+        self.assertEqual([s["key"] for s in out["steps"] if s["changes"]], ["state"])
+        self.assertEqual(self.load(self.state)["installed_commit"], self.pkg_head())
+        again = self.install_json("--host", "claude")
+        self.assertEqual([s["key"] for s in again["steps"] if s["changes"]], [])
+
+
 # ---------------------------------------------------------------- AGENTS.md 区块
 
 
 class AgentsMdTests(InstallTestBase):
+    def test_block_step_rereads_file(self) -> None:
+        """区块那一步执行时重读 AGENTS.md：计划和执行之间隔着装飞书插件（最长 600 秒），这段时间里区块外的改动（比如主会话
+        按你的话改"本机补充"）不被计划时读到的旧内容盖掉。假 herdr 装插件时往 AGENTS.md 末尾追加一段来模拟"""
+        head = "# 我的工作台\n\n上面的个人内容\n\n"
+        self.write(self.agents, head + BEGIN + "\n旧的路由规则\n" + END + "\n")
+        added = "\n## 本机补充\n\n- 装插件那几分钟里新写的一条\n"
+        self.set_herdr(plugin_install_appends=[str(self.agents), added])
+        out = self.install_json("--host", "claude", *self.ws_args(), "--oncall")
+        self.assertTrue(self.step(out, "oncall-plugin")["result"].startswith("完成"), dump_steps(out))
+        self.assertTrue(self.step(out, "routing")["result"].startswith("完成"), dump_steps(out))
+        text = self.agents.read_text()
+        self.assertTrue(text.startswith(head + BEGIN), text[:200])
+        self.assertTrue(text.endswith(added), text[-300:])
+        self.assert_block(text)
+
     def test_personal_without_markers_appends_block(self) -> None:
         personal = "# 我的工作台\n\n个人规则：仓库在 ~/ws/company 下。\n"
         self.write(self.agents, personal)

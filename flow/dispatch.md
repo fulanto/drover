@@ -471,10 +471,10 @@ PARTIAL / FAILED 时先读报告和屏幕（`herdr agent read <name> --source re
 **直接批准 / 自行回答**
 
 - 文件新建、编辑、移动；删除临时文件、构建产物、缓存、worktree 内自己生成的文件
-- 任何未授权的 bash 命令，只要是常规开发操作：安装依赖、构建、测试、lint、格式化、启动本地服务、curl 本地或公共只读地址、git 只读命令（status/diff/log/show/blame）、worktree 内的 git stash / checkout 文件
+- 任何未授权的 bash 命令，只要是常规开发操作：安装依赖、构建、测试、lint、格式化、启动本地服务、curl 本地或公共只读地址、git 只读命令（status/diff/log/show/blame）、worktree 内的 git checkout 文件。`git stash` 不在其中：同一个仓库的所有 worktree 共用一个 stash 栈，并行的 worker 会 pop 到别人的改动（真实任务里踩过），要暂存让它 `git diff` 导成 patch 文件
 - 读取 worktree 外的文件
 - agent 提出的实现选型问题：按任务意图和仓库现有约定选，理由记到状态文件
-- claude 弹窗优先选 "Yes, and don't ask again for … this session" 这类免重复选项（限常规开发命令）；一次性删除类只选 "Yes"
+- claude 弹窗优先选 "Yes, and don't ask again for … this session" 这类免重复选项（限常规开发命令）；一次性删除类只选 "Yes"；前缀是会改状态的程序（`drover`、`herdr` 的写子命令、git 写操作、podman / docker / kubectl、安装脚本）也只选 "Yes" 批单次：不再询问放行的是整个前缀，而且 Bash 命令的这一条会存进仓库主检出根目录的 `.claude/settings.local.json`（worktree 里批的也存到主检出，[官方文档](https://code.claude.com/docs/en/permissions)），之后这个仓库所有 worker 同前缀的推送、删除都不再弹框
 - codex 审批同理：选 "Yes" 或 "Yes, and don't ask again for this session"
 - 探测 / 调研用的 worktree（不交付改动）：报告记进状态文件后用 `drover cleanup --probe` 删（第 9 节"pane 清理"）
 

@@ -40,10 +40,11 @@ class StateDirTests(DroverTestCase):
 
     def test_drover_cmd_is_literal_tilde(self) -> None:
         """写进任务书的 CLI 入口 DROVER_CMD 是字面的 ~/.drover/bin/drover：不展开成 HOME 的绝对路径（权限规则按字面前缀
-        匹配，展开了就对不上 install.py 加的 Bash(~/.drover/bin/drover:*)，worker 每跑一次 heavy 都弹框），也不跟 DROVER_STATE_DIR 走"""
+        匹配，展开了就对不上 install.py 加进全局的 Bash(~/.drover/bin/drover heavy:*)，worker 每跑一次 heavy 都弹框），也不跟
+        DROVER_STATE_DIR 走"""
         d = self.load_drover()
         self.assertEqual(d.DROVER_CMD, "~/.drover/bin/drover")
-        self.assertIn(f'"Bash({d.DROVER_CMD}:*)"', (DROVER.parent.parent / "install.py").read_text())
+        self.assertIn(f'"Bash({d.DROVER_CMD} heavy:*)"', (DROVER.parent.parent / "install.py").read_text())
 
     def test_tilde_is_expanded(self) -> None:
         """DROVER_STATE_DIR 里的 ~ 按 HOME 展开"""

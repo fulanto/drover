@@ -521,6 +521,59 @@ class UpdateAutoTests(UpdateTestBase):
         self.assertNotIn("update", rec)
         self.assertEqual(self.state.stat().st_mtime_ns, mtime)
 
+    def board_and_events(self) -> tuple:
+        """装着的那份在进程里看：(看板第一行下面 drover 自己的那几行, watch --main 这一轮会报的 drover 事件)。只算不记。"""
+        d = self.load_cli()
+        events: list = []
+        d.drover_take_events(self.record(), time.time(), events)
+        return d.drover_board(time.time())[1], events
+
+    def test_install_failure_retried_until_fixed(self) -> None:
+        """快进以后 install 失败（AGENTS.md 里区块标记不成对，路由区块那一项装不上）：result install_failed、error 写失败项，
+        update 记着 from→to；看板写"装失败"不写"已自动更新"，watch --main 报 update-blocked 不报 updated。下一次检查（没有
+        新提交）照样重跑 install（安装记录里装好的提交还是旧的），还失败就接着留着 error。修好以后再查：重跑 install 装好，
+        result up_to_date、error 清掉，update 还是 from→to、没报过、routing_changed 是这次装上的，这时看板写"已自动更新"、
+        watch --main 报 updated(…) rules。再查一次就不重跑 install 了"""
+        self.clone_install("--host", "claude")
+        old = self.head(self.clone)
+        new = self.push_change("flow/routing.md", MARK_LINE, "routing：加一条规则")
+        good = self.agents.read_text()
+        self.agents.write_text(good + BEGIN + "\n多出来的开头标记\n")
+        self.auto(rc=1)
+        rec = self.record()
+        self.assertEqual(rec["result"], "install_failed", dump(rec))
+        self.assertIn("主工作台路由区块", rec["error"])
+        self.assertEqual((rec["update"]["from"], rec["update"]["to"], rec["update"]["announced"]), (old, new, False))
+        self.assertEqual(self.head(self.clone), new)
+        notes, events = self.board_and_events()
+        self.assertEqual(notes, [f"drover 自动更新装失败（下次自动检查重试）：{rec['error']}"])
+        self.assertEqual(events, ["update-blocked"])
+
+        p = self.auto(rc=1)  # 没有新提交，install 还是失败：照样重跑，error 留着
+        self.assertNotIn("没重跑 install", p.stdout)
+        self.assertIn("上次没装好，重跑了 install", p.stdout)
+        rec = self.record()
+        self.assertEqual(rec["result"], "install_failed", dump(rec))
+        self.assertIn("主工作台路由区块", rec["error"])
+
+        self.agents.write_text(good)
+        self.auto()
+        rec = self.record()
+        self.assertEqual(rec["result"], "up_to_date", dump(rec))
+        self.assertNotIn("error", rec)
+        self.assertIn(MARK, self.agents.read_text())
+        upd = rec["update"]
+        self.assertEqual((upd["from"], upd["to"], upd["count"], upd["announced"], upd["routing_changed"]),
+                         (old, new, 1, False, True))
+        notes, events = self.board_and_events()
+        stamp = time.strftime("%m-%d %H:%M", time.localtime(upd["at"]))
+        self.assertEqual(notes, [f"drover 已自动更新 {old[:7]}→{new[:7]}（{stamp}）"])
+        self.assertEqual(events, [f"updated({old[:7]}..{new[:7]}) rules"])
+
+        mtime = self.state.stat().st_mtime_ns
+        self.assertIn("没重跑 install", self.auto().stdout)
+        self.assertEqual(self.state.stat().st_mtime_ns, mtime)
+
     def test_dirty_and_diverged_blocked(self) -> None:
         """有已跟踪改动又落后 / 和上游分叉：result blocked、blocked_status、error 说原因，HEAD、AGENTS.md、安装记录都不动"""
         self.clone_install("--host", "claude")

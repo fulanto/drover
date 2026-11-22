@@ -120,7 +120,7 @@
   - 你电脑上缺的 herdr、Claude Code（要飞书时还有 Node）会用它们官方的安装脚本装上：herdr、claude 放在 ~/.local/bin，Node 放在 ~/.nvm，都在你自己的家目录，不用管理员密码；
   - ~/.local/bin 现在不在你的 PATH 里，所以会在 ~/.zshrc 末尾加一段带 drover 标记的 PATH（改之前先备份），这样新开的终端里能直接输 herdr、claude；卸载时会把这一段删掉；
   - ~/.drover/ 下放 drover 的入口和配置，这是 drover 自己的文件夹；
-  - 给 Claude Code 加几条权限和一个小检查（hook），让它派任务时少弹确认：那个 hook 会挡住"先 cd 再跑 git"这种每次都要你点确认的写法，让 agent 自己换成不用确认的写法（都在 ~/.claude/settings.json，只加不删，改之前先备份）；
+  - 给 Claude Code 加几条权限和一个小检查（hook），让它派任务时少弹确认：那个 hook 会挡住"cd 和 git 写在同一条命令里"这种每次都要你点确认的写法，让 agent 自己换成不用确认的写法（都在 ~/.claude/settings.json，只加不删，改之前先备份）；
   - ~/code 里放两个说明文件（AGENTS.md、CLAUDE.md）和一个权限设置文件，以后在 ~/code 打开的 agent 就知道怎么分派任务；
   - 让 Herdr 能看出每个 agent 是在干活还是在等你；
   - 从 GitHub 装飞书提醒插件（herdr-oncall），离开电脑时主会话需要你会推到飞书（你说要飞书才有这一条）；

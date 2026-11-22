@@ -70,9 +70,13 @@ BLOCK_END_RE = re.compile(r"^[ \t]*" + re.escape(BLOCK_END) + r"[ \t]*$", re.M)
 TEMPLATE_COMMENT_RE = re.compile(r"\A\s*<!--.*?-->\s*", re.S)
 PLACEHOLDER_RE = re.compile(r"\{\{\s*([a-z_]+)\s*\}\}")
 
-# 权限规则：只追加缺的，不删、不重排已有的。
+# 权限规则：只追加缺的，不重排已有的；不删，CLAUDE_GLOBAL_RETIRED 里 drover 以前加的除外。
+# 全局 settings 对本机所有 Claude Code 会话生效，包括 worker：drover CLI 只放行 heavy（worker 只用它，任务书里写成字面的
+# ~/.drover/bin/drover heavy -- …；它只执行构建 / 测试工具，见 bin/drover 的 heavy_allowed）。整个 drover CLI 只在主工作台
+# 放行：主会话和编排者都在主工作台里起（bin/drover 的 ORCH_CWD），worker 在 worktree 里拿不到。以前全局放行整个 CLI，
+# worker 跑 accept --verify "<任意命令>"、push、cleanup、prompt 都不弹框。
 CLAUDE_GLOBAL_RULES = [
-    "Bash(~/.drover/bin/drover:*)",
+    "Bash(~/.drover/bin/drover heavy:*)",
     "Read(~/.drover/**)",
     "Edit(~/.drover/**)",
     "Read(~/.herdr/worktrees/**)",
@@ -85,15 +89,18 @@ CLAUDE_GLOBAL_RULES = [
     "Bash(herdr status:*)",
 ]
 CLAUDE_WORKSPACE_RULES = [
+    "Bash(~/.drover/bin/drover:*)",
     "Skill(drover)",
     "Skill(herdr)",
     "Bash(herdr workspace *)",
     "Bash(herdr tab *)",
 ]
+# drover 以前加进全局、现在换掉的规则：重跑 install（自动更新也跑）时从全局 settings 删掉，在的时候 --check 报没装对。
+CLAUDE_GLOBAL_RETIRED = ["Bash(~/.drover/bin/drover:*)"]
 CLAUDE_MD_LINE = "@AGENTS.md"
 
-# cd+git 拦截 hook：~/.claude/settings.json 的 hooks.PreToolUse 里加一项（matcher Bash）。先 cd 再跑 git 会触发
-# Claude Code 内置的强制确认（没法加白名单、没有 "don't ask again"），子代理看不到 CLAUDE.md 里"用 git -C"的规则，
+# cd+git 拦截 hook：~/.claude/settings.json 的 hooks.PreToolUse 里加一项（matcher Bash）。同一条命令里有 cd 又有 git（不分先后）
+# 会触发 Claude Code 内置的强制确认（没法加白名单、没有 "don't ask again"），子代理看不到 CLAUDE.md 里"用 git -C"的规则，
 # 最爱这么写；hook 拒绝这种写法并提示改成 git -C <目录> …，agent 自己改写重试，不用人批。
 # 命令指向装好的包（~/.drover/pkg，link / copy 下路径都不变），不是 clone 目录。
 HOOK_SCRIPT_REL = Path("hooks") / "cd_git_guard.py"
@@ -423,6 +430,7 @@ class Ctx:
     state: dict = field(default_factory=dict)       # 上次的安装记录
     created: list = field(default_factory=list)     # 本次新建的文件（绝对路径字符串）
     added_rules: dict = field(default_factory=dict)  # 本次加的规则：settings 文件绝对路径 → 规则列表
+    dropped_rules: dict = field(default_factory=dict)  # 本次删掉的 drover 旧规则（CLAUDE_GLOBAL_RETIRED）：同上
     added_hooks: dict = field(default_factory=dict)  # 本次加（或更新成）的 hook 命令：settings 文件绝对路径 → 命令列表
     dropped_hooks: dict = field(default_factory=dict)  # 本次换掉的 drover 旧 hook 命令（路径变了）：同上
     backups: list = field(default_factory=list)     # 本次做的备份
@@ -1345,8 +1353,9 @@ def plan_claude_herdr_skill(ctx: Ctx) -> Step:
                 backup=backup_target(path) if path.is_symlink() else None)
 
 
-def plan_rules(ctx: Ctx, key: str, label: str, path: Path, rules: list) -> Step:
-    """permissions.allow 里只追加缺的规则，不删、不重排已有内容，JSON 其他键原样保留；改之前先备份。"""
+def plan_rules(ctx: Ctx, key: str, label: str, path: Path, rules: list, retired: tuple = ()) -> Step:
+    """permissions.allow 里只追加缺的规则，不重排已有内容，JSON 其他键原样保留；retired 是 drover 以前加的、现在换掉的规则，
+    在就删掉。改之前先备份。"""
     data, err = read_json(path)
     if err:
         return Step(key, label, disp(path), err, action="不动：先修好这个文件再重跑", level="fail")
@@ -1355,29 +1364,52 @@ def plan_rules(ctx: Ctx, key: str, label: str, path: Path, rules: list) -> Step:
     if not isinstance(allow, list):
         return Step(key, label, disp(path), "permissions / permissions.allow 不是预期的类型", action="不动：先手动修好",
                     level="fail")
-    missing = [r for r in rules if r not in allow]
-    if not missing:
+    _, stale, missing = split_rules(allow, rules, retired)
+    if not missing + stale:
         return Step(key, label, disp(path), f"{len(rules)} 条规则都在")
-
-    def run() -> str:
-        cur, cur_err = read_json(path)
-        if cur_err:
-            raise RuntimeError(cur_err)
-        cur = cur if cur is not None else {}
-        cur_perms = cur.setdefault("permissions", {})
-        cur_allow = cur_perms.setdefault("allow", [])
-        added = [r for r in rules if r not in cur_allow]
-        cur_allow.extend(added)
-        write_json(path, cur)
-        if added:
-            ctx.added_rules.setdefault(str(path), []).extend(added)
-        if data is None:
-            ctx.created.append(str(path))
-        return f"加了 {len(added)} 条"
-
-    state = "不存在" if data is None else f"缺 {len(missing)} 条（共 {len(rules)} 条）"
-    return Step(key, label, disp(path), state, action="追加：" + "、".join(missing), run=run, level="fail",
+    state, action = rules_todo(len(rules), missing, stale)
+    return Step(key, label, disp(path), "不存在" if data is None else state, action=action,
+                run=lambda: write_rules(ctx, path, rules, retired), level="fail",
                 fs=path, backup=backup_target(path) if data is not None else None, backup_how="copy")
+
+
+def split_rules(allow: list, rules: list, retired: tuple) -> tuple[list, list, list]:
+    """(留下的, 要删的旧规则, 要加的)：allow 里 retired 的删掉、别的原样不重排，rules 里缺的加在后面。计划和执行共用。"""
+    kept = [r for r in allow if r not in retired]
+    return kept, [r for r in allow if r in retired], [r for r in rules if r not in kept]
+
+
+def rules_todo(total: int, missing: list, stale: list) -> tuple[str, str]:
+    """plan_rules 的现状和动作：缺几条、追加哪些；有换下来的旧规则时再加一段删哪些。"""
+    state = [f"缺 {len(missing)} 条（共 {total} 条）"] if missing else []
+    action = ["追加：" + "、".join(missing)] if missing else []
+    if stale:
+        state.append(f"有换下来的旧规则 {len(stale)} 条")
+        action.append("删掉换下来的旧规则：" + "、".join(stale))
+    return "，".join(state), "；".join(action)
+
+
+def write_rules(ctx: Ctx, path: Path, rules: list, retired: tuple) -> str:
+    """plan_rules 那一项的执行：重读文件（计划之后可能被别的项改过），删掉换下来的旧规则、追加缺的，记进 ctx。"""
+    cur, cur_err = read_json(path)
+    if cur_err:
+        raise RuntimeError(cur_err)
+    data = {} if cur is None else cur
+    perms = data.setdefault("permissions", {})
+    kept, dropped, added = split_rules(perms.setdefault("allow", []), rules, retired)
+    perms["allow"] = kept + added
+    write_json(path, data)
+    note_rules(ctx.added_rules, path, added)
+    note_rules(ctx.dropped_rules, path, dropped)
+    if cur is None:
+        ctx.created.append(str(path))
+    return f"加了 {len(added)} 条" + (f"，删了换下来的旧规则 {len(dropped)} 条" if dropped else "")
+
+
+def note_rules(record: dict, path: Path, rules: list) -> None:
+    """往 ctx.added_rules / dropped_rules 里记一笔；没有就不记（空列表会让安装记录多出一个空键、白白重写一次）。"""
+    if rules:
+        record.setdefault(str(path), []).extend(rules)
 
 
 @dataclass
@@ -2310,24 +2342,23 @@ def plan_routing(ctx: Ctx) -> Step:
         return Step(key, label, disp(path), "区块已是最新")
     if how == "replace":
         return Step(key, label, disp(path), "有区块，和 flow/routing.md 当前的渲染结果不同",
-                    action="整段替换区块（区块外内容不动）", run=lambda: path.write_text(new), level="warn")
+                    action="整段替换区块（区块外内容不动）", run=lambda: put_block(path, block), level="warn")
     return Step(key, label, disp(path), "存在，没有 drover 区块标记", action="在末尾追加区块（原有内容不动）",
-                run=lambda: path.write_text(new), level="fail", fs=path, backup=backup_target(path), backup_how="copy",
+                run=lambda: put_block(path, block), level="fail", fs=path, backup=backup_target(path), backup_how="copy",
                 note="已有内容可能和路由规则重复，请检查：通用规则删掉、只留个人内容（install 不去猜哪段是通用规则）")
 
 
-def merged_state(ctx: Ctx) -> dict:
-    """新的安装记录 = 上次的记录 + 这次的宿主、模式、新建文件、加的规则和 hook、备份。"""
+def put_block(path: Path, block: str) -> None:
+    """执行这一步时重读 AGENTS.md 再放区块，不用计划时读到的内容：中间隔着装 / 更新飞书插件（最长 ONCALL_INSTALL_TIMEOUT 秒），
+    这段时间里区块外的改动（比如主会话按用户的话改"本机补充"）不能被盖掉。改 settings.json 的几项同样执行时重读。"""
+    new, _ = merge_block(path.read_text(), block)
+    path.write_text(new)
+
+
+def merged_state(ctx: Ctx, installed_commit: Optional[str]) -> dict:
+    """新的安装记录 = 上次的记录 + 这次的宿主、模式、新建文件、加的（和换掉的）规则和 hook、备份。installed_commit 是这次装好的
+    提交（drover 自己的各项都装好了才有，见 installed_now），没有就留着上次的。"""
     old = ctx.state
-    rules = {k: list(v) for k, v in (old.get("added_rules") or {}).items()}
-    for path, added in ctx.added_rules.items():
-        rules[path] = rules.get(path, []) + [r for r in added if r not in rules.get(path, [])]
-    hooks = {k: list(v) for k, v in (old.get("added_hooks") or {}).items()}
-    for path, dropped in ctx.dropped_hooks.items():
-        hooks[path] = [c for c in hooks.get(path, []) if c not in dropped]
-    for path, added in ctx.added_hooks.items():
-        hooks[path] = hooks.get(path, []) + [c for c in added if c not in hooks.get(path, [])]
-    hooks = {k: v for k, v in hooks.items() if v}
     created = list(old.get("created") or [])
     created += [p for p in ctx.created if p not in created]
     workspaces = list(old.get("workspaces") or [])
@@ -2339,8 +2370,8 @@ def merged_state(ctx: Ctx) -> dict:
         "hosts": [h for h in HOSTS if h in set(old.get("hosts") or []) | set(ctx.hosts)],
         "workspaces": workspaces,
         "created": created,
-        "added_rules": rules,
-        "added_hooks": hooks,
+        "added_rules": merge_recorded(old.get("added_rules"), ctx.dropped_rules, ctx.added_rules),
+        "added_hooks": merge_recorded(old.get("added_hooks"), ctx.dropped_hooks, ctx.added_hooks),
         "backups": list(old.get("backups") or []) + [str(p) for p in ctx.backups],
     }
     # 飞书 oncall：插件是不是 drover 装的（--uninstall 只卸 drover 装的）、drover.env 在哪（--uninstall 按它删）。
@@ -2350,7 +2381,20 @@ def merged_state(ctx: Ctx) -> dict:
     if oncall["installed_by_drover"] or oncall["env"]:
         data["oncall"] = oncall
     data.update(deps_record(ctx, old))
+    commit = installed_commit or old.get("installed_commit")
+    if commit:
+        data["installed_commit"] = commit
     return data
+
+
+def merge_recorded(old: Optional[dict], dropped: dict, added: dict) -> dict:
+    """安装记录里"settings 文件 → drover 加的规则 / hook"的表：上次的，去掉这次换掉的，加上这次加的（不重复），空的去掉。"""
+    out = {k: list(v) for k, v in (old or {}).items()}
+    for path, gone in dropped.items():
+        out[path] = [x for x in out.get(path, []) if x not in gone]
+    for path, new in added.items():
+        out[path] = out.get(path, []) + [x for x in new if x not in out.get(path, [])]
+    return {k: v for k, v in out.items() if v}
 
 
 def deps_record(ctx: Ctx, old: dict) -> dict:
@@ -2366,15 +2410,24 @@ def deps_record(ctx: Ctx, old: dict) -> dict:
     return out
 
 
-def plan_state(ctx: Ctx) -> Step:
-    """安装记录放在 drover 自己的各项的最后：run 时它们已经执行完，ctx 里有这次新建的文件和加的规则。后面只剩验收工具，
-    它们不进记录。"""
+def installed_now(steps: list) -> Optional[str]:
+    """steps（drover 自己的各项）都装好了就返回包所在仓库的 HEAD（记进安装记录的 installed_commit），有一项没做成返回 None。
+    没做成：没法处理的（计划时就是 fail、没有 run），执行时失败的；只记警告的不算。计划时（结果还没有）和执行完都能用。
+    bin/drover 的自动更新拿 installed_commit 和 clone 的 HEAD 比，不一样就重跑 install：以前只看"这次有没有快进"，快进以后
+    install 失败（或进程被杀），下一次检查看到没有新提交就不再装，AGENTS.md 的区块、hook 一直停在旧版。"""
+    failed = any((s.run is None and s.level == "fail") or s.result.startswith("失败") for s in steps)
+    return None if failed else pkg_commit()
+
+
+def plan_state(ctx: Ctx, prior: list) -> Step:
+    """安装记录放在 drover 自己的各项（prior）的最后：run 时它们已经执行完，ctx 里有这次新建的文件和加的规则，也知道它们都
+    装好没有（installed_now）。后面只剩验收工具，它们不进记录。"""
     def run() -> None:
-        data = merged_state(ctx)
+        data = merged_state(ctx, installed_now(prior))
         data["updated_at"] = datetime.datetime.now().isoformat(timespec="seconds")
         write_json(STATE_FILE, data)
     return Step("state", "安装记录", disp(STATE_FILE), "已有" if STATE_FILE.exists() else "不存在",
-                action="写入（宿主、模式、新建的文件、加的规则和 hook、备份；--uninstall 按它撤）", run=run)
+                action="写入（宿主、模式、新建的文件、加的规则和 hook、备份、装好的提交；--uninstall 按它撤）", run=run)
 
 
 def plan_chain() -> Step:
@@ -2431,7 +2484,8 @@ def build_plan(ctx: Ctx) -> list:
             plan_link(ctx, "claude-command", "Claude Code 的 /drover 命令", CLAUDE_COMMAND,
                       INSTALL_ROOT / "flow" / "dispatch.md", PKG_ROOT / "flow" / "dispatch.md"),
             plan_claude_herdr_skill(ctx),
-            plan_rules(ctx, "claude-settings", "Claude Code 全局权限规则", CLAUDE_SETTINGS, CLAUDE_GLOBAL_RULES),
+            plan_rules(ctx, "claude-settings", "Claude Code 全局权限规则", CLAUDE_SETTINGS, CLAUDE_GLOBAL_RULES,
+                       tuple(CLAUDE_GLOBAL_RETIRED)),
             plan_hook(ctx, CD_GIT_HOOK),
             plan_hook(ctx, SESSION_HOOK),
             plan_hook(ctx, PROMPT_HOOK),
@@ -2459,9 +2513,10 @@ def build_plan(ctx: Ctx) -> list:
     if ctx.checking:
         steps.append(plan_chain())
     else:
-        state_step = plan_state(ctx)
+        state_step = plan_state(ctx, list(steps))
         old = {k: v for k, v in ctx.state.items() if k != "updated_at"}
-        if not any(s.run for s in steps) and merged_state(ctx) == old:
+        # 别的项都不用做时也要看 installed_commit：旧记录没有它、或者上次没装好，这次都装好了就得补记
+        if not any(s.run for s in steps) and merged_state(ctx, installed_now(steps)) == old:
             state_step.state, state_step.action, state_step.run = "已是最新", "无需改动", None
         steps.append(state_step)
     # 验收工具（宿主无关）最慢、装不上也只是警告（StepWarning，不影响退出码），放最后，被打断时（drover update 给 install 的时限
@@ -3259,16 +3314,17 @@ EPILOG = """\
                                          不覆盖，除非显式传 --workspace / --repo-dir / --profile / --oncall / --no-oncall（只改传了的那个键，
                                          改之前备份）
   ~/.drover/drover-install.json          安装记录（装了哪些宿主、新建的文件、加的规则和 hook、备份、drover 替你装过的外部依赖、
-                                         往哪个 shell 启动文件加过 PATH；--uninstall 按它撤）
+                                         往哪个 shell 启动文件加过 PATH、都装好时的提交 installed_commit；--uninstall 按它撤）
   ~/.drover/<slug>/                      每个任务一个目录（drover CLI 写，install 不碰）；baselines/、locks/ 同理
   Claude Code（--host 含 claude）：
     ~/.claude/commands/drover.md         软链到 ~/.drover/pkg/flow/dispatch.md（/drover 命令）
     ~/.claude/skills/herdr/SKILL.md      没有时用 herdr --skill 的输出写一份
-    ~/.claude/settings.json              permissions.allow 追加 drover CLI、~/.drover 和 ~/.herdr/worktrees 读写、
+    ~/.claude/settings.json              permissions.allow 追加 drover heavy（只放行它：这里对所有会话生效，含 worker；
+                                         以前加的整个 drover CLI 换掉）、~/.drover 和 ~/.herdr/worktrees 读写、
                                          herdr agent / pane / worktree / workspace list / tab list / status；
                                          hooks.PreToolUse 加一项 cd+git 拦截 hook（matcher Bash，跑装好的包里的
-                                         ~/.drover/pkg/hooks/cd_git_guard.py，timeout 5 秒）：拒绝 cd <目录> && git …，
-                                         提示改成 git -C <目录> …。先 cd 再跑 git 会触发 Claude Code 内置的强制确认
+                                         ~/.drover/pkg/hooks/cd_git_guard.py，timeout 5 秒）：拒绝同一条里有 cd 又有 git
+                                         的命令（不分先后），提示改成 git -C <目录> …。这种命令会触发 Claude Code 内置的强制确认
                                          （没法加白名单、每次都要人批），子代理最爱这么写。已有的其他 hook 原样保留；
                                          hooks.SessionStart 加一项主会话登记 hook（不设 matcher，跑
                                          ~/.drover/pkg/bin/drover main-register --hook，timeout 15 秒）：把主会话在
@@ -3278,7 +3334,8 @@ EPILOG = """\
                                          ~/.drover/pkg/bin/drover rules --hook，timeout 10 秒）：自动更新改了 AGENTS.md
                                          里的 drover 规则时，把改动跟着用户的下一条消息送进主会话（不用 /clear）；
                                          不是主会话、规则没变时什么都不输出
-    <workspace>/.claude/settings.local.json  追加 Skill(drover)、Skill(herdr)、Bash(herdr workspace *)、Bash(herdr tab *)
+    <workspace>/.claude/settings.local.json  追加整个 drover CLI（主会话、编排者在主工作台里起）、Skill(drover)、Skill(herdr)、
+                                             Bash(herdr workspace *)、Bash(herdr tab *)
     <workspace>/CLAUDE.md                含一行 @AGENTS.md（没有就新建 / 追加）
     herdr integration install claude     claude 的状态 hook 不是 current 时执行
   Codex（--host 含 codex；设了 CODEX_HOME 时用它代替 ~/.codex）：

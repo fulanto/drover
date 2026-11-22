@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-"""Claude Code 的 PreToolUse hook：拦下"先 cd 再跑 git"的 Bash 命令，提示改成 git -C <目录> …。
+"""Claude Code 的 PreToolUse hook：拦下同一条里既有 cd 又有 git 的 Bash 命令，提示改成 git -C <目录> …。
 
 由 drover 的 install.py 装进 ~/.claude/settings.json 的 hooks.PreToolUse（matcher Bash），命令指向装好的包
 ~/.drover/pkg/hooks/cd_git_guard.py。
 
-为什么要它：Bash 命令里先 cd 再跑 git，会触发 Claude Code 内置的安全确认（"This command changes directory before
+为什么要它：Bash 命令里有 cd 又有 git，会触发 Claude Code 内置的安全确认（"This command changes directory before
 running a version-control command…"）。这个确认不走权限白名单，也没有 "don't ask again"，每条都要人批。编排者和
 worker 派出去的子代理（Explore 等）看不到 CLAUDE.md 和任务书里"用 git -C"的规则，最爱这么写。hook 在内置检查之前
 执行，对子代理的 Bash 调用也生效；deny 的理由会回给发命令的 agent，它照着改写重试，就不用人批了（实测）。
 
-判定：引号外有一个 cd（pushd、popd、chdir 也算）命令，之后又有一个 git 命令（xargs … git 也算）→ 拒绝。命令之间
+判定：引号外有一个 cd（pushd、popd、chdir 也算）命令，又有一个 git 命令（xargs … git 也算），不分先后 → 拒绝。命令之间
 按 && || ; | & 换行 ( ) 和反引号分隔；git 前面带 VAR=val 环境变量赋值也算。单引号、双引号里的，注释里的，heredoc
 正文里的都不算。
-只拦 git：Claude Code 内置的这项检查（cd-git-compound，2.1.319 里核对过）只认 git 和 xargs … git，换目录只认
+范围照 Claude Code 内置的这项检查（cd-git-compound）：2.1.330 的实现是 some(是 cd) && some(是 git)，不看先后（以前只拦
+cd 在前的，git -C x status && cd x && bun test 这类放过去照样弹框）；只认 git 和 xargs … git，换目录只认
 cd / pushd / popd / chdir；hg / svn 它不拦，我们也不拦（git -C 这个改法对它们也不适用）。
 只拒绝、给提示，不改写命令（不用 updatedInput）。形状正好是 cd <目录> && git <参数…>（可带管道尾巴）时，提示里
 直接给出改写好的整条命令。
@@ -232,15 +233,9 @@ def analyze(command: str) -> tuple:
     for joiner, words in cmds:
         k = name_index(words)
         names.append((joiner, words, k, words[k][1] if k >= 0 else ""))
-    cd_seen = False
-    blocked = False
-    for _, words, k, name in names:
-        if name in CD_NAMES:
-            cd_seen = True
-        elif cd_seen and k >= 0 and runs_git(words, k):
-            blocked = True
-            break
-    if not blocked:
+    has_cd = any(name in CD_NAMES for _, _, _, name in names)
+    has_git = any(k >= 0 and runs_git(words, k) for _, words, k, _ in names)
+    if not (has_cd and has_git):
         return False, None
     return True, None if had_heredoc else rewrite(command, toks, names)
 
@@ -271,10 +266,10 @@ def rewrite(command: str, toks: list, names: list) -> "str | None":
 
 
 def deny_reason(suggestion: "str | None") -> str:
-    text = ("drover 的 hook 拦下了这条命令：先 cd 再跑 git 会触发 Claude Code 内置的安全确认，"
+    text = ("drover 的 hook 拦下了这条命令：同一条命令里有 cd 又有 git（不分先后）会触发 Claude Code 内置的安全确认，"
             "这个确认没法加白名单，每次都要人批。请改写后重试：用 git -C <目录> <子命令…> 代替 cd <目录> && git <子命令…>，"
-            "管道接在后面照用（git -C <目录> log | head）；cd 之后还有别的非 git 命令的，拆成单独的调用"
-            "（git 那几步各自用 git -C <目录>，其他命令另起一条）。")
+            "管道接在后面照用（git -C <目录> log | head）；还要 cd 去跑别的命令的，拆成单独的调用"
+            "（git 那几步各自用 git -C <目录>，cd 和其他命令另起一条，不和 git 写在一起）。")
     if suggestion:
         text += "这条可以直接改成：" + suggestion
     return text

@@ -56,9 +56,9 @@ herdr integration install claude    # 不是 current 就重装（codex 同理）
 python3 install.py --check    # 看权限规则装上没有
 ```
 
-- 规则在 `~/.claude/settings.json` 和 `<workspace>/.claude/settings.local.json`，缺了重跑 `python3 install.py`。
-- Claude Code 的编排者和 worker 跑在 `acceptEdits` 下：写文件自动放行，bash 命令要命中白名单前缀才不弹。有一类弹窗没有"don't ask again"选项（`$(...)` 命令替换、heredoc、`cd X && git …` 这类写法会触发），只能靠不写出这种命令来避免；流程和任务书里已经要求 agent 一条命令只做一件事、脚本先写成文件再执行。其中 `cd X && git …` 由 install 装的 cd+git 拦截 hook 兜底（子代理也管得到）：agent 会收到"改成 `git -C X …`"的拒绝理由，自己改写重试，不用你批。`--check` 里"Claude Code 的 cd+git 拦截 hook"一项是 `✗` 时重跑 install。
-- 遇到新的弹窗类型，选"don't ask again"时优先选带 `*` 的宽前缀那项；编排者也会在汇报里提出来，补进规则。
+- 规则在 `~/.claude/settings.json` 和 `<workspace>/.claude/settings.local.json`，缺了重跑 `python3 install.py`。全局只放行 `drover heavy`，整个 drover CLI 只在主工作台放行：worker 跑 `drover push`、`accept`、`cleanup` 之类会弹框，这是故意的（worker 只该用 heavy），别批"don't ask again"。
+- Claude Code 的编排者和 worker 跑在 `acceptEdits` 下：写文件自动放行，bash 命令要命中白名单前缀才不弹。有一类弹窗没有"don't ask again"选项（`$(...)` 命令替换、heredoc、`cd X && git …` 这类写法会触发），只能靠不写出这种命令来避免；流程和任务书里已经要求 agent 一条命令只做一件事、脚本先写成文件再执行。其中 `cd X && git …`（git 在前、cd 在后的也算）由 install 装的 cd+git 拦截 hook 兜底（子代理也管得到）：agent 会收到"改成 `git -C X …`"的拒绝理由，自己改写重试，不用你批。`--check` 里"Claude Code 的 cd+git 拦截 hook"一项是 `✗` 时重跑 install。
+- 遇到新的弹窗类型，选"don't ask again"时优先选带 `*` 的宽前缀那项（前缀是 drover、git 写操作这类会改状态的程序时只批单次）；编排者也会在汇报里提出来，补进规则。
 
 ## `--check` 报某项没装对
 
