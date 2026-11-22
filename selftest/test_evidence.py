@@ -276,6 +276,9 @@ class HeavyRunLogTests(EvidenceTestBase):
         self.assertIn("1 failed", first["summary_line"])
         self.assertEqual(second["exit_code"], 0)
         self.assertIn("10 passed", second["summary_line"])
+        self.assertIn("10 passed", second["counts"][-1])  # 计数字段同 accept 的 verify（tally_fields）
+        self.assertEqual((first["tests"], second["tests"]),
+                         ({"passed": 10, "failed": 1, "skipped": 0}, {"passed": 10, "failed": 0, "skipped": 0}))
         self.assertNotEqual(first["fingerprint"], second["fingerprint"])
         res = self.accept("--slug", SLUG, "--name", "w1", "--brief", "--verify", "tsc --noEmit")
         runs = res["worker_runs"]
@@ -295,7 +298,8 @@ class HeavyRunLogTests(EvidenceTestBase):
         self.assertEqual(p.stdout, "out\n")
         self.assertIn("err\n", p.stderr)
         self.assertIn("流水 #1", p.stderr)
-        self.assertEqual(self.runs()[0]["exit_code"], 3)
+        (row,) = self.runs()
+        self.assertEqual((row["exit_code"], row["counts"], "tests" in row), (3, [], False))  # 认不出测试框架：没有 tests
 
     def test_no_run_log_outside_task_worktree(self) -> None:
         """分支不是 task/<slug>… 的仓库、不在 git 里的目录：不记流水，accept 写明没有流水的原因"""

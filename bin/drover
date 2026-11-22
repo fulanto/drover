@@ -8698,10 +8698,10 @@ def run_log_for(top: str) -> tuple:
 
 
 def run_output_summary(output: str) -> dict:
-    """流水里的汇总：最后一行非空行和测试计数（同 accept 的 verify）。测试计数只在这一处取，集成时换成 test_tally（多一个 tests）。"""
+    """流水里的汇总：最后一行非空行，加上和 accept 的 verify 同样的计数字段（tally_fields：counts，认得出测试框架时加 tests）。"""
     output = ANSI_RE.sub("", output)
     last = [line.strip() for line in output.splitlines() if line.strip()]
-    return {"summary_line": last[-1][:300] if last else "", "counts": test_counts(output)}
+    return {"summary_line": last[-1][:300] if last else "", **tally_fields(test_tally(output))}
 
 
 def heavy_logged_run(argv: list, cwd: str, env: Optional[dict], notify, log: Path, top: str, branch: str) -> dict:

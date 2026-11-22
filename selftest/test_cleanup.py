@@ -400,7 +400,8 @@ class CleanupTests(CleanupCase):
         self.commit(r, "ship neighbours only", {
             conf: conf_text.replace("timeout: 30", "timeout: 60"),
             auth: auth_text.replace("legacy_auth\n", "legacy_auth\nimport new_auth\n").replace("legacy_auth.", "new_auth.")})
-        self.assertTrue(self.drover_json("push", "--wt", str(r), "--target", "main")["verified"])
+        self.assertTrue(self.drover_json("push", "--wt", str(r), "--target", "main",
+                                         "--unchecked", "自测：cleanup 用例不测整体检查")["verified"])
         e = self.by_path(self.cleanup())
         self.assertEqual({"删掉": e[y]["result"], "换掉": e[z]["result"]}, {"删掉": "kept", "换掉": "kept"})
         for wt, path in ((y, conf), (z, auth)):
@@ -422,7 +423,8 @@ class CleanupTests(CleanupCase):
         os.chmod(x / "run.sh", 0o755)
         r = self.wt("r1")
         self.commit(r, "ship run.sh without the exec bit", {"run.sh": "echo hi\n"})
-        self.assertTrue(self.drover_json("push", "--wt", str(r), "--target", "main")["verified"])
+        self.assertTrue(self.drover_json("push", "--wt", str(r), "--target", "main",
+                                         "--unchecked", "自测：cleanup 用例不测整体检查")["verified"])
         p = self.by_path(self.cleanup("--probe", "--wt", str(probe)))[probe]
         e = self.by_path(self.cleanup())
         self.assertEqual({"内嵌仓库": e[nest]["result"], "内嵌仓库 --probe": p["result"], "只改可执行位": e[m]["result"],
