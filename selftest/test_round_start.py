@@ -37,12 +37,12 @@ class RoundStartCase(IntegrationCase):
         return [c for c in self.herdr_calls() if c[:2] == ["worktree", "create"]]
 
     def ship(self, target: str, name: str, files: dict, *extra: str) -> tuple[Path, str]:
-        """一轮 patch 模式：wt --base origin/<target> 建集成 worktree、提交、push（不传 --slug，按分支 task/r1-… 归属）。
-        返回 (集成 worktree, 推上去的提交)。"""
+        """一轮 patch 模式：wt --base origin/<target> 建集成 worktree、提交、push（不传 --slug，按分支 task/r1-… 归属；
+        没有集成状态，带 --unchecked）。返回 (集成 worktree, 推上去的提交)。"""
         res = self.wt(f"task/{SLUG}-{name}", "--base", f"origin/{target}", *extra)
         wt = Path(res["worktree_path"])
         sha = self.commit(wt, f"{name} work", files)
-        pushed = self.drover_json("push", "--wt", str(wt), "--target", target)
+        pushed = self.drover_json("push", "--wt", str(wt), "--target", target, "--unchecked", "自测：patch 模式")
         self.assertTrue(pushed["pushed"] and pushed["verified"], pushed)
         self.assertEqual((pushed["task"], pushed["task_from"]), (SLUG, f"worktree 分支 task/{SLUG}-{name}"))
         return wt, sha
@@ -126,6 +126,21 @@ class RoundStartTests(RoundStartCase):
         self.assertEqual(len(carry), 1)
         self.assertEqual((carry[0]["reason"], carry[0]["status"], carry[0]["start"]),
                          ("用户定了带上上一轮的提交", "picked", "origin/release2"))
+        # 条目的起点记的是带上之前的提交：integrate 摘条目提交时把带上的也一起摘进来
+        start = self.records("starts.jsonl")[-1]
+        self.assertEqual((start["branch"], start["start"], start["worktree_path"]),
+                         (f"task/{SLUG}-b", top, str(wt)))
+
+    def test_whitespace_variant_on_new_branch_refused(self) -> None:
+        """新分支里只有上一轮提交的"只改了缩进"的版本（Python 里语义不同）：补丁按保留空白比，不算已包含 → 拒绝、列出缺的提交"""
+        _, sha = self.ship("release", "int", {"app/fmt.py": "def f():\n        return 1\n"})
+        self.git(self.up, "fetch", "-q", "origin")
+        self.git(self.up, "checkout", "-q", "-b", "release2", "origin/main")
+        self.commit(self.up, "fmt reindented", {"app/fmt.py": "def f():\n    return 1\n"})
+        self.git(self.up, "push", "-q", "origin", "release2")
+        self.git(self.up, "checkout", "-q", "main")
+        res = self.wt(f"task/{SLUG}-b", "--base", "origin/release2", rc=1)
+        self.assertEqual([m["sha"] for m in res["missing"]], [sha])
 
     def test_patch_equivalent_on_new_branch_passes(self) -> None:
         """新分支里有上一轮提交挑过去的副本（提交号不同、补丁相同）→ 按补丁内容算通过"""
@@ -170,6 +185,7 @@ class RoundStartTests(RoundStartCase):
                          ("ok", [f"task/{SLUG}-item"]))
         self.assertNotIn("carried", more)
         self.assertEqual([p["subject"] for p in more["picked"]], ["int work", "item change"])
+        self.check(Path(more["worktree_path"]))
         pushed = self.drover_json("push", "--wt", more["worktree_path"], "--target", "release2", "--slug", SLUG)
         self.assertTrue(pushed["verified"])
         subjects = self.git(self.tmp, "--git-dir", str(self.origin), "log", "--format=%s", "release2").splitlines()
@@ -192,7 +208,7 @@ class RoundStartTests(RoundStartCase):
         (self.tmp / "item.patch").write_text(patch)
         self.git(cwt, "apply", "--3way", "--index", str(self.tmp / "item.patch"))
         self.git(cwt, "commit", "-q", "-m", "item via patch")
-        pushed = self.drover_json("push", "--wt", str(cwt), "--target", "release2")
+        pushed = self.drover_json("push", "--wt", str(cwt), "--target", "release2", "--unchecked", "自测：patch 模式")
         self.assertTrue(pushed["verified"])
         files = self.git(self.tmp, "--git-dir", str(self.origin), "ls-tree", "-r", "--name-only", "release2").splitlines()
         self.assertIn("app/r.py", files)

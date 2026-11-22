@@ -95,7 +95,8 @@ class CleanupCase(IntegrationCase):
         for b in branches:
             args += ["--from", b]
         wt = Path(self.drover_json(*args)["worktree_path"])
-        self.assertTrue(self.drover_json("push", "--wt", str(wt), "--target", "main")["verified"])
+        self.assertTrue(self.drover_json("push", "--wt", str(wt), "--target", "main",
+                                         "--unchecked", "自测：cleanup 用例不测整体检查")["verified"])
         return wt
 
     def ship_patch(self, item: Path, name: str = "r1") -> Path:
@@ -105,7 +106,8 @@ class CleanupCase(IntegrationCase):
         wt = self.wt(name)
         self.git(wt, "apply", "--index", str(self.tmp / f"{name}.patch"))
         self.git(wt, "commit", "-q", "-m", f"ship {name}")
-        self.assertTrue(self.drover_json("push", "--wt", str(wt), "--target", "main")["verified"])
+        self.assertTrue(self.drover_json("push", "--wt", str(wt), "--target", "main",
+                                         "--unchecked", "自测：cleanup 用例不测整体检查")["verified"])
         return wt
 
     def remote_commit(self, message: str, files: dict) -> str:
@@ -331,7 +333,8 @@ class CleanupTests(CleanupCase):
         r = self.wt("r1")
         pushed = self.commit(r, "item a", {"app/code.py": CODE.replace("    x = 1\n    y = 2",
                                                                        "    x = 1\n    z = 0\n    y = 3")})
-        self.assertTrue(self.drover_json("push", "--wt", str(r), "--target", "main")["verified"])
+        self.assertTrue(self.drover_json("push", "--wt", str(r), "--target", "main",
+                                         "--unchecked", "自测：cleanup 用例不测整体检查")["verified"])
         res = self.cleanup("--dry-run")
         e = self.by_path(res)
         self.assertEqual(e[a]["result"], "would_remove", e[a])

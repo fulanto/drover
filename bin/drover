@@ -279,11 +279,16 @@ GIT_NET_TIMEOUT = 300  # 秒，每次。update --auto（无人值守）改成只
 # fetch 指定分支时远端没有这条分支：wt 在主检出没配上游、按 origin/<当前分支> 试 fetch 时，据此判断"没有上游"（不算失败）。
 # 中文 locale 下 git 打的是"无法找到远程引用"，靠 git_net_once 的 C locale 才认得出。
 REMOTE_REF_MISSING_RE = re.compile(r"(?i)couldn't find remote ref")
-# 上游改动按类型归类，push 时据此提示要不要重新检查。
-DEPS_FILE_RE = re.compile(
-    r"(^|/)(package\.json|bun\.lockb?|pnpm-lock\.yaml|yarn\.lock|package-lock\.json|requirements[^/]*\.txt|pyproject\.toml"
-    r"|uv\.lock|poetry\.lock|pom\.xml|build\.gradle(\.kts)?|go\.(mod|sum))$")
-MIGRATION_FILE_RE = re.compile(r"(^|/)(migrations?|migrate|db/changelog)/")
+# 上游改动按类型归类，push 时据此提示要不要重新检查；wrapup 的迁移 / 依赖分类也用这两个。
+# 依赖：deps 指纹认的输入（JS lockfile、包管理器的安装配置、各 package.json，uv sync 的输入，requirements*.txt），
+# 加上 deps 不装、但同样决定依赖或工具链版本的文件（Node / Python 版本文件、Pipenv、Poetry、setup.py、Go、Rust、Maven / Gradle）。
+DEPS_TOOLCHAIN_FILES = (".nvmrc", ".node-version", ".tool-versions", "Pipfile", "Pipfile.lock", "poetry.lock",
+                        "setup.py", "setup.cfg", "go.mod", "go.sum", "Cargo.toml", "Cargo.lock", "pom.xml",
+                        "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts", "gradle.properties")
+DEPS_FILE_RE = re.compile(r"(^|/)(" + "|".join(map(re.escape, sorted(
+    {name for name, _ in JS_LOCKFILES} | set(JS_INSTALL_CONFIG) | set(UV_SYNC_INPUTS) | {"package.json"}
+    | set(DEPS_TOOLCHAIN_FILES)))) + r"|requirements[^/]*\.txt|requirements/[^/]+\.txt)$")
+MIGRATION_FILE_RE = re.compile(r"(?i)((^|/)(migrations?|migrate|alembic/versions|db/changelog)/|flyway|\.sql$)")
 DOC_FILE_RE = re.compile(r"(\.md$|^docs/)")
 # vitest 输出解析：失败条目、超时、计数行；pytest 的结尾汇总行。
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -1291,7 +1296,10 @@ def plan_source_sync(repo: str, base: Optional[str], prefetched: dict) -> tuple:
 # 记录里除了 remote 名还记推送时的地址 remote_url：remote 名只是本地别名，仓库换了托管地址以后 origin 指的是另一个仓库，
 # 拿推到旧地址的记录去核实新地址会误报漏推（push_moved）。
 PUSHES_FILE = "pushes.jsonl"
-CARRY_FILE = "carry.jsonl"  # wt --carry 带上上一轮提交的记录：理由、起点、带上的提交
+CARRY_FILE = "carry.jsonl"  # wt / integrate --carry、integrate --carry-base 带上别的提交的记录：理由、起点、带上的提交
+# wt 新建条目 worktree 时的起点（--carry 带上上一轮提交之前的 HEAD）：一行一个 worktree。integrate 只摘起点之后的提交
+# （item_starts）；没有这个记录时只能按"目标分支没有的提交"摘，会把起点带着的别人的提交、主检出没推的本地提交一起摘走。
+STARTS_FILE = "starts.jsonl"
 
 
 def read_jsonl(path: Path) -> list:
@@ -1500,13 +1508,47 @@ def round_default_base(repo: str, pushes: list) -> Optional[str]:
     return branches[0]["ref"]
 
 
-def cherry_plus(repo: str, upstream: str, end: str, begin: str) -> Optional[list]:
-    """begin..end 里在 upstream 那边没有的提交（git cherry 的 "+"，从旧到新）；upstream 已经包含的（祖先，不列出）和补丁内容
-    相同的（"-"）都不算。git cherry 失败返回 None。"""
-    c = git(repo, "cherry", upstream, end, begin)
+def cherry_marks(repo: str, upstream: str, head: str, limit: Optional[str] = None) -> Optional[list]:
+    """补丁相同的公共判断（integrate 摘提交、cleanup 核对已提交的、新一轮起点核实三处共用）：head 上（limit 之后）不在
+    upstream 里的提交，从旧到新 [(标记, sha)]。标记同 git cherry："-" 是 upstream 那边（head..upstream）有补丁内容相同的
+    提交，"+" 是没有。git cherry 比的补丁号去掉了空白、也没有配置能关（实测只改缩进的两个提交判 "-"），Python / YAML /
+    Makefile 里只改缩进的修正会被当成已应用：所以 "-" 再按保留空白的补丁号（git patch-id --verbatim）在 upstream 那边找一次，
+    找不到的改成 "+"。合并提交不比（同 git cherry）。git 失败返回 None。"""
+    c = git(repo, "cherry", upstream, head, *([limit] if limit else []))
     if c.returncode != 0:
         return None
-    return [line.split()[1] for line in c.stdout.splitlines() if line.startswith("+ ")]
+    marks = [(line[0], line.split()[1]) for line in c.stdout.splitlines() if line[:2] in ("+ ", "- ")]
+    same = [sha for mark, sha in marks if mark == "-"]
+    return verbatim_marks(repo, upstream, head, marks, same) if same else marks
+
+
+def verbatim_marks(repo: str, upstream: str, head: str, marks: list, same: list) -> Optional[list]:
+    """git cherry 判 "-" 的（same）再按保留空白的补丁号核一次：upstream 那边（head..upstream）没有同号的改成 "+"。"""
+    theirs, ours = verbatim_patch_ids(repo, [f"{head}..{upstream}"]), verbatim_patch_ids(repo, ["--no-walk", *same])
+    if theirs is None or ours is None:
+        return None
+    found = set(theirs.values())
+    return [("-" if mark == "-" and ours.get(sha) in found else "+", sha) for mark, sha in marks]
+
+
+def verbatim_patch_ids(repo: str, revs: list) -> Optional[dict]:
+    """{提交: 保留空白的补丁号}：git log -p 的输出交给 git patch-id --verbatim（每个提交以 "commit <sha>" 开头）。
+    带 --binary（二进制改动按内容算）、--no-renames（不受 diff.renames 配置影响），两边同一种写法才可比。"""
+    log = git_bytes(repo, "log", "--no-merges", "-p", "--binary", "--no-renames", "--no-color", "--no-ext-diff",
+                    "--format=commit %H", *revs)
+    if log.returncode != 0:
+        return None
+    pid = git_bytes(repo, "patch-id", "--verbatim", input_bytes=log.stdout)
+    if pid.returncode != 0:
+        return None
+    return {sha: patch for patch, sha in (row.split() for row in pid.stdout.decode().splitlines() if row.strip())}
+
+
+def cherry_plus(repo: str, upstream: str, end: str, begin: str) -> Optional[list]:
+    """begin..end 里在 upstream 那边没有的提交（cherry_marks 的 "+"，从旧到新）；upstream 已经包含的（祖先，不列出）和补丁
+    内容相同的（"-"）都不算。git 失败返回 None。"""
+    marks = cherry_marks(repo, upstream, end, begin)
+    return None if marks is None else [sha for mark, sha in marks if mark == "+"]
 
 
 def push_short(repo: str, p: dict, start_sha: str, also: tuple) -> tuple[list, Optional[str]]:
@@ -1664,6 +1706,15 @@ def herdr_trusted(cmd: list, repo: str) -> tuple[bool, dict, bool]:
     return ok, res, ok
 
 
+def record_item_start(slug: Optional[str], skip: bool, repo: str, branch: str, wt_path: str, base_ref: str) -> None:
+    """新建的条目 worktree 把起点（--carry 带上的上一轮提交之前的 HEAD）记进 <slug>/starts.jsonl，integrate 只摘它之后的
+    提交（item_starts）。复用的、integrate 自己建的集成 worktree（skip）、定不了任务的不记。"""
+    if slug and not skip:
+        append_jsonl(STATE_HOME / slug / STARTS_FILE, {
+            "at": time.strftime("%m-%d %H:%M:%S"), "ts": round(time.time(), 3), "repo": repo, "branch": branch,
+            "worktree_path": wt_path, "start": git_out(wt_path, "rev-parse", "HEAD"), "base_ref": base_ref})
+
+
 def cmd_wt(a: argparse.Namespace) -> dict:
     repo = git_out(a.repo, "rev-parse", "--show-toplevel")
     branch = a.branch
@@ -1788,6 +1839,7 @@ def cmd_wt(a: argparse.Namespace) -> dict:
 
     ok, panes = herdr(["pane", "list", "--workspace", ws_id])
     pane_id = panes["panes"][0]["pane_id"] if ok and panes.get("panes") else None
+    record_item_start(slug, reused or via_integrate, repo, branch, wt_path, base_ref)
     carried = []
     if check["status"] == "missing":
         # 先带上再复制本地文件：复制过去的未跟踪文件会挡住要新增它的 cherry-pick（见 copy_local_files）
@@ -8073,6 +8125,8 @@ def cmd_accept(a: argparse.Namespace) -> dict:
     result["fingerprint_before_mark"] = marked_from or None
     result["fingerprint"] = worktree_fingerprint(wt) or None
     save = a.save or (str(STATE_HOME / a.slug / f"accept-{a.name}.json") if a.name else None)
+    if a.integration:  # 结论记进集成状态：push 按它核对要推的提交检查过没有
+        result["integration_check"] = record_integration_check(wt, result, save)
     if save:
         # review 子命令从这里取图谱摘要和验证结果，编排者不必再手抄一遍。
         result["saved_to"] = save_json(save, result)
@@ -8210,6 +8264,8 @@ def accept_brief(result: dict) -> dict:
     for key in ("evidence", "worker_runs"):
         if key in result:
             out[key] = result[key]
+    if result.get("integration_check"):
+        out["integration_check"] = result["integration_check"]
     return out
 
 
@@ -8760,13 +8816,265 @@ def conflicted_files(wt: str) -> list:
     return git_out(wt, *DIFF_NO_REFRESH, "diff", "--name-only", "--diff-filter=U").splitlines()
 
 
+def integrate_state_path(slug: str, repo: str, upstream: str) -> tuple[Path, dict]:
+    """（仓库，目标分支）的集成状态文件和内容：<slug>/integrate-<仓库>@<目标>.json（目标里的 / 换成 ~，分支名里不会有 ~；
+    远端不是 origin 时目标前面带上远端名）。旧版本一个仓库只有一份 integrate-<仓库>.json：里面记的 upstream 是这个目标的就
+    接着用它（不改名）。都没有返回新名字和 {}。"""
+    remote, _, target = upstream.partition("/")
+    name = Path(repo).name
+    key = (target if remote == "origin" else f"{remote}~{target}").replace("/", "~")
+    new = STATE_HOME / slug / f"integrate-{name}@{key}.json"
+    for f in (new, STATE_HOME / slug / f"integrate-{name}.json"):
+        state = read_json_dict(f)
+        if state.get("upstream") == upstream and \
+                os.path.realpath(state.get("repo") or "/nonexistent") == os.path.realpath(repo):
+            return f, state
+    return new, {}
+
+
+def worktree_upstream(repo: str, branch: str, upstream: str) -> tuple[Optional[str], Optional[str]]:
+    """分支 branch 的 worktree 路径和它的集成状态记的 upstream（同一个 worktree 对上几份状态时取和 upstream 相同的那份）。
+    没有 worktree → (None, None)；有 worktree、没有集成状态（wt 手建的）→ (路径, None)。"""
+    path = worktree_of_branch(repo, branch)
+    found = find_integrate_state(path, None, upstream) if path else None
+    return path, read_json_dict(found).get("upstream") if found else None
+
+
+def integrate_branch(repo: str, slug: str, explicit: Optional[str], state: dict, upstream: str) -> tuple[str, Optional[str]]:
+    """这次用哪条集成分支，返回 (分支, 说明)：--branch 给了用它；这个目标已有集成状态用它记的分支；否则 task/<slug>，它已经是
+    别的目标的（或者 wt 手建、没有集成状态的）worktree 时自动改用 task/<slug>-<目标>。选中的分支已有 worktree、却不是给这个
+    目标建的 → 拒绝：复用会把那条分支上别人的提交带过来（第二条目标分支复用第一条的集成 worktree，只在 main 上的别人的
+    提交就这样进了 release）。"""
+    if explicit or state.get("branch"):
+        branch, note = explicit or state["branch"], None
+    else:
+        branch, note = default_integrate_branch(repo, slug, upstream)
+    path, owner = worktree_upstream(repo, branch, upstream)
+    if path and owner != upstream:
+        raise branch_taken(branch, path, owner, upstream, bool(explicit))
+    return branch, note
+
+
+def default_integrate_branch(repo: str, slug: str, upstream: str) -> tuple[str, Optional[str]]:
+    """这个目标还没有集成状态、没给 --branch：task/<slug>；它已经是别的目标的（或者 wt 手建、没有集成状态的）worktree 时
+    改用 task/<slug>-<目标>，返回说明。"""
+    branch = f"task/{slug}"
+    path, owner = worktree_upstream(repo, branch, upstream)
+    if not path or owner == upstream:
+        return branch, None
+    taken = f"{branch} 已经是 {owner} 的集成 worktree" if owner else f"{branch} 已有 worktree（没有集成状态）"
+    alt = f"task/{slug}-{re.sub(r'[^A-Za-z0-9._-]+', '-', upstream.partition('/')[2])}"
+    return alt, f"{taken}，{upstream} 另建集成 worktree，分支 {alt}"
+
+
+def branch_taken(branch: str, path: str, owner: Optional[str], upstream: str, explicit: bool) -> DroverError:
+    why = f"它的集成状态记的是 {owner}" if owner else "它没有集成状态（不是 integrate 建的，比如 wt 手建的）"
+    return DroverError(f"集成分支 {branch} 已有 worktree {path}，{why}，不是给 {upstream} 建的，没有复用（复用会把那边的提交"
+                       f"带到 {upstream.partition('/')[2]}）：换一个 --branch"
+                       + ("，或者去掉 --branch 让 integrate 按目标分支选" if explicit else ""),
+                       worktree_path=path, branch=branch)
+
+
+def integrate_start(repo: str, a: argparse.Namespace, state: dict) -> tuple[str, int, Optional[str]]:
+    """fetch 目标分支，返回 (集成 worktree 从哪起, fetch 次数, create_from)。远端还没有这条分支（新建远程分支）时，从哪条分支建
+    要用户定：没带 --create-from（重跑时集成状态里记过的也算）就拒绝；带了就 fetch 源分支、从它起。目标已有却带了
+    --create-from 拒绝（以为是新建，其实不是）。和 wt 的 fetch + 快进同一把仓库锁（几个编排者同时 fetch 同一仓库会撞
+    ref lock）；cmd_wt 自己再拿，这里先放掉。"""
+    upstream = f"{a.remote}/{a.target}"
+    with repo_sync_lock(repo):
+        p, tries = git_net(repo, "fetch", a.remote, a.target)
+    if p.returncode == 0:
+        if a.create_from:
+            raise DroverError(f"远端已有分支 {a.target}，--create-from 只用于新建远程分支，没有集成：去掉 --create-from 重跑"
+                              f"（从最新的 {upstream} 起）")
+        return upstream, tries, None
+    if not REMOTE_REF_MISSING_RE.search(p.stderr or ""):
+        raise DroverError(f"git fetch {a.remote} {a.target} 失败（试了 {tries} 次）", stderr=tail(p.stderr))
+    source = a.create_from or state.get("create_from")
+    if not source:
+        raise DroverError(
+            f"远端 {a.remote} 没有分支 {a.target}：这是要新建远程分支，没有建集成 worktree。从哪条分支建要用户定（写进 rollup 的"
+            "「需要你决定」：新分支带上源分支的全部提交，建错了就多了或少了一批提交）；定了用 drover integrate … "
+            f"--target {a.target} --create-from {a.remote}/<源分支> 重跑", new_branch=a.target)
+    rb = remote_branch_of(source, git_out(repo, "remote").split())
+    if not rb:
+        raise DroverError(f"--create-from {source} 要写成 <远端>/<分支>（如 {a.remote}/main）")
+    with repo_sync_lock(repo):
+        sp, tries = git_net(repo, "fetch", *rb)
+    if sp.returncode != 0:
+        raise DroverError(f"git fetch {rb[0]} {rb[1]} 失败（试了 {tries} 次）", stderr=tail(sp.stderr))
+    return source, tries, source
+
+
+def integrate_sync(wt: str, state: dict, upstream_sha: str) -> Optional[str]:
+    """复用同一目标的集成 worktree：HEAD 是刚 fetch 的上游的祖先（没有没推的提交，比如上一轮推完了）→ 快进到上游、base
+    跟着更新，返回说明；有没推的提交（同一轮重跑）不动。不快进的话，新一轮条目的起点（最新上游）和集成分支之间那段上游
+    提交会被当成条目的提交逐个摘，整体检查的 --base 也是旧的。"""
+    head = git_out(wt, "rev-parse", "HEAD")
+    if not is_ancestor(wt, head, upstream_sha):
+        return None
+    if head != upstream_sha:
+        ff = git(wt, "merge", "--ff-only", "-q", upstream_sha)
+        if ff.returncode != 0:
+            raise DroverError(f"集成 worktree 快进到最新的 {state['upstream']} 失败：{tail(ff.stderr or ff.stdout, 300)}",
+                              worktree_path=wt)
+    moved, state["base"] = state.get("base") != upstream_sha, upstream_sha
+    return (f"复用的集成 worktree 没有没推的提交，已快进到最新的 {state['upstream']}（{upstream_sha[:9]}），base 跟着更新"
+            if moved else None)
+
+
+def item_starts(slugs: list, repo: str) -> dict:
+    """条目分支 → 起点（wt 记在 <slug>/starts.jsonl 的；同一分支取最后一条：分支删了以后同名重建的是新的起点）。"""
+    real, out = os.path.realpath(repo), {}
+    for s in dict.fromkeys(slugs):
+        for r in read_jsonl(STATE_HOME / s / STARTS_FILE):
+            if os.path.realpath(r.get("repo") or "/nonexistent") == real and r.get("branch") and r.get("start"):
+                out[r["branch"]] = r["start"]
+    return out
+
+
+INTEGRATE_APPLIED = ("picked", "resolved", "empty")
+
+
+def verify_picked(wt: str, state: dict, warnings: list) -> tuple[set, list]:
+    """集成状态里的"已应用"记录只信 HEAD，逐条核一遍。返回 (确实在集成分支里的 sha, 上次冲突后被放弃的)：
+    - picked / resolved：记下的新提交还是 HEAD 的祖先才算（被 reset 掉的重摘）；旧版本的 resolved 没记新提交，照旧算；
+    - conflict：摘之前记下的 HEAD（head_before）之后 HEAD 前进了、紧接着的提交说明和它一样（--continue 不改说明）才算解决了；
+      否则（--abort / reset 过）不算，单列"上次冲突后被放弃"、这次重摘；旧版本的记录没有 head_before，照旧算解决了、给提示；
+    - picking（记下之后 drover 被杀）、failed（git 没开始就拒绝）：重摘，真摘过的会停在空提交上跳过；empty：信。"""
+    head = git_out(wt, "rev-parse", "HEAD")
+    done, abandoned = set(), []
+    for e in state["picked"]:
+        if e.get("status") == "conflict" and not e.get("head_before"):
+            e["status"] = "resolved"
+            warnings.append(f"{e['sha'][:12]}（{e.get('subject')}）上次停在冲突上，旧版 drover 的记录没记摘之前的 HEAD，按已解决算、"
+                            "没核实：确认它在集成分支里")
+        elif e.get("status") == "conflict":
+            resolved = conflict_resolved_as(wt, e, head)
+            if resolved:
+                e.update(status="resolved", new_sha=resolved)
+            else:
+                e["status"] = "abandoned"
+                abandoned.append({"branch": e.get("branch"), "sha": e["sha"][:12], "subject": e.get("subject"),
+                                  "reason": "上次冲突后被放弃，没进集成分支（HEAD 没前进：--abort / reset 过），这次重摘"})
+        if e.get("status") in INTEGRATE_APPLIED and (not e.get("new_sha") or is_ancestor(wt, e["new_sha"], head)):
+            done.add(e["sha"])
+    return done, abandoned
+
+
+def conflict_resolved_as(wt: str, e: dict, head: str) -> Optional[str]:
+    """上次停在冲突上的记录：摘之前的 HEAD（head_before）之后 HEAD 前进了、紧接着的提交说明和它一样（--continue 不改说明）→
+    那个提交；否则 None（--abort / reset 过，或者 HEAD 换到了别处）。"""
+    before = e["head_before"]
+    path = git_out(wt, "rev-list", "--reverse", "--ancestry-path", f"{before}..HEAD").splitlines() \
+        if is_ancestor(wt, before, head) else []
+    return path[0] if path and git_out(wt, "log", "-1", "--format=%s", path[0]) == e.get("subject") else None
+
+
+def integrate_marks(wt: str, branch: str) -> list:
+    """条目分支上集成分支（HEAD）还没有的提交，cherry_marks 的结果；git 失败报错。"""
+    marks = cherry_marks(wt, "HEAD", branch)
+    if marks is None:
+        raise DroverError(f"git cherry HEAD {branch} 失败", worktree_path=wt)
+    return marks
+
+
+def foreign_commits(repo: str, branch: str, start: str, marks: list, done: set, remote: str) -> Optional[dict]:
+    """条目分支上目标分支没有、又不是这个条目做的（在起点之前）的提交：起点带着的别人的提交、主检出没推的本地提交。
+    起点已经不是分支的祖先（分支被 rebase / reset 过）时分不清哪些是条目的，"+" 全算。没有返回 None。"""
+    rebased = not is_ancestor(repo, start, branch)
+    own = set() if rebased else set(git_out(repo, "rev-list", f"{start}..{branch}").splitlines())
+    extra = [sha for mark, sha in marks if mark == "+" and sha not in own and sha not in done]
+    if not extra:
+        return None
+    refs = git(repo, "for-each-ref", "--contains", start, "--format=%(refname:short)", f"refs/remotes/{remote}/")
+    on = [r for r in refs.stdout.split() if not r.endswith("/HEAD")] if refs.returncode == 0 else []
+    return {"branch": branch, "start": start, "start_on": on[:5], "rebased": rebased,
+            "commits": [{"sha": s, "short": s[:9], "subject": git_out(repo, "log", "-1", "--format=%s", s)} for s in extra]}
+
+
+def foreign_refusal(foreign: list, upstream: str, **extra: Any) -> DroverError:
+    """起点带着别人的提交时的报错，写成能直接转给用户的中文：每个条目分支的起点在哪、带着哪些提交（短 sha、标题），两种做法。"""
+    parts, targets = [], []
+    for f in foreign:
+        if f["rebased"]:
+            head = f"条目分支 {f['branch']} 的起点 {f['start'][:9]} 已经不在分支历史里（分支被 rebase / reset 过），分不清哪些是条目自己的："
+        else:
+            where = f"在 {'、'.join(f['start_on'])} 上" if f["start_on"] else "不在任何远端分支上（比如主检出本地没推的提交）"
+            head = f"条目分支 {f['branch']} 的起点 {f['start'][:9]}（{where}）带着 {upstream} 没有的 {len(f['commits'])} 个提交："
+        shown = f["commits"][:10]
+        parts.append(head + "；".join(f"{c['short']} {c['subject']}" for c in shown)
+                     + (f"……共 {len(f['commits'])} 个" if len(f["commits"]) > len(shown) else ""))
+        targets += [r.partition("/")[2] for r in f["start_on"]]
+    choices = [f"集成到起点那条线：{' 或 '.join(f'--target {t}' for t in dict.fromkeys(targets))}"] if targets else []
+    choices.append("带上这些提交：重跑加 --carry-base \"<用户的原话或理由>\"（理由和带上的提交记进 carry.jsonl）")
+    text = ("。".join(parts) + f"。这些提交不是条目做的，推上去就是把别人的代码推进 {upstream}，都没有摘。做法交用户定："
+            + "；".join(f"{'①②'[i]}{c}" for i, c in enumerate(choices)))
+    return DroverError(text, foreign=foreign, **extra)
+
+
+def integrate_foreign(a: argparse.Namespace, repo: str, wt: str, sources: list, done: set, warnings: list,
+                      **extra: Any) -> list:
+    """只摘条目自己的提交：每个条目分支按 wt 记的起点找出起点带着、目标分支没有的提交（foreign_commits）。有就停下（报错交
+    用户定换目标还是 --carry-base 带上）；带了 --carry-base 就照摘、记进 carry.jsonl（kind: base），返回带上的。没有起点
+    记录的旧条目照旧摘、进 warnings。"""
+    upstream = f"{a.remote}/{a.target}"
+    starts = item_starts([a.slug, *filter(None, (task_owner(s["branch"], task_slugs()) for s in sources))], repo)
+    foreign = []
+    for s in sources:
+        if s["branch"] not in starts:
+            warnings.append(f"条目分支 {s['branch']} 没有起点记录（旧版 drover 或不是 wt 建的 worktree）：按 {upstream} 没有的"
+                            "全部提交摘，picked 里逐个核对是不是这个条目的")
+            continue
+        f = foreign_commits(repo, s["branch"], starts[s["branch"]], integrate_marks(wt, s["branch"]), done, a.remote)
+        foreign += [f] if f else []
+    if foreign and not a.carry_base:
+        raise foreign_refusal(foreign, upstream, worktree_path=wt, **extra)
+    if a.carry_base and not foreign:
+        warnings.append("--carry-base 没用上：条目分支的起点没有带着目标分支没有的提交")
+    for f in foreign:
+        append_jsonl(STATE_HOME / a.slug / CARRY_FILE, {
+            "at": time.strftime("%m-%d %H:%M:%S"), "ts": round(time.time(), 3), "kind": "base", "repo": repo,
+            "branch": f["branch"], "worktree_path": wt, "start": f["start"], "target": upstream, "reason": a.carry_base,
+            "commits": [{k: c[k] for k in ("sha", "subject")} for c in f["commits"]]})
+    return foreign
+
+
+def pick_failed(wt: str, cp: subprocess.CompletedProcess, record: dict, save, abandoned: list, **extra: Any) -> None:
+    """cherry-pick 没成功时按集成 worktree 的实际状态分：空提交（停在进行中的 cherry-pick 上、没有冲突文件、暂存区和 HEAD
+    一样：改动已经在集成分支里了）→ --skip、记 empty、返回；git 没开始就拒绝（没有进行中的 cherry-pick，如未跟踪文件会被
+    覆盖）→ 记 failed（不是冲突，没有 --continue 可做，重跑时重试）、报错；其余是冲突 → 记 conflict、报错停下。
+    不按 git 输出里的词判断：被挡住时 git 会把路径打出来，路径里带 empty 就会被当成空提交永久跳过。"""
+    sha, what = record["sha"], f"cherry-pick {record['sha'][:12]}（{record.get('branch')}：{record.get('subject')}）"
+    conflicts, op, out = conflicted_files(wt), in_progress_op(wt), cp.stderr or cp.stdout
+    if op is None:
+        record.update(status="failed", error=tail(out, 400))
+        save()
+        raise DroverError(f"{what}没能开始，git 拒绝了（没有冲突、也没有进行中的 cherry-pick）：{tail(out, 300)}。挡住的原因"
+                          f"处理掉后（比如挪走 {wt} 里会被覆盖的未跟踪文件），重跑同样的 integrate 会重试这个提交（已应用的会跳过）",
+                          worktree_path=wt, stderr=tail(out, 800), **extra)
+    if not conflicts and op == "CHERRY_PICK_HEAD" and git(wt, "diff", "--cached", "--quiet", "HEAD").returncode == 0:
+        sk = git(wt, "cherry-pick", "--skip")
+        if sk.returncode != 0:
+            raise DroverError(f"{what}是空提交，cherry-pick --skip 失败：{tail(sk.stderr or sk.stdout, 300)}", worktree_path=wt)
+        record["status"] = "empty"
+        save()
+        return
+    record["status"] = "conflict"
+    save()
+    again = "（上次冲突后被放弃、没进集成分支，这次重摘又冲突了）" if any(x["sha"] == sha[:12] for x in abandoned) else ""
+    raise DroverError(f"{what}冲突{again}：在 {wt} 解冲突 → git -C {wt} add <文件> → git -C {wt} cherry-pick --continue → "
+                      "再跑一次同样的 integrate（已应用的会跳过）", worktree_path=wt, conflicts=conflicts,
+                      stderr=tail(out, 800), abandoned=abandoned, **extra)
+
+
 def cmd_integrate(a: argparse.Namespace) -> dict:
-    """编排者的集成 worktree：每个仓库一个（分支 task/<slug>），从最新上游建，依次 cherry-pick 各条目分支的提交。
-    可重复执行：已应用的提交（patch-id 相同，或状态文件里记过）跳过；冲突时停下，解完 --continue 后再跑一次。"""
+    """编排者的集成 worktree：每个（仓库，目标分支）一个（分支 task/<slug>，第二条目标分支 task/<slug>-<目标>），从最新上游
+    建，依次 cherry-pick 各条目分支起点之后的提交。可重复执行：已应用的（补丁相同，或状态里记过、核实还在 HEAD 里的）跳过；
+    冲突时停下，解完 --continue 后再跑一次。复用同一目标的集成 worktree 时，没有没推的提交就先快进到最新上游。"""
     check_slug(a.slug)
     repo = resolve_repo(a.repo)
     name = Path(repo).name
-    branch = a.branch or f"task/{a.slug}"
     upstream = f"{a.remote}/{a.target}"
     sources = []
     for b in a.from_branch:
@@ -8777,27 +9085,26 @@ def cmd_integrate(a: argparse.Namespace) -> dict:
         if dirty:
             raise DroverError(f"条目分支 {b} 的 worktree 还有没提交的改动，先按条目提交：{b_wt}", files=dirty[:20])
         sources.append({"branch": b, "worktree": b_wt})
-    state_path = STATE_HOME / a.slug / f"integrate-{name}.json"
+    state_path, state = integrate_state_path(a.slug, repo, upstream)
+    branch, branch_note = integrate_branch(repo, a.slug, a.branch, state, upstream)
     if a.dry_run:
         return {"ok": True, "dry_run": True, "repo": repo, "branch": branch, "upstream": upstream,
-                "sources": sources, "state_file": str(state_path),
-                "planned": [f"git -C {repo} fetch {a.remote} {a.target}（偶发认证 / 网络错误自动重试）",
-                            f"drover wt --repo {repo} --branch {branch} --base {upstream}（已有就复用，不移动、不同步；"
-                            f"新建时再 fetch 源仓库主检出的上游（和 {upstream} 是同一条就不重复），"
+                "sources": sources, "state_file": str(state_path), **({"branch_note": branch_note} if branch_note else {}),
+                "planned": [f"git -C {repo} fetch {a.remote} {a.target}（偶发认证 / 网络错误自动重试；远端没有这条分支时要"
+                            "--create-from <远端>/<源分支>）",
+                            f"drover wt --repo {repo} --branch {branch} --base {upstream}（已有就复用：没有没推的提交就快进到"
+                            f"最新上游；新建时再 fetch 源仓库主检出的上游（和 {upstream} 是同一条就不重复），"
                             "主检出在分支上、干净、落后上游时快进，否则不动它、在 warnings 里报出；"
                             f"新建前核实 {upstream} 含这个任务上一轮推的提交，不含就拒绝建"
                             f"{'（--carry：建好后先带上缺的提交）' if a.carry else ''}）",
-                            *[f"git cherry HEAD {s['branch']} → 逐个 cherry-pick 没应用过的提交" for s in sources],
+                            *[f"{s['branch']}：逐个 cherry-pick 起点（starts.jsonl）之后、集成分支里没有的提交，起点带着"
+                              "别人的提交时停下" for s in sources],
                             f"drover deps --wt <集成 worktree> --save {STATE_HOME / a.slug}/deps-integrate-{name}.json"]}
 
-    # 和 wt 的 fetch + 快进同一把仓库锁（几个编排者同时 fetch 同一仓库会撞 ref lock）；cmd_wt 自己再拿，这里先放掉。
-    with repo_sync_lock(repo):
-        p, tries = git_net(repo, "fetch", a.remote, a.target)
-    if p.returncode != 0:
-        raise DroverError(f"git fetch {a.remote} {a.target} 失败（试了 {tries} 次）", stderr=tail(p.stderr))
-    upstream_sha = git_out(repo, "rev-parse", upstream)
+    start_ref, tries, create_from = integrate_start(repo, a, state)
+    start_sha = git_out(repo, "rev-parse", start_ref)
     wt_res = cmd_wt(argparse.Namespace(repo=repo, branch=branch, label=f"{name}:{a.slug}", path=None,
-                                       dry_run=False, base=upstream, no_sync=False, prefetched={upstream: tries},
+                                       dry_run=False, base=start_ref, no_sync=False, prefetched={start_ref: tries},
                                        slug=a.slug, carry=a.carry, via_integrate=True,
                                        round_also=[s["branch"] for s in sources]))
     wt = wt_res["worktree_path"]
@@ -8807,66 +9114,46 @@ def cmd_integrate(a: argparse.Namespace) -> dict:
                             f"git -C {wt} cherry-pick --continue，再跑一次 integrate（不要 --abort，放弃某个提交要先说明理由）",
                             worktree_path=wt, conflicts=conflicted_files(wt))
 
-    state = json.loads(state_path.read_text()) if state_path.exists() else {}
+    warnings, synced = list(wt_res.get("warnings") or []), None
     if not wt_res["reused"] or state.get("worktree_path") != wt:
         # 旧代码把推送记在这份状态里：重建前转进任务的推送记录（带上旧的 upstream），不跟着状态一起丢
         for p in state_pushes(state, state_path.name):
             append_jsonl(STATE_HOME / a.slug / PUSHES_FILE, p)
         state = {"repo": repo, "branch": wt_res["branch"], "worktree_path": wt, "upstream": upstream,
-                 "base": upstream_sha, "picked": []}
-    for entry in state["picked"]:
-        if entry.get("status") == "conflict":
-            entry["status"] = "resolved"  # 上次停在冲突上，现在没有进行中的 cherry-pick，说明已经 --continue 了
-    # failed：上次 git 没开始就拒绝了（比如未跟踪文件挡路），提交没上去，这次重试。
-    done = {entry["sha"] for entry in state["picked"] if entry.get("status") != "failed"}
+                 "base": start_sha, "picked": [], **({"create_from": create_from} if create_from else {})}
+    elif not create_from:
+        synced = integrate_sync(wt, state, start_sha)
+    done, abandoned = verify_picked(wt, state, warnings)
 
     def save_state() -> None:
         state_path.parent.mkdir(parents=True, exist_ok=True)
         state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2))
 
+    save_state()
+    foreign = integrate_foreign(a, repo, wt, sources, done, warnings, state_file=str(state_path))
     picked_now, skipped = [], []
     for s in sources:
-        for line in git_out(wt, "cherry", "HEAD", s["branch"]).splitlines():
-            mark, sha = line.split()[:2]
+        # 按摘完前面条目之后的 HEAD 算：几个条目分支里有同一个提交时，后面的认出它已在集成分支里
+        for mark, sha in integrate_marks(wt, s["branch"]):
             subject = git_out(repo, "log", "-1", "--format=%s", sha)
             if mark == "-" or sha in done:
                 skipped.append({"branch": s["branch"], "sha": sha[:12], "subject": subject, "reason": "已在集成分支里"})
                 continue
-            record = next((e for e in state["picked"] if e["sha"] == sha and e.get("status") == "failed"), None)
+            # 没核实在集成分支里的记录（failed / picking / 放弃了的冲突 / 被 reset 掉的）接着用，重摘
+            record = next((e for e in reversed(state["picked"]) if e["sha"] == sha), None)
             if record is None:
                 record = {"branch": s["branch"], "sha": sha, "subject": subject}
                 state["picked"].append(record)
-            record.pop("error", None)
-            record["status"] = "picking"
+            for key in ("error", "new_sha"):
+                record.pop(key, None)
+            record.update(status="picking", head_before=git_out(wt, "rev-parse", "HEAD"))
             save_state()
-            cp = git(wt, "cherry-pick", sha, timeout=300, env=c_locale_env())  # 下面按 git 的原话认空提交
+            cp = git(wt, "cherry-pick", sha, timeout=300)
             if cp.returncode != 0:
-                conflicts = conflicted_files(wt)
-                if not conflicts and "empty" in f"{cp.stdout}{cp.stderr}":
-                    git(wt, "cherry-pick", "--skip")
-                    record["status"] = "empty"
-                    save_state()
-                    skipped.append({"branch": s["branch"], "sha": sha[:12], "subject": subject,
-                                    "reason": "改动已在集成分支里（空提交）"})
-                    continue
-                if not conflicts and in_progress_op(wt) is None:
-                    # git 没开始就拒绝了（如未跟踪文件会被覆盖）：不是冲突，没有 --continue 可做，
-                    # 不能记 conflict（重跑会被当成已解决跳过，HEAD 实际没动）。
-                    record.update(status="failed", error=tail(cp.stderr or cp.stdout, 400))
-                    save_state()
-                    raise DroverError(
-                        f"cherry-pick {sha[:12]}（{s['branch']}：{subject}）没能开始，git 拒绝了（没有冲突、也没有进行中的 "
-                        f"cherry-pick）：{tail(cp.stderr or cp.stdout, 300)}。挡住的原因处理掉后（比如挪走 {wt} 里会被覆盖的"
-                        "未跟踪文件），重跑同样的 integrate 会重试这个提交（已应用的会跳过）",
-                        worktree_path=wt, stderr=tail(cp.stderr or cp.stdout, 800), picked_so_far=picked_now,
-                        state_file=str(state_path))
-                record["status"] = "conflict"
-                save_state()
-                raise DroverError(
-                    f"cherry-pick {sha[:12]}（{s['branch']}：{subject}）冲突：在 {wt} 解冲突 → git -C {wt} add <文件> → "
-                    f"git -C {wt} cherry-pick --continue → 再跑一次同样的 integrate（已应用的会跳过）",
-                    worktree_path=wt, conflicts=conflicts, stderr=tail(cp.stderr or cp.stdout, 800),
-                    picked_so_far=picked_now, state_file=str(state_path))
+                pick_failed(wt, cp, record, save_state, abandoned, picked_so_far=picked_now, state_file=str(state_path))
+                skipped.append({"branch": s["branch"], "sha": sha[:12], "subject": subject,
+                                "reason": "改动已在集成分支里（空提交）"})
+                continue
             record.update(status="picked", new_sha=git_out(wt, "rev-parse", "HEAD"))
             save_state()
             picked_now.append({"branch": s["branch"], "sha": sha[:12], "new_sha": record["new_sha"][:12],
@@ -8876,20 +9163,28 @@ def cmd_integrate(a: argparse.Namespace) -> dict:
                                        save=str(STATE_HOME / a.slug / f"deps-integrate-{name}.json")))
     return {
         "ok": True, "repo": repo, "branch": state["branch"], "worktree_path": wt,
+        **({"branch_note": branch_note} if branch_note else {}),
         "workspace_id": wt_res["workspace_id"], "pane_id": wt_res["pane_id"], "reused": wt_res["reused"],
         "source_workspace_opened": wt_res.get("source_workspace_opened"),
-        # wt 新建集成 worktree 时同步源仓库主检出的结果（复用时 status 是 reused）；warnings 非空要在汇报里提一句。
-        "source_sync": wt_res.get("source_sync"), "warnings": wt_res.get("warnings") or [],
+        # wt 新建集成 worktree 时同步源仓库主检出的结果（复用时 status 是 reused）；warnings 非空要在汇报里提一句
+        # （含没有起点记录的条目分支、旧记录没核实的冲突）。
+        "source_sync": wt_res.get("source_sync"), "warnings": warnings,
+        # 复用时快进到了最新上游（base 跟着更新）的说明；没快进（有没推的提交）不出现。
+        **({"synced": synced} if synced else {}),
         # 新建集成 worktree 时起点的核实（同 wt）；carried 是 --carry 带上的上一轮提交（已在 base 之后、条目提交之前）。
         "round_check": wt_res.get("round_check"), **({"carried": wt_res["carried"]} if wt_res.get("carried") else {}),
+        # --carry-base 带上的、起点带着的别的提交（也在 picked 里）；上次冲突后被放弃、这次重摘了的（abandoned）。
+        **({"carried_base": foreign} if foreign else {}), **({"abandoned": abandoned} if abandoned else {}),
         "upstream": upstream, "base": state["base"], "fetch_tries": tries,
+        **({"create_from": state["create_from"]} if state.get("create_from") else {}),
         "picked": picked_now, "skipped": skipped, "head": git_out(wt, "rev-parse", "HEAD"),
         # deps 每一项这次是装了（installed）、跳过（skipped：依赖清单没变 / 软链）还是失败，原因和摘要在 saved_to 里。
         "deps": {"has_failure": deps.get("has_failure"), "saved_to": deps.get("saved_to"),
                  "items": [{"kind": i["kind"], "action": i["action"]} for i in deps["items"]]},
         "state_file": str(state_path),
-        "next": (f"整体检查（全量测试、tsc、build 等）：drover accept --wt {wt} --base {state['base']} "
-                 f"--save {STATE_HOME / a.slug}/accept-integrate-{name}.json --brief --verify …"),
+        "next": (f"整体检查（全量测试、tsc、build 等）：drover accept --wt {wt} --base {state['base']} --integration "
+                 f"--save {STATE_HOME / a.slug}/accept-integrate-{name}.json --brief --verify …（结论记进集成状态，"
+                 "push 只推检查通过的内容）"),
     }
 
 
@@ -8907,20 +9202,168 @@ def classify_paths(paths: list) -> dict:
     return groups
 
 
-def find_integrate_state(wt: str, slug: Optional[str]) -> Optional[Path]:
-    """集成 worktree 对应的状态文件 <slug>/integrate-<仓库名>.json（integrate 写的）：给了 slug 只在那个任务里找，
-    否则扫全部任务目录，按记录的 worktree_path 匹配。"""
+def find_integrate_state(wt: str, slug: Optional[str], upstream: Optional[str] = None) -> Optional[Path]:
+    """集成 worktree 对应的状态文件 <slug>/integrate-<仓库名>@<目标>.json（integrate 写的；旧版本是 integrate-<仓库名>.json）：
+    给了 slug 只在那个任务里找，否则扫全部任务目录，按记录的 worktree_path 匹配。同一个 worktree 对上几份（手工复制的归档）
+    时取 upstream 和给的相同的那份，没有相同的取第一份。"""
     target = os.path.realpath(wt)
     dirs = [STATE_HOME / slug] if slug else sorted(p for p in STATE_HOME.iterdir() if p.is_dir())
-    for d in dirs:
-        for f in sorted(d.glob("integrate-*.json")):
-            try:
-                state = json.loads(f.read_text())
-            except (OSError, json.JSONDecodeError):
-                continue
-            if os.path.realpath(state.get("worktree_path") or "/nonexistent") == target:
-                return f
+    found = [(f, read_json_dict(f)) for d in dirs for f in sorted(d.glob("integrate-*.json"))]
+    found = [(f, s) for f, s in found if os.path.realpath(s.get("worktree_path") or "/nonexistent") == target]
+    return next((f for f, s in found if upstream is None or s.get("upstream") == upstream),
+                found[0][0] if found else None)
+
+
+def remote_branch_head(repo: str, remote: str, branch: str) -> tuple[Optional[str], subprocess.CompletedProcess, int]:
+    """远端分支现在的提交：ls-remote 按完整引用名 refs/heads/<分支> 查，只认名字完全相同的那一行（只写分支名时 git 按后缀匹配，
+    远端有 hotfix/main 时会一起列出来，取第一行就读错了分支）。返回 (sha，没有这条分支或 ls-remote 失败是 None, 结果, 尝试次数)。"""
+    ref = f"refs/heads/{branch}"
+    ls, tries = git_net(repo, "ls-remote", remote, ref)
+    rows = (row.split() for row in ls.stdout.splitlines()) if ls.returncode == 0 else ()
+    return next((r[0] for r in rows if r[1:2] == [ref]), None), ls, tries
+
+
+def record_integration_check(wt: str, result: dict, save: Optional[str]) -> dict:
+    """accept --integration 的结论记进这个集成 worktree 的集成状态（integrate 写的那份，按 worktree 路径找），push 按它核对
+    要推的提交检查过没有：检查的提交和树、检查时 worktree 干不干净、跑了几条、几条没过、存档在哪。通过 = 有 verify、全过、
+    检查时干净（有没提交的改动时检查的不是提交本身）。没有集成状态的（patch 模式 wt 建的）记不了，push 要带 --unchecked。
+    返回记下的内容（或记不了的说明），accept 的结果里带上。"""
+    state_path = find_integrate_state(wt, None)
+    if not state_path:
+        return {"recorded": False, "note": "没找到这个 worktree 的集成状态（不是 integrate 建的），结论没有记下：push 时要带 "
+                                           "--unchecked \"<理由>\""}
+    verify = result.get("verify") or []
+    failed = sum(1 for v in verify if not v.get("ok"))
+    clean = not result.get("status_porcelain")
+    check = {"at": time.strftime("%m-%d %H:%M:%S"), "head": result["head"],
+             "tree": git_out(wt, "rev-parse", f"{result['head']}^{{tree}}"), "clean": clean, "verify": len(verify),
+             "failed": failed, "passed": bool(verify) and not failed and clean, "base": result.get("base"),
+             "saved_to": str(Path(save).expanduser()) if save else None}
+    state = json.loads(state_path.read_text())
+    state["check"] = check
+    state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2))
+    return {"recorded": True, "state_file": str(state_path), **check}
+
+
+def archived_check(wt: str, slug: str) -> Optional[dict]:
+    """过渡（只认这一个版本，下个版本删）：旧版 drover 的 accept --integration 不往集成状态里记结论。集成状态里没有 check 时，
+    在任务目录的 accept 存档里按内容找（不看文件名）：worktree 是这个、存档的 head 的树等于 HEAD 的树、有 verify、全部通过、
+    检查时干净（status_porcelain 为空），算检查过。"""
+    tree = git_out(wt, "rev-parse", "HEAD^{tree}")
+    files = sorted((STATE_HOME / slug).glob("accept*.json"), key=lambda f: f.stat().st_mtime, reverse=True)
+    for f in files:
+        raw = read_json_dict(f)
+        verify = raw.get("verify") or []
+        if archive_passed(raw, wt) and commit_tree(wt, raw.get("head")) == tree:
+            return {"head": raw["head"], "tree": tree, "clean": True, "verify": len(verify), "failed": 0, "passed": True,
+                    "base": raw.get("base"), "saved_to": str(f), "check_from": "archive"}
     return None
+
+
+def archive_passed(raw: dict, wt: str) -> bool:
+    """accept 存档是这个 worktree 的、有 verify、全部通过、检查时干净（status_porcelain 为空）。"""
+    verify = raw.get("verify") or []
+    return bool(verify) and all(v.get("ok") for v in verify) and not raw.get("status_porcelain") and \
+        os.path.realpath(raw.get("worktree_path") or "/nonexistent") == os.path.realpath(wt)
+
+
+def check_fail_text(check: dict) -> str:
+    why = ("一条 --verify 都没带" if not check.get("verify") else
+           "检查时 worktree 有没提交的改动，检查的不是提交本身" if not check.get("clean") else
+           f"{check.get('failed')}/{check.get('verify')} 条没通过")
+    return f"整体检查没过（{why}；存档 {check.get('saved_to') or '没存'}）"
+
+
+def check_gap(wt: str, check: dict) -> Optional[str]:
+    """检查结论和要推的 HEAD 差在哪；对得上返回 None。差文档以外的改动都算差（检查之后只改了文档不用重跑，见 push_check）。"""
+    if not check.get("passed"):
+        return check_fail_text(check)
+    tree = git_out(wt, "rev-parse", "HEAD^{tree}")
+    if tree == check.get("tree"):
+        return None
+    head, checked = git_out(wt, "rev-parse", "HEAD"), check.get("head") or ""
+    text = f"检查之后又有改动：检查的是 {checked[:9]}，现在 HEAD 是 {head[:9]}"
+    d = git(wt, "diff", "--no-renames", "--name-only", check.get("tree") or "", tree)
+    if d.returncode != 0:
+        return f"{text}，核对不了改了什么（{tail(d.stderr, 200)}）"
+    changed = [f for f in d.stdout.splitlines() if not DOC_FILE_RE.search(f)]
+    if not changed:
+        return None
+    return text + commits_since(wt, checked) + f"；改了 {len(changed)} 个文件：" + "、".join(changed[:8]) + \
+        ("……" if len(changed) > 8 else "")
+
+
+def commits_since(wt: str, checked: str) -> str:
+    """检查的提交之后 HEAD 上多出来的提交（"，多了 N 个提交：…"）；不在一条线上（rebase / reset 过）就这么写。"""
+    if not checked or not is_ancestor(wt, checked, "HEAD"):
+        return "（不在一条线上：rebase / reset 过）"
+    since = git_out(wt, "log", "--format=%h %s", f"{checked}..HEAD").splitlines()
+    return f"，多了 {len(since)} 个提交：" + "；".join(since[:5]) + ("……" if len(since) > 5 else "")
+
+
+def push_check(wt: str, state: Optional[dict], slug: str) -> tuple[Optional[dict], Optional[str], list]:
+    """要推的 HEAD 有没有整体检查覆盖（accept --integration 记进集成状态的 check）。返回 (覆盖它的检查, 差在哪, 提示)：
+    覆盖 = 检查通过，并且检查时的树和 HEAD 的树一样，或者只差文档（DOC_FILE_RE，同 push 的 needs_reverify：上游只改文档的
+    rebase、检查之后只加了文档，都不用重跑；差的文档列在 docs_only_after）。"""
+    if state is None:
+        return None, ("这个 worktree 没有集成状态（不是 integrate 建的，比如 patch 模式 wt 建的集成 worktree），整体检查的结论"
+                      "没有地方记、核对不了"), []
+    check, notes = state.get("check"), []
+    if not check:
+        check = archived_check(wt, slug)
+        if check:
+            notes.append(f"集成状态里没有整体检查结论（旧版 drover 跑的检查），按存档 {check['saved_to']} 的内容核对：worktree、"
+                         "提交的树都对得上，全部通过")
+    if not check:
+        return None, "没做整体检查：这个集成 worktree 上还没跑过 accept --integration", notes
+    gap = check_gap(wt, check)
+    if gap:
+        return None, gap, notes
+    tree = git_out(wt, "rev-parse", "HEAD^{tree}")
+    covered = {k: check[k] for k in ("head", "tree", "at", "saved_to", "check_from") if check.get(k)}
+    if tree != check["tree"]:
+        covered["docs_only_after"] = git_out(wt, "diff", "--no-renames", "--name-only", check["tree"], tree).splitlines()[:10]
+    return covered, None, notes
+
+
+def push_target_matches(wt: str, state: Optional[dict], state_path: Optional[Path], a: argparse.Namespace) -> None:
+    """集成状态记的目标不是这次的 --target 就不推：那是给别的分支建的集成 worktree，推过去会把那条分支上别人的提交一起带过去
+    （同一轮推第二条分支只换 --target，把只在 main 上的提交推进了 release）。没有集成状态的不在这里管（检查核对会挡）。"""
+    upstream = f"{a.remote}/{a.target}"
+    if state is not None and state.get("upstream") != upstream:
+        raise DroverError(
+            f"这个集成 worktree 是给 {state.get('upstream')} 建的（{state_path}），不是 {upstream}，没推：推 {a.target} 先跑 "
+            f"drover integrate … --target {a.target}（会另建它自己的集成 worktree），在那边做整体检查再推",
+            worktree_path=wt, state_file=str(state_path))
+
+
+def push_new_branch(p: subprocess.CompletedProcess, tries: int, a: argparse.Namespace, state: Optional[dict]) -> str:
+    """push 的 fetch 失败了：远端没有目标分支、集成状态是 integrate --create-from 建的（新建远程分支，源分支用户定过）→ 返回
+    源分支，照常核对检查后推；远端没有这条分支却不是这样建的 → 报错（从哪条建要用户定）；别的 fetch 失败照报。"""
+    if not REMOTE_REF_MISSING_RE.search(p.stderr or ""):
+        raise DroverError(f"git fetch 失败（试了 {tries} 次）", stderr=tail(p.stderr))
+    if not (state and state.get("create_from")):
+        raise DroverError(
+            f"远端 {a.remote} 没有分支 {a.target}：新建远程分支要用户定从哪条分支建，没推。定了用 drover integrate … "
+            f"--target {a.target} --create-from {a.remote}/<源分支> 建集成 worktree，整体检查后再 push", new_branch=a.target)
+    return state["create_from"]
+
+
+def push_gate(wt: str, a: argparse.Namespace, state: Optional[dict], slug: str, head: str,
+              upstream_sha: str) -> tuple[dict, list]:
+    """推之前核对整体检查（push_check）：对不上就不推、说明差在哪和怎么补，除非 --unchecked。返回 (要记进推送记录和返回的
+    字段, 提示)：覆盖它的检查 {check}，或者带 --unchecked 推的 {unchecked: 理由, check_gap: 差在哪}。"""
+    check, gap, notes = push_check(wt, state, slug)
+    if gap and not a.unchecked:
+        raise DroverError(
+            f"{gap}，没推。先在这个 worktree 上跑整体检查：drover accept --wt {wt} --base "
+            f"{state.get('base') if state else upstream_sha} --integration --save {STATE_HOME / slug}/accept-integrate-"
+            "<仓库名>.json --brief --verify …（检查的就是现在的 HEAD，通过后再 push）；用户明确要跳过检查时加 "
+            "--unchecked \"<用户的原话或理由>\"（理由记进推送记录）",
+            check_gap=gap, worktree_path=wt, head=head, **({"warnings": notes} if notes else {}))
+    if a.unchecked and not gap:
+        notes.append("--unchecked 没用上：整体检查覆盖了要推的提交")
+    return ({"unchecked": a.unchecked, "check_gap": gap} if gap else {"check": check}), notes
 
 
 def push_task(wt: str, slug: Optional[str], state_path: Optional[Path]) -> tuple:
@@ -8943,8 +9386,11 @@ def push_task(wt: str, slug: Optional[str], state_path: Optional[Path]) -> tuple
 
 def cmd_push(a: argparse.Namespace) -> dict:
     """从集成 worktree 推送：先 fetch；上游有新提交就 rebase、报告上游改了什么，这次不推（重新检查后再跑一次）；
-    没有新提交就 push HEAD:<目标分支>，再 ls-remote 核对远端已是 HEAD，推送记进任务的 pushes.jsonl（push_task 定任务）。
-    rebase 后把新上游回写进 integrate 的状态文件（base = 补检查用的 --base）；rebase 冲突解完后的下一次 push 先停一次。"""
+    没有新提交就核对整体检查（push_check：检查通过、检查的就是要推的内容，或者只差文档），对上了才 push HEAD:<目标分支>，
+    再 ls-remote 核对远端已是 HEAD，推送记进任务的 pushes.jsonl（push_task 定任务），带上覆盖它的检查。对不上就不推、说明
+    差在哪；用户明确要跳过时 --unchecked "<理由>"，理由记进推送记录。集成状态记的目标不是这次的 --target 就不推（那是给别的
+    分支建的集成 worktree）。远端还没有目标分支时，只推 integrate --create-from 建的集成 worktree（新建远程分支）。
+    rebase 后把新上游回写进 integrate 的状态文件（base = 补检查用的 --base）。"""
     wt = str(Path(a.wt).expanduser().resolve())
     upstream = f"{a.remote}/{a.target}"
     dirty = git_out(wt, "status", "--porcelain").splitlines()
@@ -8953,10 +9399,11 @@ def cmd_push(a: argparse.Namespace) -> dict:
     pending = in_progress_op(wt)
     if pending:
         raise DroverError(f"还有没做完的 {pending}：先解完冲突并 --continue", conflicts=conflicted_files(wt))
-    state_path = find_integrate_state(wt, a.slug)
+    state_path = find_integrate_state(wt, a.slug, upstream)
     state = json.loads(state_path.read_text()) if state_path else None
     slug, slug_from = push_task(wt, a.slug, state_path)
     record_file = STATE_HOME / slug / PUSHES_FILE
+    push_target_matches(wt, state, state_path, a)
 
     def save_state() -> None:
         if state_path and state is not None:
@@ -8972,18 +9419,26 @@ def cmd_push(a: argparse.Namespace) -> dict:
         return result
 
     if a.dry_run:
-        return state_fields({"ok": True, "dry_run": True, "worktree_path": wt,
+        check, gap, notes = push_check(wt, state, slug)
+        return state_fields({"ok": True, "dry_run": True, "worktree_path": wt, "check": check, "check_gap": gap,
+                             **({"warnings": notes} if notes else {}),
                              "planned": [f"git -C {wt} fetch {a.remote} {a.target}（自动重试）",
                                          f"上游有新提交：git -C {wt} rebase {upstream}，回写 base，报告上游改动后停下（不推）",
-                                         f"否则：git -C {wt} push {a.remote} HEAD:{a.target}，再 ls-remote 核对，"
+                                         "否则核对整体检查（上面的 check_gap 是按现在的 HEAD 算的），对上了（或 --unchecked）"
+                                         f"才 git -C {wt} push {a.remote} HEAD:refs/heads/{a.target}，再 ls-remote 核对，"
                                          f"推送记进 {record_file}"]})
     p, tries = git_net(wt, "fetch", a.remote, a.target)
+    created_from = None
     if p.returncode != 0:
-        raise DroverError(f"git fetch 失败（试了 {tries} 次）", stderr=tail(p.stderr))
-    behind, ahead = (int(x) for x in git_out(wt, "rev-list", "--left-right", "--count", f"{upstream}...HEAD").split())
+        created_from = push_new_branch(p, tries, a, state)
     head_before = git_out(wt, "rev-parse", "HEAD")
-    upstream_sha = git_out(wt, "rev-parse", upstream)
     stamp = time.strftime("%m-%d %H:%M:%S")
+    if created_from:
+        # 新建远程分支：起点是 integrate 时的源分支提交（base），没有上游可以 rebase
+        upstream_sha, behind, ahead = state["base"], 0, 1
+    else:
+        behind, ahead = (int(x) for x in git_out(wt, "rev-list", "--left-right", "--count", f"{upstream}...HEAD").split())
+        upstream_sha = git_out(wt, "rev-parse", upstream)
     if behind:
         base = git_out(wt, "merge-base", "HEAD", upstream)
         upstream_files = git_out(wt, "diff", "--name-only", base, upstream).splitlines()
@@ -8996,13 +9451,11 @@ def cmd_push(a: argparse.Namespace) -> dict:
                 "overlap_with_ours": overlap, "head_before": head_before}
         rb = git(wt, "rebase", upstream, timeout=600)
         if rb.returncode != 0:
-            if state is not None:
-                # 冲突要人工解：解完 --continue 后下一次 push 先停一次，提醒用新 base 重新检查，不能直接推。
-                state["pending_reverify"] = {"at": stamp, "reason": f"rebase 到 {upstream} 冲突，人工解过", "to": upstream_sha}
-                save_state()
+            # 冲突要人工解：解完 --continue 后树和整体检查时不同，下一次 push 的检查核对会拒绝，补完检查才推。
             raise DroverError(f"rebase 到 {upstream} 冲突：解完 → git -C {wt} add <文件> → "
-                                f"git -C {wt} -c core.editor=true rebase --continue → 再跑一次 push（会先停一次，提醒用新 base "
-                                "重新检查）", conflicts=conflicted_files(wt), stderr=tail(rb.stderr or rb.stdout, 800), **info)
+                                f"git -C {wt} -c core.editor=true rebase --continue → 用新 base {upstream_sha[:12]} 补检查"
+                                "（accept --integration）→ 再跑一次 push", conflicts=conflicted_files(wt),
+                                stderr=tail(rb.stderr or rb.stdout, 800), **info)
         needs = bool(groups["code"] or groups["deps"] or groups["migrations"] or overlap)
         if state is not None:
             state.setdefault("rebases", []).append({"at": stamp, "from": state.get("base"), "to": upstream_sha,
@@ -9012,40 +9465,35 @@ def cmd_push(a: argparse.Namespace) -> dict:
         result = {"ok": True, "pushed": False, "rebased": True, **info, "head": git_out(wt, "rev-parse", "HEAD"),
                   "base": upstream_sha, "needs_reverify": needs,
                   "next": (f"上游改了代码 / 依赖 / 迁移，或和我们改了同一个文件：依赖变了先重跑 deps，再跑 tsc 和相关测试"
-                           f"（accept --base {upstream_sha[:12]} --verify …），通过后再跑一次 push" if needs else
+                           f"（accept --base {upstream_sha[:12]} --integration --verify …），通过后再跑一次 push（检查结论"
+                           "对不上现在的提交，push 不推）" if needs else
                            "上游只改了文档：不用重新检查，直接再跑一次 push")}
         if groups["migrations"]:
             result["migrations_note"] = "上游带了新迁移：确认它们和我们已在测试环境执行的迁移没有依赖，文件名先后合理"
         return state_fields(result)
-    if state is not None and state.get("base") != upstream_sha and \
+    if state is not None and not created_from and state.get("base") != upstream_sha and \
             git(wt, "merge-base", "--is-ancestor", upstream_sha, "HEAD").returncode == 0:
         # 上游已经在 HEAD 里、但不是记录的 base：人工 rebase 过（冲突解完 --continue，或手动 rebase）。
         state.setdefault("rebases", []).append({"at": stamp, "from": state.get("base"), "to": upstream_sha,
                                                 "manual": True})
         state["base"] = upstream_sha
         save_state()
-    if state is not None and state.get("pending_reverify"):
-        marker = state.pop("pending_reverify")
-        save_state()
-        return state_fields({"ok": True, "pushed": False, "head": head_before, "base": upstream_sha,
-                             "needs_reverify": True, "reason": marker.get("reason"),
-                             "next": (f"上次 rebase 冲突是人工解的：用 base {upstream_sha[:12]} 重新检查（tsc、相关测试，"
-                                      "依赖变了先 deps），通过后再跑一次 push")})
     if not ahead:
         return state_fields({"ok": True, "pushed": False, "head": head_before, "base": upstream_sha,
                              "note": "HEAD 已经在上游里，没有要推的提交"})
-    commits = git_out(wt, "log", "--oneline", f"{upstream}..HEAD").splitlines()
-    old = git_out(wt, "rev-parse", "--short=9", upstream)
+    covered, notes = push_gate(wt, a, state, slug, head_before, upstream_sha)
+    commits = git_out(wt, "log", "--oneline", f"{upstream_sha}..HEAD").splitlines()
+    old = upstream_sha[:9]
     # 推到的地址（remote 名只是本地别名，换了托管地址以后同一个名字指的是另一个仓库，见 push_moved）
     remote_url = remote_push_url(wt, a.remote)
-    ps, push_tries = git_net(wt, "push", a.remote, f"HEAD:{a.target}")
+    ps, push_tries = git_net(wt, "push", a.remote, f"HEAD:refs/heads/{a.target}")
     if ps.returncode != 0:
         raise DroverError(f"git push 失败（试了 {push_tries} 次）", stderr=tail(ps.stderr))
-    ls, ls_tries = git_net(wt, "ls-remote", "--heads", a.remote, a.target)
-    remote_sha = ls.stdout.split()[0] if ls.returncode == 0 and ls.stdout.strip() else None
+    remote_sha, _, ls_tries = remote_branch_head(wt, a.remote, a.target)
     verified = remote_sha == head_before
     result = {"ok": verified, "pushed": True, "range": f"{old}..{head_before[:9]}", "commits": commits,
               "remote_sha": remote_sha, "head": head_before, "verified": verified, "remote_url": remote_url,
+              **covered, **({"created_from": created_from} if created_from else {}), **({"warnings": notes} if notes else {}),
               "tries": {"fetch": tries, "push": push_tries, "ls_remote": ls_tries}}
     if not verified:
         result["error"] = "push 返回成功，但 ls-remote 读到的远端分支不是 HEAD（或没读到）：手动 ls-remote 再核对一次"
@@ -9053,7 +9501,8 @@ def cmd_push(a: argparse.Namespace) -> dict:
     record = {"at": stamp, "ts": round(time.time(), 3), "repo": str(git_common_dir(wt).parent), "remote": a.remote,
               "remote_url": remote_url, "target": a.target, "upstream": upstream, "branch": current_branch(wt),
               "worktree_path": wt, "from": upstream_sha, "remote_sha": remote_sha, "head": head_before,
-              "range": result["range"], "commits": commits, "verified": verified,
+              "range": result["range"], "commits": commits, "verified": verified, **covered,
+              **({"created_from": created_from} if created_from else {}),
               **({"state_file": str(state_path)} if state_path else {})}
     append_jsonl(record_file, record)
     result["push_record"] = str(record_file)
@@ -9069,7 +9518,7 @@ WRAPUP_DRAFT_FILES = 15  # 骨架"变更总结"每个仓库最多列这么多文
 GOAL_LINE_RE = re.compile(r"^\s*[-*]?\s*目标[：:]\s*(.+?)\s*$")
 # 改动文件分类（线索，不是结论）：按 迁移 → 配置 → 部署 → 依赖 的顺序取第一个匹配的。
 WRAPUP_CATEGORIES = [
-    ("migrations", re.compile(r"(?i)((^|/)(migrations?|migrate|alembic/versions|db/changelog)/|flyway|\.sql$)")),
+    ("migrations", MIGRATION_FILE_RE),
     ("config", re.compile(r"(?i)((^|/)\.env[^/]*$|(^|/)application[^/]*\.(ya?ml|properties)$"
                           r"|(^|/)bootstrap[^/]*\.ya?ml$|nacos)")),
     ("deploy", re.compile(r"(?i)((^|/)Dockerfile[^/]*$|(^|/)docker-compose[^/]*\.ya?ml$|(^|/)\.github/workflows/"
@@ -9190,14 +9639,13 @@ def wrapup_remote(repo: str, upstream: str, pushed: str, fetch: bool) -> dict:
     out: dict = {"checked": True, "upstream": upstream, "pushed_sha": pushed}
     if not remote or not target:
         return {"checked": False, "reason": f"upstream {upstream!r} 不是 <远端>/<分支> 的形式"}
-    ls, tries = git_net(repo, "ls-remote", remote, f"refs/heads/{target}")
+    head, ls, tries = remote_branch_head(repo, remote, target)
     if tries > 1:
         out["tries"] = tries
     if ls.returncode != 0:
         out.update(contains=None, remote_head=None,
                    error=f"git ls-remote {remote} refs/heads/{target} 失败（试了 {tries} 次）：{tail(ls.stderr, 300)}")
         return out
-    head = ls.stdout.split()[0] if ls.stdout.strip() else None
     out["remote_head"] = head
     if not head:
         out.update(contains=False, note=f"远端 {remote} 没有分支 {target}")
@@ -9384,11 +9832,118 @@ def wrapup_checks(slugs: list, lines: list, warnings: list) -> list:
         checks.append({"slug": s, "file": f.name, "path": str(f),
                        "mtime": time.strftime("%m-%d %H:%M", time.localtime(f.stat().st_mtime)),
                        "worktree_path": wt, "upstream": by_wt.get(os.path.realpath(wt)) if wt else None,
-                       "base": raw.get("base"), "diff_summary": brief["diff_summary"],
+                       "base": raw.get("base"), "head": raw.get("head"), "diff_summary": brief["diff_summary"],
                        "verify_failed": brief["verify_failed"], "verify": brief["verify"]})
         if brief["verify_failed"]:
             warnings.append(f"整体检查 {f.name} 有没通过的命令（verify_failed: true）")
     return checks
+
+
+def commit_tree(repo: str, rev: Optional[str]) -> Optional[str]:
+    """rev 的树对象 sha；rev 为空或本地没有返回 None。"""
+    p = git(repo, "rev-parse", "--verify", "--quiet", f"{rev}^{{tree}}") if rev else None
+    return p.stdout.strip() if p and p.returncode == 0 else None
+
+
+def wrapup_coverage(lines: list, checks: list, warnings: list) -> None:
+    """每次推送有没有整体检查覆盖、每份检查存档覆盖了哪几次推送：推送记录里有 check（push 核对过检查才推的）算覆盖；没有的
+    （旧记录）看有没有通过的存档，它检查时的提交的树等于推上去的树。存档的 covers 列出它覆盖的推送（"<upstream> <短 sha>"：
+    树相同，或者推送记录的 check 指的就是它）；没覆盖的推送进 warnings 和 line["unchecked_pushes"]（带 --unchecked 的理由）。"""
+    for c in checks:
+        c["covers"] = []
+    for line in lines:
+        repo, line["unchecked_pushes"] = line.get("repo_path") or "", []
+        if not Path(repo).is_dir():
+            continue
+        trees = {id(c): commit_tree(repo, c.get("head")) for c in checks}
+        for i, p in enumerate(line["pushes"], 1):
+            if not push_covered(repo, line, p, checks, trees):
+                push_uncovered(line, i, p, warnings)
+
+
+def push_covered(repo: str, line: dict, p: dict, checks: list, trees: dict) -> bool:
+    """一次推送有没有整体检查覆盖，顺带给覆盖它的存档记上 covers（树相同，或者推送记录的 check 指的就是它）。"""
+    sha = pushed_sha(p)
+    # 取不到的用一个对不上任何东西的占位，免得"推送的树取不到"和"存档没记 head"两个 None 相等
+    tree, via = commit_tree(repo, sha) or "?", (p.get("check") or {}).get("saved_to") or "?"
+    hits = [c for c in checks if trees[id(c)] == tree or c["path"] == via]
+    for c in hits:
+        c["covers"] = list(dict.fromkeys([*c["covers"], f"{line['upstream']} {sha[:9]}"]))
+    return bool(p.get("check")) or any(c["verify"] and not c["verify_failed"] for c in hits)
+
+
+def pushed_sha(p: dict) -> str:
+    """推送记录里推上去的提交（核对过的远端提交，没有就是推送时的 HEAD）。"""
+    return p.get("remote_sha") or p.get("head") or ""
+
+
+def push_uncovered(line: dict, i: int, p: dict, warnings: list) -> None:
+    sha, reason = pushed_sha(p)[:9], p.get("unchecked")
+    warnings.append(f"{line['repo']} {line['upstream']} 第 {i} 次推送（{p.get('at')}）{sha}：没有整体检查覆盖"
+                    + (f"，推送时带了 --unchecked：{reason}" if reason else ""))
+    line["unchecked_pushes"].append(f"{line['repo']} {line['target']} {sha}" + (f"（--unchecked：{reason}）" if reason else ""))
+
+
+def integrated_records(groups: list) -> tuple[set, dict]:
+    """集成记录里的 (源仓库 realpath, 集成分支 / 推送时的分支) 集合，和摘出来的提交 {条目提交: 集成分支上的新提交}（已应用的；
+    空提交、旧版本的 resolved 没有新提交，是 None）。"""
+    integ, picked = set(), {}
+    for g in groups:
+        for _, state in g["states"]:
+            integ.add((os.path.realpath(state.get("repo") or "/nonexistent"), state.get("branch")))
+            picked.update({e["sha"]: e.get("new_sha") for e in state.get("picked") or []
+                           if isinstance(e, dict) and e.get("status") in INTEGRATE_APPLIED})
+        integ |= {(os.path.realpath(p.get("repo") or "/nonexistent"), p.get("branch")) for p in g["pushes"]}
+    return integ, picked
+
+
+def pushed_commits(lines: list) -> dict:
+    """{源仓库 realpath: 推送记录里推上去的提交（本地有的完整 sha）}。"""
+    pushed: dict = {}
+    for line in lines:
+        repo = line.get("repo_path") or ""
+        if Path(repo).is_dir():
+            shas = (rev_commit(repo, pushed_sha(p)) for p in line["pushes"])
+            pushed.setdefault(os.path.realpath(repo), set()).update(s for s in shas if s)
+    return pushed
+
+
+def unpushed_on_branch(repo: str, branch: str, shas: list, start: Optional[str], picked: dict) -> list:
+    """条目分支（start 之后）上推上去的提交里没有的提交（不是祖先、cherry_marks 也不是 "-"），摘出来的新提交在推上去的提交里
+    的不算；从旧到新的 sha。"""
+    rev = f"refs/heads/{branch}"
+    local = git_out(repo, "rev-list", rev, "--not", *shas, *([start] if start else [])).splitlines()
+    equal = set()
+    for sha in shas if local else []:
+        equal |= {s for m, s in cherry_marks(repo, sha, rev, start) or [] if m == "-"}
+    return [s for s in reversed(local) if s not in equal and not picked_and_pushed(repo, s, picked, shas)]
+
+
+def picked_and_pushed(repo: str, sha: str, picked: dict, shas: list) -> bool:
+    """条目提交 sha 在集成记录里算已应用，而且摘出来的新提交在推上去的提交里（空提交、旧版本没记新提交的照信）。"""
+    if sha not in picked:
+        return False
+    return not picked[sha] or any(is_ancestor(repo, picked[sha], p) for p in shas)
+
+
+def wrapup_unpushed_items(family: list, groups: list, lines: list, items: list, warnings: list) -> list:
+    """待清理清单里的条目分支（不是集成分支）上有没有没推上去的提交。和 cleanup 核对已提交的同一个判断（cherry_marks：
+    推上去的提交里有祖先或补丁内容相同的），核对对象是推送记录里推上去的提交（不联网）；有起点记录的从起点算起（起点之前的
+    不是这个条目的）；集成状态里记过、摘出来的新提交在推上去的提交里的也算推了（解过冲突的 cherry-pick 补丁对不上）。
+    这个仓库一次都没推过的不查（集成记录那几行已经写了没推送）。返回 [{repo, branch, commits: [{sha, subject}]}]，有的进 warnings。"""
+    (integ, picked), pushed, out = integrated_records(groups), pushed_commits(lines), []
+    for item in items:
+        repo, branch = item["repo_path"], item["branch"]
+        shas = sorted(pushed.get(os.path.realpath(repo)) or [])
+        if not branch or not shas or (os.path.realpath(repo), branch) in integ:
+            continue
+        left = unpushed_on_branch(repo, branch, shas, item_starts(family, repo).get(branch), picked)
+        if left:
+            commits = [{"sha": s, "subject": git_out(repo, "log", "-1", "--format=%s", s)} for s in left]
+            out.append({"repo": item["repo"], "repo_path": repo, "branch": branch, "commits": commits})
+            warnings.append(f"{item['repo']} 条目分支 {branch} 有 {len(commits)} 个提交没推上去（没集成，或者集成了没推）："
+                            + "；".join(f"{c['sha'][:9]} {c['subject']}" for c in commits[:5]))
+    return out
 
 
 def parse_worktree_list(text: str) -> list:
@@ -9522,7 +10077,17 @@ def wrapup_check_text(check: dict, slug: str) -> str:
     base = f"，base {check['base'][:12]}" if check.get("base") else ""
     up = f"，{check['upstream']}" if check.get("upstream") else ""
     passed = sum(1 for v in verify if v.get("ok"))
-    return f"{check['file']}（{check['mtime']}{up}{base}{who}）：{passed}/{len(verify)} 条通过；" + "；".join(notable)
+    return (f"{check['file']}（{check['mtime']}{up}{base}{who}）：{passed}/{len(verify)} 条通过；" + "；".join(notable)
+            + check_cover_text(check))
+
+
+def check_cover_text(check: dict) -> str:
+    """整体检查那一行末尾：覆盖了哪几次推送（wrapup_coverage 算的 covers），没覆盖的写明检查的是哪个提交。"""
+    if check.get("covers"):
+        return "；" + "、".join("覆盖推到 {} 的 {}".format(*c.rsplit(" ", 1)) for c in check["covers"])
+    if check.get("head"):
+        return f"；不是推上去的提交（检查的是 {check['head'][:9]}）"
+    return "；存档里没记检查的提交，核对不了覆盖没覆盖推上去的提交"
 
 
 def wrapup_main_files(paths: list) -> list:
@@ -9591,10 +10156,13 @@ def wrapup_draft(res: dict, lines: list) -> str:
                  for line in pushed if line.get("unpushed_commits")]
     dirty = [w for w in res["worktrees"] if w.get("dirty")]
     unpushed += [f"worktree {w['path']}（{w['branch']}）有 {w.get('dirty_count', 0)} 个未提交的改动" for w in dirty]
+    unpushed += [f"{u['repo']} 条目分支 {u['branch']} 有 {len(u['commits'])} 个提交没推上去："
+                 + "、".join(f"{c['sha'][:9]} {c['subject']}" for c in u["commits"][:5]) for u in res["unpushed_items"]]
     if unpushed:
         out.append("- 没推送的：" + "；".join(unpushed) + f"；原因{todo}")
     elif lines:
-        out.append("- 没推送的：无（每份集成记录都有推送记录，集成分支没有推送之后的新提交，worktree 都没有未提交的改动）")
+        out.append("- 没推送的：无（每份集成记录都有推送记录，集成分支没有推送之后的新提交，条目分支上的提交都推上去了，"
+                   "worktree 都没有未提交的改动）")
     else:
         out.append(f"- 没推送的：{todo}")
 
@@ -9653,6 +10221,9 @@ def wrapup_draft(res: dict, lines: list) -> str:
         out += [f"  - {wrapup_check_text(c, slug)}" for c in res["checks"]]
     else:
         out.append(f"- 整体检查：{todo}")
+    unchecked = [u for line in lines for u in line.get("unchecked_pushes") or []]
+    if unchecked:
+        out.append("- 没有整体检查覆盖的推送：" + "；".join(unchecked))
     out += [f"- 没做的：{todo}", "", "## 未决", f"- {todo}", "", "## 清理"]
     if res["worktrees"]:
         out.append("- 待清理的 worktree：")
@@ -9722,11 +10293,13 @@ def cmd_wrapup(a: argparse.Namespace) -> dict:
     worktrees, branches = wrapup_worktrees(family, repo_paths, group_branches(groups), warnings)
     warnings += [f"worktree {w['path']} 有 {w['dirty_count']} 个未提交的改动：清理时 cleanup 会核实它们在不在推过的远端分支里"
                  for w in worktrees if w.get("dirty")]
+    unpushed_items = wrapup_unpushed_items(family, groups, lines, worktrees + branches, warnings)
     checks = wrapup_checks(family, lines, warnings)
+    wrapup_coverage(lines, checks, warnings)
 
     res = {"ok": True, "slug": a.slug, "state_file": str(state_file), "goal": goal, "repos": involved,
            "orchestrator": orchestrator, "children": children, "lines": lines, "checks": checks,
-           "worktrees": worktrees, "branches": branches, "warnings": warnings}
+           "worktrees": worktrees, "branches": branches, "unpushed_items": unpushed_items, "warnings": warnings}
     if draft:
         text = wrapup_draft(res, lines)
         try:
@@ -9815,9 +10388,9 @@ def unverified_commits(where: str, rev: str, refs: list) -> tuple[list, set]:
     merges = set(git_out(where, "rev-list", "--merges", rev, "--not", *shas).splitlines())
     equal: set = set()
     for r in refs:
-        c = git(where, "cherry", r["sha"], rev)
-        if c.returncode == 0:
-            equal |= {line.split()[1] for line in c.stdout.splitlines() if line.startswith("- ")}
+        marks = cherry_marks(where, r["sha"], rev)
+        if marks is not None:
+            equal |= {sha for mark, sha in marks if mark == "-"}
     bad = [s for s in local if s in merges or s not in equal]
     return bad, merges
 
@@ -11668,24 +12241,35 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("integrate", help="编排者的集成 worktree：fetch → 从最新上游建（或复用）→ 依次 cherry-pick 条目分支 → 装依赖")
     p.add_argument("--repo", required=True, help="源仓库：路径或仓库名")
-    p.add_argument("--slug", required=True, help="任务 slug；集成分支默认 task/<slug>，状态写 <slug>/integrate-<仓库名>.json")
+    p.add_argument("--slug", required=True,
+                   help="任务 slug；集成分支默认 task/<slug>（这个仓库已有别的目标分支的集成 worktree 时 task/<slug>-<目标>），"
+                        "状态写 <slug>/integrate-<仓库名>@<目标>.json（旧版本的 integrate-<仓库名>.json 按里面记的目标照用）")
     p.add_argument("--target", required=True, help="要推送到的上游分支，如 main、release/1.2")
     p.add_argument("--from", dest="from_branch", action="append", required=True,
-                   help="条目分支（已按条目提交），按要应用的顺序写，可重复")
-    p.add_argument("--branch", help="集成分支名，默认 task/<slug>")
+                   help="条目分支（已按条目提交），按要应用的顺序写，可重复；只摘 wt 记下的起点（starts.jsonl）之后的提交")
+    p.add_argument("--branch", help="集成分支名，默认 task/<slug>；指到别的目标分支的、或 wt 手建的集成 worktree 会被拒绝")
     p.add_argument("--remote", default="origin", help="远端名，默认 origin")
     p.add_argument("--carry", metavar="理由",
                    help="新建集成 worktree 时起点缺这个任务上一轮推的提交、用户定了带上时用（同 wt --carry）")
+    p.add_argument("--carry-base", metavar="理由",
+                   help="条目分支的起点带着目标分支没有的提交（别人的提交、主检出没推的本地提交）、用户定了一起带上时用："
+                        "照摘，理由和带上的提交记进 <slug>/carry.jsonl（kind: base）")
+    p.add_argument("--create-from", metavar="远端/分支",
+                   help="目标分支远端还没有（新建远程分支）、用户定了从哪条分支建时用，如 origin/main：从它建集成 worktree，"
+                        "push 照常核对、推上去建出分支、记录")
     p.add_argument("--dry-run", action="store_true", help="只列出要执行的步骤")
 
-    p = sub.add_parser("push", help="集成 worktree 推送：fetch；上游有新提交就 rebase 并报告（这次不推）；否则推送并 ls-remote 核对，"
-                                    "推送记进任务的 pushes.jsonl")
+    p = sub.add_parser("push", help="集成 worktree 推送：fetch；上游有新提交就 rebase 并报告（这次不推）；否则核对整体检查，"
+                                    "对上了才推送并 ls-remote 核对，推送记进任务的 pushes.jsonl")
     p.add_argument("--wt", required=True, help="集成 worktree 路径")
     p.add_argument("--target", required=True, help="上游分支，如 main、release/1.2")
     p.add_argument("--remote", default="origin", help="远端名，默认 origin")
     p.add_argument("--slug", help="任务 slug：只在 <slug>/ 里找集成状态文件、推送记到这个任务；不传就按 worktree 路径在全部任务里找"
                                   "集成状态，再按分支名 task/<slug>… 归属，都定不了就不推")
-    p.add_argument("--dry-run", action="store_true", help="只列出要执行的步骤")
+    p.add_argument("--unchecked", metavar="理由",
+                   help="没有整体检查覆盖要推的提交（没检查、没过、检查之后又改了代码，或者没有集成状态的 patch 模式）也推："
+                        "只在用户明确要跳过时用，理由和差在哪记进 pushes.jsonl")
+    p.add_argument("--dry-run", action="store_true", help="只列出要执行的步骤（含按现在的 HEAD 核对整体检查的结果）")
 
     p = sub.add_parser("wrapup", help="收尾汇总的事实：每个仓库推到哪条分支哪个提交（含归档记录、子编排者）、远端核对、"
                                       "改动文件分类、新增配置键引用、整体检查、待清理的 worktree；--draft 写 wrapup.md 骨架",

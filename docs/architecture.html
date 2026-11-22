@@ -2062,8 +2062,10 @@ footer.end { margin-top: 64px; font-size: 13px; color: var(--muted); display: fl
       <li><strong>什么时候做</strong>：用户明确说了“提交推送”才做，编排者从主会话转达的原话里确认。</li>
       <li><strong>integrate 冲突</strong>：脚本停下并返回冲突文件。在集成 worktree 里解完 → <code>git add</code> → <code>cherry-pick --continue</code> → 再跑一次同样的 <code>integrate</code>。不 <code>--abort</code>；要放弃某个提交先写明理由。</li>
       <li><strong>整体检查</strong>：仓库基线本来就有失败的命令（全量测试、lint）放 <code>--verify-baseline</code>，脚本自动和上游比失败条目，只看有没有新增。</li>
-      <li><strong>push 回写 base</strong>：rebase 后的新上游写回 <code>&lt;slug&gt;/integrate-&lt;仓库&gt;.json</code>，补检查就用它当 <code>accept --base</code>。rebase 冲突是人工解的，下一次 push 会先停一次。</li>
-      <li><strong>推送成功的标准</strong>：<code>ls-remote</code> 核对后 <code>verified: true</code>。rebase 记录在集成状态 <code>integrate-&lt;仓库&gt;.json</code> 里。</li>
+      <li><strong>只摘条目自己的提交</strong>：<code>wt</code> 建条目 worktree 时记下起点，<code>integrate</code> 只摘起点之后的；起点带着目标分支没有的提交（条目从别的分支起、主检出有没推的本地提交）就停下列出来，交你定换目标还是 <code>--carry-base</code> 带上。集成 worktree 每个（仓库，目标分支）一个，推第二条分支另建一个；复用时没有没推的提交就先快进到最新上游。</li>
+      <li><strong>只推检查过的</strong>：<code>accept --integration</code> 把检查的提交和过没过记进集成状态，<code>push</code> 推之前核对：没检查、没过、检查之后又改了代码都不推（之后只改了文档的照推），你明确说跳过才带 <code>--unchecked "&lt;理由&gt;"</code>，理由记进推送账本。</li>
+      <li><strong>push 回写 base</strong>：rebase 后的新上游写回集成状态 <code>&lt;slug&gt;/integrate-&lt;仓库&gt;@&lt;目标&gt;.json</code>，补检查就用它当 <code>accept --base</code>。rebase 改了代码、或冲突是人工解的，不补检查 push 不推。</li>
+      <li><strong>推送成功的标准</strong>：按完整引用名 <code>ls-remote</code> 核对后 <code>verified: true</code>。rebase 记录在集成状态里。</li>
       <li><strong>推送账本</strong>：每次推上去都记一行进任务的 <code>&lt;slug&gt;/pushes.jsonl</code>（目标分支、推到的远端地址、本地分支、推送前的远端头、远端提交、范围、提交列表、时间、核对过没有），没走集成状态的也记。收尾汇总的“提交”一节、新一轮从哪起、清理时核对什么，都按它来；仓库换了托管地址以后，推到旧地址的那几次不拿来核实新一轮的起点。定不了是哪个任务的就不推，提示加 <code>--slug</code>。</li>
       <li><strong>新一轮的起点</strong>：任务推过之后接着改，<code>wt</code> / <code>integrate</code> 默认从上一轮推的那条远端分支（fetch 到最新）起，不从主检出所在的分支起；建之前先核实上一轮推上去的提交都在起点里（同一条分支看祖先，换了分支按补丁内容比）。不在（比如换到了新的 release 分支）就不建，列出缺的提交，交你定：<code>--carry "&lt;理由&gt;"</code> 带上这些提交在新分支上起，或者 <code>--base</code> 回到上一轮的分支接着改。</li>
       <li><strong>推完不自动删</strong>：worktree、分支等你说“清理”或“收尾”时，编排者跑 <code>drover cleanup</code>：逐个核实里面的 worker 没在干活、提交和没提交的改动都在这个任务推过的远端分支的历史里（推上去之后又被后来的轮次改过也算），全过才删 worktree、本地分支、关掉 worker；核实不过的不动，写明原因来问你。主检出永远不动。探测、调研用的 worktree 不交付改动，报告记下就删，改过的代码先存成 patch 放进任务目录。</li>

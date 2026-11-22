@@ -40,7 +40,7 @@ class WrapupCase(IntegrationCase):
         return self.drover_json("wrapup", "--slug", slug or self.SLUG, *extra, rc=rc)
 
     def ship(self, target: str, *items: str, slug: str = "", branch: str = "") -> Path:
-        """integrate 这些条目到 origin/<target>，再 push（核对过），返回集成 worktree。"""
+        """integrate 这些条目到 origin/<target>，整体检查，再 push（核对过），返回集成 worktree。"""
         args = ["integrate", "--repo", self.REPO, "--slug", slug or self.SLUG, "--target", target]
         if branch:
             args += ["--branch", branch]
@@ -48,6 +48,7 @@ class WrapupCase(IntegrationCase):
             args += ["--from", b]
         res = self.drover_json(*args)
         wt = Path(res["worktree_path"])
+        self.check(wt)
         pushed = self.drover_json("push", "--wt", str(wt), "--target", target)
         self.assertTrue(pushed["pushed"] and pushed["verified"], pushed)
         return wt
@@ -66,11 +67,11 @@ class WrapupCase(IntegrationCase):
 
 class WrapupTests(WrapupCase):
     def test_two_records_same_repo_two_lines(self) -> None:
-        """同一仓库推两条分支：上一份集成记录改名归档 → 两行（不同 upstream），各自的 last_push；远端核对都是 true"""
+        """同一仓库推两条分支：集成状态按目标分支各一份（integrate-shop@release.json / @main.json），不用改名归档 → 两行
+        （不同 upstream），各自的 last_push；远端核对都是 true"""
         self.git(self.src, "push", "-q", "origin", "main:release")
         a = self.item("a", {"app/a.py": "A = 1\n"})
         rel_wt = self.ship("release", a, branch="task/s1-release")
-        (self.state / "s1" / "integrate-shop.json").rename(self.state / "s1" / "integrate-shop-release.json")
         self.upstream_commit("upstream docs", {"docs/x.md": "x\n"})
         main_wt = self.ship("main", a)
         res = self.wrapup()
@@ -80,8 +81,8 @@ class WrapupTests(WrapupCase):
         lines = self.by_upstream(res)
         self.assertEqual(set(lines), {"origin/release", "origin/main"})
         rel, main = lines["origin/release"], lines["origin/main"]
-        self.assertEqual(Path(rel["state_file"]).name, "integrate-shop-release.json")
-        self.assertEqual(Path(main["state_file"]).name, "integrate-shop.json")
+        self.assertEqual(Path(rel["state_file"]).name, "integrate-shop@release.json")
+        self.assertEqual(Path(main["state_file"]).name, "integrate-shop@main.json")
         self.assertEqual((rel["target"], rel["branch"]), ("release", "task/s1-release"))
         self.assertEqual(rel["last_push"]["remote_sha"], self.head(rel_wt))
         self.assertEqual(rel["last_push"]["remote_sha"], self.remote_head_of("release"))
@@ -93,49 +94,60 @@ class WrapupTests(WrapupCase):
             self.assertIs(line["remote"]["contains"], True)
             self.assertEqual([f["path"] for f in line["files"]], ["app/a.py"])
         self.assertEqual(res["warnings"], [])
-        # 同一仓库同一 upstream 的集成记录有两份（归档时复制而不是改名）→ 合成一行，state_files 列出两份，推送只算一次
-        (self.state / "s1" / "integrate-shop-copy.json").write_text((self.state / "s1" / "integrate-shop.json").read_text())
+        # 同一仓库同一 upstream 的集成记录有两份（手工复制的归档）→ 合成一行，state_files 列出两份，推送只算一次
+        (self.state / "s1" / "integrate-shop-copy.json").write_text(self.state_file().read_text())
         dup = self.wrapup("--no-remote")
         self.assertEqual(len(dup["lines"]), 2)
         main_line = self.by_upstream(dup)["origin/main"]
         self.assertEqual(sorted(Path(f).name for f in main_line["state_files"]),
-                         ["integrate-shop-copy.json", "integrate-shop.json"])
+                         ["integrate-shop-copy.json", "integrate-shop@main.json"])
         self.assertEqual(len(main_line["pushes"]), 1)
 
     def test_rebuild_and_legacy_records_keep_pushes(self) -> None:
-        """一个仓库推两条分支、不改名归档：第二次 integrate 换了集成 worktree（状态重置），第一条的推送照样在（推送记录不挂在
-        集成状态上）→ 两行。旧代码记在集成状态里的 pushes：integrate 重建前转进 pushes.jsonl（带上旧的 upstream），不丢"""
+        """旧版本的集成状态（文件名不带目标分支 integrate-shop.json，推送记在它的 pushes 里）：wrapup 照样读出那次推送；
+        集成另一条分支另起一份状态、不动它 → 两行；同一目标换了集成 worktree（--branch 重建）时，旧推送先转进 pushes.jsonl
+        （带上旧的 upstream 和来源文件），不丢"""
         self.git(self.src, "push", "-q", "origin", "main:release")
         a = self.item("a", {"app/a.py": "A = 1\n"})
         rel_wt = self.ship("release", a, branch="task/s1-release")
         records = self.state / "s1" / "pushes.jsonl"
         release_push = json.loads(records.read_text().splitlines()[0])
-        # 假装这次推送是旧代码记的：只记在集成状态里
+        # 假装这次推送是旧代码记的：状态文件用旧名字、推送只记在集成状态里
         records.unlink()
-        state = self.load_state()
+        legacy = self.state / "s1" / "integrate-shop.json"
+        state = self.load_state("release")
         state["pushes"] = [{k: release_push[k] for k in ("at", "range", "commits", "remote_sha", "verified")}]
-        self.state_file().write_text(json.dumps(state))
+        legacy.write_text(json.dumps(state))
+        self.state_file("release").unlink()
         self.assertEqual(len(self.wrapup("--no-remote")["lines"]), 1)
         self.upstream_commit("upstream docs", {"docs/x.md": "x\n"})
         main_wt = self.ship("main", a)
-        self.assertNotIn("pushes", self.load_state())
-        migrated = [json.loads(x) for x in records.read_text().splitlines()]
-        self.assertEqual([(p["upstream"], p.get("source")) for p in migrated],
-                         [("origin/release", "integrate-shop.json"), ("origin/main", None)])
+        self.assertIn("pushes", json.loads(legacy.read_text()))
         lines = self.by_upstream(self.wrapup())
         self.assertEqual(set(lines), {"origin/release", "origin/main"})
         self.assertEqual(lines["origin/release"]["last_push"]["remote_sha"], self.head(rel_wt))
         self.assertEqual(lines["origin/main"]["last_push"]["remote_sha"], self.head(main_wt))
-        self.assertIsNone(lines["origin/release"]["state_file"])
+        self.assertEqual(Path(lines["origin/release"]["state_file"]), legacy)
         self.assertIs(lines["origin/release"]["remote"]["contains"], True)
+        rebuilt = self.drover_json("integrate", "--repo", self.REPO, "--slug", self.SLUG, "--target", "release",
+                                   "--branch", "task/s1-release2", "--from", a)
+        self.assertEqual(Path(rebuilt["state_file"]), legacy)
+        self.assertNotIn("pushes", json.loads(legacy.read_text()))
+        migrated = [json.loads(x) for x in records.read_text().splitlines()]
+        self.assertEqual([(p["upstream"], p.get("source")) for p in migrated],
+                         [("origin/main", None), ("origin/release", "integrate-shop.json")])
+        self.assertEqual(self.by_upstream(self.wrapup("--no-remote"))["origin/release"]["last_push"]["remote_sha"],
+                         self.head(rel_wt))
 
     def test_patch_mode_pushes_listed(self) -> None:
-        """patch 模式（集成 worktree 是 wt 建的、没有集成状态文件）的推送也列出来：一行，分支是推送时的本地分支，
-        改动文件按推送范围取，远端核对照做；骨架的提交表有这一行，不用手写"""
+        """patch 模式（集成 worktree 是 wt 建的、没有集成状态文件）的推送（带 --unchecked）也列出来：一行，分支是推送时的
+        本地分支，改动文件按推送范围取，远端核对照做；骨架的提交表有这一行，不用手写；没有整体检查覆盖它，warnings 带上
+        --unchecked 的理由"""
         wt = Path(self.drover_json("wt", "--repo", str(self.src), "--branch", "task/s1-r1", "--label", "shop:s1-r1",
                                    "--base", "origin/main")["worktree_path"])
         sha = self.commit(wt, "patch round", {"app/p.py": "P = 1\n"})
-        self.assertTrue(self.drover_json("push", "--wt", str(wt), "--target", "main")["verified"])
+        self.assertTrue(self.drover_json("push", "--wt", str(wt), "--target", "main",
+                                         "--unchecked", "patch 模式")["verified"])
         self.assertFalse(list((self.state / "s1").glob("integrate-*.json")))
         draft = self.tmp / "wrapup.md"
         res = self.wrapup("--draft", str(draft))
@@ -147,6 +159,7 @@ class WrapupTests(WrapupCase):
         self.assertEqual([f["path"] for f in line["files"]], ["app/p.py"])
         self.assertIs(line["remote"]["contains"], True)
         self.assertFalse(any("推送记录" in w for w in res["warnings"]), res["warnings"])
+        self.assertTrue(any("没有整体检查覆盖" in w and "patch 模式" in w for w in res["warnings"]), res["warnings"])
         self.assertIn(f"| shop | main | {sha[:9]} |", draft.read_text())
 
     def test_child_orchestrator_records_included(self) -> None:
@@ -321,6 +334,46 @@ class WrapupTests(WrapupCase):
         self.assertEqual(wts["task/s1-extra"]["dirty_count"], 1)
         self.assertEqual({b["branch"]: b["matched_by"] for b in res["branches"]}, {a: "record"})
         self.assertTrue(any("未提交的改动" in w for w in res["warnings"]))
+
+    def test_unpushed_item_commits_listed(self) -> None:
+        """条目 a 集成并推了；条目 b 提交了但没集成、没推 → "没推送的"不再写"无"：列出 b 上没推上去的提交（不联网，按推送
+        记录里推上去的提交核对，从起点算起），warnings 也有；a 的提交是挑过去的（提交号不同、补丁相同）不算"""
+        a = self.item("a", {"app/a.py": "A = 1\n"})
+        self.upstream_commit("upstream docs", {"docs/x.md": "x\n"})
+        self.ship("main", a)
+        b = self.item("b", {"app/b.py": "B = 1\n"})
+        draft = self.tmp / "wrapup.md"
+        res = self.wrapup("--no-remote", "--draft", str(draft))
+        self.assertEqual([(u["branch"], [c["subject"] for c in u["commits"]]) for u in res["unpushed_items"]],
+                         [(b, ["item b"])])
+        line = [x for x in draft.read_text().splitlines() if x.startswith("- 没推送的")][0]
+        self.assertIn(b, line)
+        self.assertIn("item b", line)
+        self.assertNotIn("无（", line)
+        self.assertTrue(any(b in w and "没推上去" in w for w in res["warnings"]), res["warnings"])
+
+    def test_check_coverage_of_pushes(self) -> None:
+        """整体检查覆盖推上去的提交：push 记下的检查和存档的 head 都对得上 → 骨架的检查行写"覆盖推到 origin/main 的 <sha>"；
+        之后又带 --unchecked 推了一次 → 那次推送没有检查覆盖，warnings 和骨架都写明，带上理由"""
+        a = self.item("a", {"app/a.py": "A = 1\n"})
+        wt = self.ship("main", a)
+        first = self.head(wt)
+        draft = self.tmp / "wrapup.md"
+        res = self.wrapup("--no-remote", "--draft", str(draft))
+        self.assertEqual(res["checks"][0]["covers"], [f"origin/main {first[:9]}"])
+        self.assertIn(f"覆盖推到 origin/main 的 {first[:9]}", draft.read_text())
+        self.assertFalse(any("没有整体检查覆盖" in w for w in res["warnings"]), res["warnings"])
+        b = self.item("b", {"app/b.py": "B = 1\n"})
+        self.integrate(a, b)
+        self.assertTrue(self.push(wt, "--unchecked", "用户要先上线、检查之后补")["verified"])
+        second = self.head(wt)
+        res2 = self.wrapup("--no-remote", "--draft", str(draft), "--force")
+        self.assertTrue(any("没有整体检查覆盖" in w and second[:9] in w and "用户要先上线" in w
+                            for w in res2["warnings"]), res2["warnings"])
+        text = draft.read_text()
+        self.assertIn(f"{second[:9]}（--unchecked：用户要先上线、检查之后补）", text)
+        self.assertIn(f"覆盖推到 origin/main 的 {first[:9]}", text)
+        self.assertEqual(res2["checks"][0]["covers"], [f"origin/main {first[:9]}"])
 
 
 if __name__ == "__main__":

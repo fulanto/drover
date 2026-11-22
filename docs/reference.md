@@ -28,9 +28,9 @@
 | `agent-start` | 在 pane 里启动 claude / codex worker，自动处理启动弹窗：新目录的信任弹窗、Claude Code 对 `--add-dir` 加进来的目录弹的 "Adding a new directory" 信任框（光标默认在 "No, exit"，移到 "Yes, add it" 再确认）、codex 的升级提示。模型和 effort：`--model` / `--effort` > 任务 `orch.json` 记的（宿主和编排者相同才继承）> config > 内置默认（claude `opus[1m]` + xhigh；codex xhigh、不传模型）；claude 传 `--model`，codex 传 `-m` | 编排者 |
 | `brief` | 按模板生成任务书（必填完成证据），可先摸底，`--send` 生成后立刻发出（和 `prompt` 一样看到开工就返回）。`--evidence-cmd` 紧跟在它所属的 `--evidence` 后面，给这条证据配验收时重跑的命令，证据清单写进 `<slug>/<agent>.evidence.json`；状态文件拿锁追加（几个同时跑不丢段）；同一个 agent 再生成时上一轮的任务书、报告、摸底挪成 `.rN`。模板里限了篇幅：摸底只写结论和证据位置，"和代码不符""需要决策"两部分写全、其余 100 行左右；报告每条 verification 一行（命令 → 汇总行 → heavy 流水号）、尽量 60 行内，worker 在对话里只回复报告路径和 status | 编排者 |
 | `accept` | 验收：标记新文件、建图、改动分析、diff 概览、crapper 查这次改动碰到的函数的圈复杂度、重跑验证命令（认得出 vitest / pytest / mvn 的输出时，退出码 0 却一个测试都没跑也判不通过；每条给 通过 / 失败 / 跳过 三个数）；`--verify-baseline` 和基线比失败条目（基线上只重跑失败的文件；解析不全、提前停了、基线不可信都按失败），`--integration` 是集成检查（不建图、不跑 crapper，dryer 扫全仓、只留碰到改动的重复），`--no-graph` 只是不建图。建图、dryer 和验证命令都经 heavy 调度；多条验证默认同时交给调度（能同时跑的同时跑，结果按传入顺序），前后有依赖的加 `--serial` 逐条跑。`--slug --name <agent>`：带命令的证据自动当 verify 跑，`evidence` 给每条证据的结论和"证据 N 条 / 有命令 M 条 / 通过 K 条 / 只能看自述 X 条"，默认存 `<slug>/accept-<agent>.json`。结果里另有 `worker_runs`（这个 worktree 的 heavy 流水：在现在的代码上通过过的、先失败后通过的）和改动指纹（review 核对用） | 编排者 |
-| `integrate` | 集成 worktree：从最新上游建（或复用），依次 cherry-pick 条目分支，装依赖。新建时和 `wt` 一样核实起点含上一轮推的提交（`--from` 的条目分支里已有的不算缺），`--carry` 同 `wt`；重建集成 worktree 不丢推送记录 | 编排者 |
-| `push` | 集成 worktree 推送：上游有新提交就 rebase 并报告（这次不推），否则推送并 `ls-remote` 核对；每次推上去都记进任务的 `pushes.jsonl`（有没有集成状态都记；记下 remote 名和推送时的地址 `remote_url`，返回里也有），定不了任务就不推、提示加 `--slug` | 编排者 |
-| `wrapup` | 收尾汇总的事实收集，不改仓库和任务记录：每个仓库每条分支的推送记录（`pushes.jsonl` 和旧任务的 `integrate-*.json`，patch 模式的也在）和远端核对（最后一次推到的是 remote 换地址之前的仓库时不核对，写明两个地址）、推送范围里的迁移 / 配置 / 部署 / 依赖文件和新增配置键线索、整体检查结果、待清理的 worktree 和分支（子编排者的一起收）；`--draft <文件>` 生成 wrapup.md 骨架（只写这一个文件，写成了在时间线记一条收尾汇总） | 编排者 |
+| `integrate` | 集成 worktree：每个（仓库，目标分支）一个（第二条目标分支自动另建 `task/<slug>-<目标>`，指到别的目标的 worktree 拒绝复用），从最新上游建，复用时没有没推的提交就先快进到最新上游；只摘条目分支起点（`wt` 记在 `starts.jsonl`）之后的提交，起点带着目标分支没有的提交时停下列出来（`--carry-base` 带上），没有起点记录的旧条目照旧摘、给提示；"已应用"按 HEAD 核实（abort 过的冲突重摘、单列 `abandoned`，补丁比较保留空白），装依赖。新建时和 `wt` 一样核实起点含上一轮推的提交（`--from` 的条目分支里已有的不算缺），`--carry` 同 `wt`；目标分支远端还没有时要 `--create-from <远端>/<源分支>`；重建集成 worktree 不丢推送记录 | 编排者 |
+| `push` | 集成 worktree 推送：上游有新提交就 rebase 并报告（这次不推）；否则核对整体检查（`accept --integration` 记进集成状态的结论：通过，检查的就是要推的内容，或者只差文档），对上了才推送并按完整引用名 `ls-remote` 核对，没检查 / 没过 / 检查之后又改了都不推，`--unchecked "<理由>"` 才推；集成状态记的目标不是这次的就不推；每次推上去都记进任务的 `pushes.jsonl`（记下 remote 名和推送时的地址 `remote_url`、覆盖它的检查或 `--unchecked` 的理由，返回里也有），定不了任务就不推、提示加 `--slug` | 编排者 |
+| `wrapup` | 收尾汇总的事实收集，不改仓库和任务记录：每个仓库每条分支的推送记录（`pushes.jsonl` 和旧任务的 `integrate-*.json`，patch 模式的也在）和远端核对（最后一次推到的是 remote 换地址之前的仓库时不核对，写明两个地址）、推送范围里的迁移 / 配置 / 部署 / 依赖文件和新增配置键线索、整体检查结果（每份覆盖了哪次推送，没被检查覆盖的推送单列）、条目分支上没推上去的提交、待清理的 worktree 和分支（子编排者的一起收）；`--draft <文件>` 生成 wrapup.md 骨架（只写这一个文件，写成了在时间线记一条收尾汇总） | 编排者 |
 | `cleanup` | 用户说"清理"或"收尾"时清任务的 worktree 和分支：`--slug` 全部（含没有 worktree 的同类本地分支），`--wt` 只清指定的。逐个核实没有进行中的 git 操作、里面的 agent 不在 working / blocked、已提交的和没提交的改动都在这个任务推过的远端分支（的历史）里（先 fetch；推上去之后又被后来的轮次改过也算，内容在远端历史里就丢不了；集成时手工解过冲突、推上去的树里上下文变了的，按文件三方合并判"已包含"，冲突块先按行核、两边都改过的行再按词核；比 worktree 现有内容还旧的推送不拿来核对，三方合并的起点是没核实过的内容开始之前，所以撤回以前推过的改动、推上去之后又删掉的行、我们删掉 / 换掉而远端还留着的行都不算在远端；可执行位变化算改动；有内嵌 git 仓库（子目录自己有 `.git`）核实不了、不删，`--probe` 也不存不删），全过才 `herdr worktree remove`（有没提交改动的加 `--force`；workspace 没开用 `git worktree remove`）再删本地分支，核实不过的不动、列原因。`--target <远端>/<分支>` 给推送没落盘的老任务补核对分支；`--probe`（配 `--wt`）探测 worktree 先把本地独有的提交和改动存成 patch 到任务目录再删；`--dry-run` 只列结论。主检出永远不动 | 编排者 |
 | `review` | 复审一条命令：按模板生成 prompt、分屏启动只读 codex、立刻发出。`--model` 指定 codex 的模型（`-m`），不传时用任务 `orch.json` 记的（编排者是 codex 才有，effort 也一样继承），再不传用 `~/.codex/config.toml` 的。验收存档按复审者名找（`<agent>-rev` → `<slug>/accept-<agent>.json`，没有再用旧的 `accept.json`；`--accept-json` 可指定），worktree、HEAD、改动指纹和现在的对不上就拒绝 | 编排者（带 `--review` 时） |
 | `collect` | 复审结束后存档输出原文、关闭复审 pane | 编排者 |
@@ -165,10 +165,11 @@ drover/
 │   ├── accept.json                  # 旧文档的条目验收存档路径（几个条目会互相覆盖，review 找不到 accept-<agent>.json 时才用）
 │   ├── <agent>-rev.prompt.md        # 复审的 prompt（带 --review 时）
 │   ├── <agent>-rev.result.md        # 复审输出原文
-│   ├── integrate-<仓库>.json         # 集成状态：base、已 cherry-pick 的提交、rebase 记录（旧任务的推送记录也在这里）
+│   ├── integrate-<仓库>@<目标>.json  # 集成状态，每个（仓库，目标分支）一份（目标里的 / 换成 ~）：集成分支和 worktree、base、已 cherry-pick 的提交（摘之前的 HEAD）、rebase 记录、整体检查结论 check（push 按它核对）、新建远程分支的 create_from。旧版本的 integrate-<仓库>.json 按里面记的目标照用（旧任务的推送记录也在这里）
 │   ├── accept-integrate-<仓库>.json  # 集成后整体检查的存档
-│   ├── pushes.jsonl                 # 推送记录：每次 drover push 推上去追加一行（目标分支、远端名和推送时的地址、本地分支、远端提交、范围、提交、时间、核对过没有）
-│   ├── carry.jsonl                  # wt / integrate --carry 带上上一轮提交的记录：理由、起点、带上的提交
+│   ├── pushes.jsonl                 # 推送记录：每次 drover push 推上去追加一行（目标分支、远端名和推送时的地址、本地分支、远端提交、范围、提交、时间、核对过没有；覆盖它的整体检查 check，或 --unchecked 的理由和差在哪）
+│   ├── starts.jsonl                 # wt 新建条目 worktree 时的起点（--carry 之前的 HEAD）：integrate 只摘起点之后的提交
+│   ├── carry.jsonl                  # wt / integrate --carry 带上上一轮提交、integrate --carry-base 带上起点带着的提交（kind: base）的记录：理由、起点、带上的提交
 │   ├── probe-<分支>-<时间>.*.patch   # cleanup --probe 删探测 worktree 前存的 patch（commits：本地独有的提交；worktree：没提交的改动）
 │   └── wrapup.md                    # 收尾汇总：变更、提交、数据库、配置、上线、清理（说"收尾"时写）
 ├── locks/heavy/                     # heavy 调度（构建 / 测试命令按资源排队）：sched.lock（读改调度状态时的锁）、

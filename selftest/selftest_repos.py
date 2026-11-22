@@ -43,13 +43,31 @@ class IntegrationCase(DroverTestCase):
         self.git(self.up, "push", "-q", "origin", "main")
         return sha
 
-    def item(self, name: str, files: dict) -> str:
-        """在源仓库从 main 拉条目分支 task/s1-<名字>、提交（说明 "item <名字>"），切回 main，返回分支名。"""
+    def item(self, name: str, files: dict, record: bool = True) -> str:
+        """在源仓库从 main 拉条目分支 task/s1-<名字>、提交（说明 "item <名字>"），切回 main，返回分支名。
+        record：像 wt 建条目 worktree 那样把起点记进任务目录的 starts.jsonl（integrate 只摘起点之后的提交）；
+        False 模拟旧版 drover 建的、没有起点记录的条目。"""
         branch = f"task/{self.SLUG}-{name}"
+        if record:
+            start = {"repo": str(self.src), "branch": branch, "start": self.git(self.src, "rev-parse", "main")}
+            path = self.state / self.SLUG / "starts.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a") as f:
+                f.write(json.dumps(start) + "\n")
         self.git(self.src, "checkout", "-q", "-b", branch, "main")
         self.commit(self.src, f"item {name}", files)
         self.git(self.src, "checkout", "-q", "main")
         return branch
+
+    def check(self, wt: Path, *verify: str, rc: int = 0) -> dict:
+        """整体检查：accept --integration（默认 --verify "pytest -q"：假 pytest 打 10 passed），存档放任务目录的
+        accept-integrate-shop.json；结论记进这个集成 worktree 的集成状态（push 按它核对）。不跑 dryer。"""
+        save = self.state / self.SLUG / f"accept-integrate-{self.REPO}.json"
+        cmds = verify or ("pytest -q",)
+        args = ["accept", "--wt", str(wt), "--base", "HEAD", "--integration", "--brief", "--save", str(save)]
+        for c in cmds:
+            args += ["--verify", c]
+        return self.drover_json(*args, rc=rc, env={"DROVER_QUALITY_TOOLS": "0"})
 
     def integrate(self, *branches: str, rc: int = 0, extra: tuple = ()) -> dict:
         args = ["integrate", "--repo", self.REPO, "--slug", self.SLUG, "--target", "main", *extra]
@@ -85,11 +103,12 @@ class IntegrationCase(DroverTestCase):
         log = self.fakebin / "fake-ssh-calls.log"
         return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
 
-    def state_file(self) -> Path:
-        return self.state / self.SLUG / f"integrate-{self.REPO}.json"
+    def state_file(self, target: str = "main") -> Path:
+        """（仓库，目标分支）的集成状态文件 integrate-<仓库>@<目标>.json（目标里的 / 换成 ~）。"""
+        return self.state / self.SLUG / f"integrate-{self.REPO}@{target.replace('/', '~')}.json"
 
-    def load_state(self) -> dict:
-        return json.loads(self.state_file().read_text())
+    def load_state(self, target: str = "main") -> dict:
+        return json.loads(self.state_file(target).read_text())
 
     def records_file(self) -> Path:
         """任务的推送记录（push 每推一次追加一行）。"""
