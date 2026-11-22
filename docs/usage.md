@@ -56,6 +56,7 @@ claude                         # 或者：codex login，再 codex -s danger-full
 | `--orch claude\|codex` | 编排者用哪个宿主 | 主会话的宿主 |
 | `--review` | 验收通过后让 codex 做一次 code review（流程里叫"复审"），High / Medium 问题交回 worker 修一轮 | 不复审 |
 | `--effort <level>` | worker 的推理强度。claude：low / medium / high / xhigh / max；codex 多一个 ultra | xhigh（`config.json` 的 `claude_effort` / `codex_effort` 可改，[配置](configuration.md)） |
+| `--model <完整模型 ID>` | 这个任务的模型（如 `claude-fable-5-2`）：编排者用它起，同宿主的 worker 和子编排者继承，别的任务不受影响；`--agent` 和编排者宿主不同时只给 worker。写完整 ID，别名（`fable`、`opus`）会被本机设置改指 | `config.json` 的 `claude_model`（`opus[1m]`）；codex 不传，用 `~/.codex/config.toml` 的 |
 | `--name <分支>` | 指定 worktree 分支名 | `task/<slug>` |
 
 例子：

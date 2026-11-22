@@ -19,9 +19,9 @@
 | `playbook_dirs` | 个人覆盖目录列表，布局和 profile 一样，排在团队 profile 之后读（后读的优先）。install 没有对应参数，手动编辑 | `[]` |
 | `default_coding_rules` | 包默认的编码规范（`flow/coding-rules.md`）追加不追加进 worker 任务书，排在团队 profile、个人覆盖的编码规范前面。它分三部分：通用原则（改编自 Robert C. Martin 的 ub-mode：先定数据结构、改行为先写失败的测试、修根因不加兜底、测行为不测实现等，总带）、MySQL 建表的命名 / 注释 / 默认值 / 索引名前缀（仓库里有 `.sql` 文件或依赖里有 mysql / mariadb 时才带）、Java 的 import 和不用内部类（仓库根目录有 `pom.xml` / `build.gradle` 时才带），每条只在改到相关代码时适用。`false` 时整份不追加，团队 profile、个人覆盖、`~/.claude/CLAUDE.md` 的照旧；只管这一份编码规范，worker 不执行迁移、数据库写操作升级给用户这些安全和流程规则不跟着关。install 没有对应参数，手动编辑 | 没有这个键 = 开 |
 | `oncall` | 接不接飞书 oncall（[飞书 oncall](oncall.md)，选装）。`true` 时 install 装插件、写 `drover.env`；`false` 时不装（已经装上的插件不卸）。`install.py --oncall` 写 `true`，`--no-oncall` 写 `false` | 没有这个键 = 没选过：以前已经接上的（安装记录里有、或者 herdr 里装着插件）照旧接，其余不接 |
-| `claude_model` | Claude Code 编排者和 worker 的模型（`claude --model` 的值）。账号没有 1M 上下文档位、`opus[1m]` 起不来时改成 `opus` 等 | `opus[1m]` |
+| `claude_model` | Claude Code 编排者和 worker 的模型（`claude --model` 的值）。账号没有 1M 上下文档位、`opus[1m]` 起不来时改成 `opus` 等。只给一个任务换模型不用改它：派发时写 `--model <完整模型 ID>`（如 `/drover --model claude-fable-5-2 @仓库 …`），这个任务的编排者用它起、记进 `orch.json`，同宿主的 worker 和子编排者继承，别的任务不受影响（codex 编排者时传 `-m`，codex worker 和复审继承）。写完整 ID，不写别名：`fable`、`opus` 这类别名会被本机设置改指（`~/.claude/settings.json` 的 `env` 里 `ANTHROPIC_DEFAULT_FABLE_MODEL` 这类变量，写别名不保证是哪个模型） | `opus[1m]` |
 | `claude_effort` | Claude Code 编排者和 worker 的 effort（`claude --effort`：low / medium / high / xhigh / max）。派发时写了 `--effort` 以那个为准 | `xhigh` |
-| `codex_effort` | Codex 编排者、worker 和复审的 effort（`-c model_reasoning_effort=…`，比 claude 多一个 ultra）。派发时写了 `--effort` 以那个为准；codex 的模型不传，用 `~/.codex/config.toml` 的默认 | `xhigh` |
+| `codex_effort` | Codex 编排者、worker 和复审的 effort（`-c model_reasoning_effort=…`，比 claude 多一个 ultra）。派发时写了 `--effort` 以那个为准；codex 的模型没指定就不传（`--model` 见上一行），用 `~/.codex/config.toml` 的默认 | `xhigh` |
 | `auto_update` | [自动更新](auto-update.md)。`false` 时这台机器不自动更新（手动 `drover update` 照常）；环境变量 `DROVER_AUTO_UPDATE=0` 也能关。install 没有对应参数，手动编辑 | 没有这个键 = 开 |
 | `quality_tools` | [验收工具](quality-tools.md) crapper、dryer。`false` 时 install 不装、`--check` 不查，验收时两步都不跑（已经装的不卸）；环境变量 `DROVER_QUALITY_TOOLS=0` 也能关。install 没有对应参数，手动编辑 | 没有这个键 = 开 |
 | `auto_update_minutes` | 自动更新多久查一次（分钟），离上次尝试满这么久才查 | 30 |
@@ -37,7 +37,7 @@
 
 **改了配置要不要重装？**
 
-- 只改 `repo_dirs`：不用重装。drover CLI 每次执行都会重新读配置，下一条命令就生效。可以直接编辑文件，也可以 `python3 install.py --repo-dir <目录> [--repo-dir <目录>]...`：只改这个键，改之前先备份。`auto_update`、`auto_update_minutes`、`update_channel`、`heavy_*` 同样下一条命令就生效（已经在跑的 `watch --main`、`board --live`、在排队的 `heavy` 用的是启动时读到的配置，重开后才认）。`claude_model`、`claude_effort`、`codex_effort` 从下一个起的编排者、worker、复审开始用，已经起来的不变。
+- 只改 `repo_dirs`：不用重装。drover CLI 每次执行都会重新读配置，下一条命令就生效。可以直接编辑文件，也可以 `python3 install.py --repo-dir <目录> [--repo-dir <目录>]...`：只改这个键，改之前先备份。`auto_update`、`auto_update_minutes`、`update_channel`、`heavy_*` 同样下一条命令就生效（已经在跑的 `watch --main`、`board --live`、在排队的 `heavy` 用的是启动时读到的配置，重开后才认）。`claude_model`、`claude_effort`、`codex_effort` 从下一个起的编排者、worker、复审开始用，已经起来的不变；所有任务都跟着换，只想换一个任务的用派发时的 `--model` / `--effort`（任务 `orch.json` 记的优先于 config）。
 - 改 `profile` / `playbook_dirs` / `default_coding_rules`：也不用重装，下一条命令就生效（已经发出去的任务书不变）。`python3 install.py --profile <名字|目录>` 只改 `profile` 这个键（改之前先备份，解析不到目录时直接报错、不写），`--profile none` 去掉它。
 - 改 `workspace`：要重跑 `python3 install.py --workspace <新目录>`。路由区块、`CLAUDE.md` 和 `.claude/settings.local.json` 都写在主工作台里，新目录里要有这些；以后也在新目录里开主会话。
   - 只传 `--workspace` 时 `repo_dirs` 保持原样，仓库目录也要变就一起传 `--repo-dir`。

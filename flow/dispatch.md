@@ -1,7 +1,7 @@
 ---
 allowed-tools: Bash, Agent, Skill, Read, Write, Edit, Glob, Grep, Monitor, TaskOutput, TaskStop, AskUserQuestion
 description: 以编排者（orchestrator）身份通过 Herdr 派发任务：分析任务与涉及仓库、一个条目一个 agent 一个 worktree 并行派发、追踪到有结果、在编排者的集成 worktree（每仓库一个）统一检查和推送
-argument-hint: "[--orch <slug>] @repo [@repo2 ...] 任务描述 [--agent claude|codex] [--effort xhigh] [--name 分支名] [--review] | status [slug] | resume <slug>"
+argument-hint: "[--orch <slug>] @repo [@repo2 ...] 任务描述 [--agent claude|codex] [--effort xhigh] [--model 完整模型ID] [--name 分支名] [--review] | status [slug] | resume <slug>"
 user-invocable: true
 ---
 
@@ -129,6 +129,7 @@ drover 是这套派发体系的名字，也是它的命令（Claude Code 的 `/d
 | `@xxx` | 首选仓库，可多个。可以是仓库名、相对路径、绝对路径、仓库内子路径 | 没有则从任务描述推断，推断不出问用户 |
 | `--agent claude\|codex` | agent 类型 | 主会话的宿主（orch-start 认出后记在 orch.json 的 `default_kind`；主会话直接编排时就是主会话自己） |
 | `--effort <level>` | claude: low/medium/high/xhigh/max；codex: low/medium/high/xhigh/max/ultra | 都是 xhigh（codex 不传会继承 config 的 ultra，太慢） |
+| `--model <完整模型 ID>` | 模型，原样传（claude `--model` / codex `-m`）。开场 prompt 写了本任务的模型时它已记在 orch.json，agent-start / review 不传就由同宿主的继承；没写（`--agent` 和你不同宿主，模型是给 worker 的）就给 agent-start 原样传 `--model` | config 的 `claude_model`（`opus[1m]`）；codex 不传 |
 | `--name <branch>` | worktree 分支名 | `task/<slug>` |
 | `--review` | 验收通过后让 codex 做 code review（下文叫"复审"，第 8 节） | 不做 |
 | `--orch <slug>` | 以编排者身份运行，slug 已由主会话定好（见"编排者模式"） | 不带时是主会话直接编排（旧方式，只用于收尾已经在主会话里进行的任务） |
@@ -261,15 +262,15 @@ slug：由你从任务描述生成，英文 kebab-case，≤ 30 字符，只含 
 agent 名：`[a-z][a-z0-9_-]{0,31}`，在 `herdr agent list` 中唯一。用 `<仓库名缩写>-<条目缩写>`（如 `web-login`、`web-admin`）；跨仓条目用 `task-<条目缩写>`。名字要给复审留出 `-rev` 后缀的长度。
 
 ```bash
-~/.drover/bin/drover agent-start --name <agent名> [--kind claude|codex] --pane <pane_id> --slug <slug> [--effort <level>] [--add-dir <其他 worktree 路径>]...
+~/.drover/bin/drover agent-start --name <agent名> [--kind claude|codex] --pane <pane_id> --slug <slug> [--effort <level>] [--model <完整模型 ID>] [--add-dir <其他 worktree 路径>]...
 ```
 
-`--kind` 只在用户写了 `--agent`、或第 6.2 节换 kind 时传；不传时脚本用 orch.json 的 `default_kind`（主会话的宿主），返回的 `kind_source` 说明用的是哪个（`explicit` / `orch` / `caller`）。原因：默认写死 claude 的话，主会话是 Codex 时派出去的编排者和 worker 仍是 Claude Code。
+`--kind` 只在用户写了 `--agent`、或第 6.2 节换 kind 时传；不传时脚本用 orch.json 的 `default_kind`（主会话的宿主），返回的 `kind_source` 说明用的是哪个（`explicit` / `orch` / `caller`）。原因：默认写死 claude 的话，主会话是 Codex 时派出去的编排者和 worker 仍是 Claude Code。`--model` / `--effort` 不传时继承 orch.json 记的任务默认（宿主和编排者相同才继承），再是 config、内置默认。
 
 脚本拼好的参数：
 
-- claude：`--model 'opus[1m]'`（最新 Opus + 1M 上下文）、`--effort`（默认 xhigh）、`--permission-mode acceptEdits`、`--name worker-<slug>`，并把 `~/.drover/<slug>` 和每个 `--add-dir` 加为可访问目录。
-- codex：`-a on-request -s workspace-write --no-daemon --no-alt-screen`，同样加目录，再加 `-c model_reasoning_effort=<level>`（默认 xhigh；不传会继承 `~/.codex/config.toml` 的 ultra，实测 worker 改两个文件花了 19 分钟）。`--no-daemon` 必须带：codex 0.157 起交互模式默认连共享后台 server，实测不带会直接报错退出。`--no-alt-screen` 让输出留在滚动缓冲区，`herdr agent read` 才读得到。
+- claude：`--model`（默认 `'opus[1m]'`：最新 Opus + 1M 上下文）、`--effort`（默认 xhigh）、`--permission-mode acceptEdits`、`--name worker-<slug>`，并把 `~/.drover/<slug>` 和每个 `--add-dir` 加为可访问目录。
+- codex：`-a on-request -s workspace-write --no-daemon --no-alt-screen`，同样加目录，指定了模型时加 `-m <模型>`，再加 `-c model_reasoning_effort=<level>`（默认 xhigh；不传会继承 `~/.codex/config.toml` 的 ultra，实测 worker 改两个文件花了 19 分钟）。`--no-daemon` 必须带：codex 0.157 起交互模式默认连共享后台 server，实测不带会直接报错退出。`--no-alt-screen` 让输出留在滚动缓冲区，`herdr agent read` 才读得到。
 
 脚本会自动处理启动时的已知弹窗，并在启动几秒后再确认一次 agent 还活着：
 

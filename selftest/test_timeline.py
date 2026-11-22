@@ -65,7 +65,7 @@ class CommandTimelineTests(TimelineCase):
         request = self.tmp / "request.md"
         request.write_text("# 请求\n\n标题：测试任务\n")
         return d.cmd_orch_start(argparse.Namespace(slug=slug, name=name, kind="claude", request_file=str(request), args=args,
-                                                   effort=None, parent=parent, dry_run=False))
+                                                   effort=None, model=None, parent=parent, dry_run=False))
 
     def test_orch_start_and_resume(self) -> None:
         """orch-start 派发 → start（name、kind、parent，at 是派发的时间）；--args "resume <slug>" → replace（换上的编排者），

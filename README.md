@@ -100,7 +100,7 @@ cd ~/.drover/src
 - **提交推送**：说"提交推送"，编排者在集成 worktree 里整体检查一次、同步上游再推；不说就不提交。
 - **收尾**：说"收尾"，编排者先出收尾汇总（变更、提交、数据库、配置、上线），再核实内容都在远端后清理 worktree 和分支。
 
-参数（`--agent`、`--orch`、`--review`、`--effort`）、看板、收尾的细节见 [docs/usage.md](docs/usage.md)。
+参数（`--agent`、`--orch`、`--review`、`--effort`、`--model`）、看板、收尾的细节见 [docs/usage.md](docs/usage.md)。
 
 ## 主要概念
 

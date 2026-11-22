@@ -13,7 +13,8 @@ JSON 对象，字段 ok 表示是否成功；失败时 error 字段说明原因�
   agent-start   在 pane 里启动 claude/codex agent（--kind 不给时用主会话的宿主），自动处理新目录的信任弹窗；
                 --split-from 在旁边新开 pane 再启动
   orch-start    为一个任务起编排者（orchestrator）：在 orch workspace 里新开 tab，启动 claude 或 codex（--kind，不给时跟调用方的宿主），
-                发出编排者开场 prompt；orch.json 记下主会话的宿主（default_kind），任务里的 worker 默认用它
+                发出编排者开场 prompt；orch.json 记下主会话的宿主（default_kind），任务里的 worker 默认用它；
+                --model / --effort 也记进 orch.json 当任务默认，同宿主的 worker、复审、子编排者不传时继承
   orch-status   列出编排者的 herdr 状态和 rollup 状态行（主会话一条命令看全部；Codex 主会话每轮开头查一次）；
                 按屏幕修正的状态放 screen_status，卡在确认框上的列进 blocked；needs_attention 只算主会话还没读过的 rollup
   brief         按模板生成任务 prompt（必填完成证据，写进状态文件）；--survey 先让 agent 摸底；--send 生成后立刻发出
@@ -2231,9 +2232,9 @@ def select_affirmative(name: str) -> bool:
 
 # codex 0.157 起交互模式默认连共享后台 server，本机配置下会直接报错退出，必须加 --no-daemon。
 CODEX_BASE_ARGS = ["--no-daemon", "--no-alt-screen"]
-# 编排者、worker、复审的模型和 effort：config.json 的 claude_model / claude_effort / codex_effort 可改（没有 1M 上下文
-# 档位的账号起不来 opus[1m]），没配就用下面的默认值；命令行的 --effort 优先于 config。codex 的模型不传，
-# 用 ~/.codex/config.toml 的默认。
+# 编排者、worker、复审的模型和 effort，优先级：命令行的 --model / --effort > 任务默认（orch.json 的 model / effort，
+# task_model）> config.json 的 claude_model / claude_effort / codex_effort（没有 1M 上下文档位的账号起不来 opus[1m]）
+# > 下面的默认值。codex 没指定模型就不传，用 ~/.codex/config.toml 的默认。
 CLAUDE_DEFAULT_MODEL = "opus[1m]"
 CLAUDE_DEFAULT_EFFORT = "xhigh"
 # codex 默认 effort 和 claude 对齐成 xhigh：不传时会继承 ~/.codex/config.toml 的 ultra
@@ -2241,13 +2242,26 @@ CLAUDE_DEFAULT_EFFORT = "xhigh"
 CODEX_DEFAULT_EFFORT = "xhigh"
 
 
-def claude_model_args(effort: Optional[str]) -> list:
-    return ["--model", CONFIG.get("claude_model") or CLAUDE_DEFAULT_MODEL,
+def claude_model_args(model: Optional[str], effort: Optional[str]) -> list:
+    return ["--model", model or CONFIG.get("claude_model") or CLAUDE_DEFAULT_MODEL,
             "--effort", effort or CONFIG.get("claude_effort") or CLAUDE_DEFAULT_EFFORT]
 
 
-def codex_effort_args(effort: Optional[str]) -> list:
-    return ["-c", f"model_reasoning_effort={effort or CONFIG.get('codex_effort') or CODEX_DEFAULT_EFFORT}"]
+def codex_model_args(model: Optional[str], effort: Optional[str]) -> list:
+    # `codex --help`、`codex resume --help` 都有 "-m, --model <MODEL>  Model the agent should use"。
+    return [*(["-m", model] if model else []),
+            "-c", f"model_reasoning_effort={effort or CONFIG.get('codex_effort') or CODEX_DEFAULT_EFFORT}"]
+
+
+def task_model(kind: str, model: Optional[str], effort: Optional[str], *slugs: Optional[str]) -> tuple:
+    """命令行给的 (model, effort)，没给的取任务默认：slugs 里第一份宿主是 kind、记了 model 或 effort 的 orch.json
+    （orch-start 时给的，或它继承来的）。宿主不同的不继承：模型 ID 只对一种宿主有效，两边的 effort 取值也不全一样。
+    orch-start 传自己和上层的 slug：换编排者（resume）沿用前任记的，子编排者继承上层的。"""
+    for slug in filter(None, slugs):
+        meta = read_json_dict(STATE_HOME / slug / "orch.json")
+        if meta.get("kind") == kind and (meta.get("model") or meta.get("effort")):
+            return model or meta.get("model"), effort or meta.get("effort")
+    return model, effort
 # agent start 刚返回时 herdr 可能还把一个马上要退出的进程看成 idle，等几秒再确认一次。
 STARTUP_SETTLE_SECONDS = 4
 # 新 pane 的 shell 还没就绪时（agent_pane_busy）的重试次数和间隔。
@@ -2376,15 +2390,16 @@ def cmd_agent_start(a: argparse.Namespace) -> dict:
         add_dirs.append(str(HEAVY_DIR))
         if not a.dry_run:
             HEAVY_DIR.mkdir(parents=True, exist_ok=True)
+    model, effort = task_model(kind, a.model, a.effort, a.slug)
     if kind == "claude":
-        args = [*claude_model_args(a.effort), "--permission-mode", "acceptEdits", "--name", f"worker-{a.slug}"]
+        args = [*claude_model_args(model, effort), "--permission-mode", "acceptEdits", "--name", f"worker-{a.slug}"]
         for d in add_dirs:
             args += ["--add-dir", d]
     else:
         args = ["-a", "on-request", "-s", "workspace-write", *CODEX_BASE_ARGS]
         for d in add_dirs:
             args += ["--add-dir", d]
-        args += codex_effort_args(a.effort)
+        args += codex_model_args(model, effort)
     if a.resume:
         # agent 意外退出后在同一个 pane 接着上次的会话：claude 加 --continue，codex 用 resume --last（选项照旧）。
         args = ["resume", "--last", *args] if kind == "codex" else [*args, "--continue"]
@@ -2436,7 +2451,7 @@ ORCH_KICKOFF = """你是任务 {slug} 的「编排者」（orchestrator），由
 2. {load_skill}
    参数里有 resume 时，是接手之前的编排者：先读 ~/.drover/{slug}/dispatch.md 和 rollup.md 恢复进度，按 dispatch.md「子模式」的 resume 接着做，不要从头分析。
 3. request.md 里的「目标」是主会话在第一条回复里给用户的复述（用户纠正过就是纠正后的），直接用它当这个任务的目标，不用再复述；每份 worker 任务书（brief --goal）和最终汇报都以它开头。读完代码发现用户要的改动行不通、或者目标本身理解错了，把证据写进 {rollup}，状态标「等你决定」后停下，不要自己改方向。request.md 里没有「目标」时，按 dispatch.md 第 1.1 节自己写一段，放进 rollup 的「当前进度」，照常往下走。
-4. 之后按 dispatch.md 的「编排者模式」一节运行：所有要用户确认或决定的事，以及阶段结论和最终汇报，都写进 {rollup}，写完就停下（结束这一轮），等主会话转达用户的答复。不要用向用户提问的工具（{ask_tool}），用户不看这个窗口。用户直接在这个窗口跟你说话时，可以直接回答。
+4. 之后按 dispatch.md 的「编排者模式」一节运行：所有要用户确认或决定的事，以及阶段结论和最终汇报，都写进 {rollup}，写完就停下（结束这一轮），等主会话转达用户的答复。不要用向用户提问的工具（{ask_tool}），用户不看这个窗口。用户直接在这个窗口跟你说话时，可以直接回答。{model_note}
 {host_notes}
 {routing}（CLAUDE.md 引用的就是它）的路由规则是给主会话用的，你忽略它。"""
 
@@ -2447,9 +2462,19 @@ ORCH_SUB_KICKOFF = """你是任务 {slug} 的「子编排者」，由上层编�
 2. {load_skill}
    参数里有 resume 时，是接手之前的子编排者：先读 ~/.drover/{slug}/dispatch.md 和 rollup.md 恢复进度，按 dispatch.md「子模式」的 resume 接着做，不要从头分析。
 3. request.md 里的「目标」是上层给你的目标（开头是用户的目标），直接用它，不用再复述；每份 worker 任务书（brief --goal）和最终汇报都以它开头。发现行不通或者和其他仓库的约定对不上，把证据写进 {rollup}，状态标「等你决定」后停下。
-4. 之后按 dispatch.md「编排者模式」里「子编排者」一节运行：要决定的事、阶段结论都写进 {rollup}，写完就停下，等上层编排者转达答复（上层读你的 rollup，用户和主会话不直接看）。整体检查通过后在 rollup 写「可以推送」并停下，等上层说「推送」再执行迁移和推送。不要用向用户提问的工具（{ask_tool}）。
+4. 之后按 dispatch.md「编排者模式」里「子编排者」一节运行：要决定的事、阶段结论都写进 {rollup}，写完就停下，等上层编排者转达答复（上层读你的 rollup，用户和主会话不直接看）。整体检查通过后在 rollup 写「可以推送」并停下，等上层说「推送」再执行迁移和推送。不要用向用户提问的工具（{ask_tool}）。{model_note}
 {host_notes}
 {routing}（CLAUDE.md 引用的就是它）的路由规则是给主会话用的，你忽略它。"""
+
+
+def orch_model_note(slug: str, kind: str, model: Optional[str], effort: Optional[str]) -> str:
+    """开场 prompt 里告诉编排者这个任务指定的模型 / effort（worker 默认继承什么）；都没指定时为空，开场 prompt 和以前一样。"""
+    given = " ".join(f"--{key} {value}" for key, value in (("model", model), ("effort", effort)) if value)
+    if not given:
+        return ""
+    return (f"\n   这个任务指定了 {given}（你就是这样起的，记在 ~/.drover/{slug}/orch.json）：agent-start、review、"
+            f"起子编排者的 orch-start 不传这两个参数时，宿主同为 {kind} 的继承它（复审固定跑 codex），宿主不同的用各自的默认；"
+            "某个 agent 要换才显式传，模型写完整 ID。")
 
 
 def codex_host_notes() -> str:
@@ -2546,6 +2571,7 @@ def cmd_orch_start(a: argparse.Namespace) -> dict:
         if not a.slug.startswith(parent + "-"):
             raise DroverError(f"子编排者的 slug 约定为 <上层 slug>-<仓库>，现在是 {a.slug}（上层 {parent}）")
     kind, kind_source, default_kind = orch_kinds(a.kind, parent)
+    model, effort = task_model(kind, a.model, a.effort, a.slug, parent)
     host = ORCH_HOSTS[kind]
     if not host["entry"].is_file():
         raise DroverError(f"{kind} 编排者要用 {host['entry_label']}，但 {host['entry']} 不存在："
@@ -2559,13 +2585,14 @@ def cmd_orch_start(a: argparse.Namespace) -> dict:
     kickoff = template.format(slug=a.slug, parent=parent, request=request, rollup=rollup, workspace=ORCH_CWD,
                               routing=ROUTING_FILE,
                               load_skill=host["load_skill"].format(skill_args=skill_args),
-                              ask_tool=host["ask_tool"], host_notes=host["host_notes"]())
+                              ask_tool=host["ask_tool"], host_notes=host["host_notes"](),
+                              model_note=orch_model_note(a.slug, kind, model, effort))
     if kind == "claude":
-        agent_args = [*claude_model_args(a.effort), "--permission-mode", "acceptEdits",
+        agent_args = [*claude_model_args(model, effort), "--permission-mode", "acceptEdits",
                       "--name", f"orch-{a.slug}", "--add-dir", str(STATE_HOME)]
     else:
-        # 模型不传就用 ~/.codex/config.toml 的默认；effort 和 codex worker 一样（codex_effort_args）。
-        agent_args = [*CODEX_ORCH_ARGS, *codex_effort_args(a.effort)]
+        # 模型没指定就不传，用 ~/.codex/config.toml 的默认；effort 和 codex worker 一样（codex_model_args）。
+        agent_args = [*CODEX_ORCH_ARGS, *codex_model_args(model, effort)]
 
     ws_id, root_pane, created_tab = orch_workspace(a.dry_run)
     kinds = {"kind": kind, "kind_source": kind_source, "default_kind": default_kind}
@@ -2598,9 +2625,11 @@ def cmd_orch_start(a: argparse.Namespace) -> dict:
     result.update({"workspace_id": ws_id, "tab_id": tab_id, "rollup_file": str(rollup), **kinds})
     stamp = time.strftime("%m-%d %H:%M")
     # orch-status 和 watch 靠它把编排者名、宿主和任务对上（resume 换人时覆盖成新的）；
-    # default_kind 给 agent-start / brief（没写 --kind 的 worker 用主会话的宿主）和子编排者的 orch-start 用。
+    # default_kind 给 agent-start / brief（没写 --kind 的 worker 用主会话的宿主）和子编排者的 orch-start 用；
+    # model / effort 是任务默认（没指定是 null），同宿主的 agent-start、review、子编排者和换上的编排者不传时继承（task_model）。
     (slug_dir / "orch.json").write_text(json.dumps(
         {"slug": a.slug, "name": a.name, "kind": kind, "default_kind": default_kind, "parent": parent,
+         "model": model, "effort": effort,
          "workspace_id": ws_id, "tab_id": tab_id, "pane_id": pane_id, "started": stamp}, ensure_ascii=False, indent=2))
     if parent:
         # 关系记两边：子任务目录里的 parent.json（resume、history 用），上层状态文件里追加一行（上层追踪用）。
@@ -7866,11 +7895,12 @@ REVIEW_TEMPLATE = """只审核不修改：执行 git diff {base} 查看全部改
 """
 
 
-def spawn_reviewer(pane: str, wt: str, name: str) -> dict:
-    """在主 agent 的 pane 右侧分屏，启动只读 codex。返回 start_agent 的结果，并带上新 pane 的 ID。"""
+def spawn_reviewer(pane: str, wt: str, name: str, model: Optional[str] = None, effort: Optional[str] = None) -> dict:
+    """在主 agent 的 pane 右侧分屏，启动只读 codex（model / effort 见 codex_model_args）。返回 start_agent 的结果，
+    并带上新 pane 的 ID。"""
     pane_id = split_pane(pane, wt)
     result = start_agent(name, "codex", pane_id, ["-a", "on-request", "-s", "read-only", *CODEX_BASE_ARGS,
-                                                  *codex_effort_args(None)], False)
+                                                  *codex_model_args(model, effort)], False)
     result["review_pane_id"] = pane_id
     return result
 
@@ -7929,7 +7959,7 @@ def cmd_review(a: argparse.Namespace) -> dict:
                             prompt_plan(a.name, f"<{prompt_file}>")]}
 
     started_at = time.strftime("%H:%M:%S")
-    result = spawn_reviewer(a.pane, a.wt, a.name)
+    result = spawn_reviewer(a.pane, a.wt, a.name, *task_model("codex", a.model, None, a.slug))
     result["prompt_file"] = str(prompt_file)
     result["started_at"] = started_at
     if not result.get("ok"):
@@ -10834,7 +10864,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--split-from", help="在这个 pane 右侧新开 pane 再启动（同一个 worktree 换 agent 时用），要配合 --wt")
     p.add_argument("--wt", help="--split-from 时新 pane 的工作目录（worktree 路径）")
     p.add_argument("--slug", required=True, help="任务 slug，决定 ~/.drover/<slug>/")
-    p.add_argument("--effort", help="不传时用 config.json 的 claude_effort / codex_effort，没配是 xhigh")
+    p.add_argument("--effort", help="不传时用任务 orch.json 记的（宿主相同才继承），再是 config.json 的 claude_effort / "
+                                    "codex_effort，没配是 xhigh")
+    p.add_argument("--model", help="完整模型 ID（claude 传 --model，codex 传 -m；别名会被本机设置改指）。不传时用任务 orch.json "
+                                   "记的（宿主相同才继承），再是 config.json 的 claude_model（没配是 opus[1m]）；codex 不传")
     p.add_argument("--add-dir", action="append", default=[], help="额外可访问的目录（其他 worktree），可重复")
     p.add_argument("--resume", action="store_true",
                    help="agent 意外退出后在同一个 pane 续上次会话（claude --continue / codex resume --last）")
@@ -11066,8 +11099,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "claude 要先装好 /drover 命令；codex 要先装好 drover 技能，"
                         "用 danger-full-access 起（workspace-write 连不上 herdr socket）")
     p.add_argument("--request-file", required=True, help="主会话写的请求文件：用户原话、@仓库、参数、已知上下文和已定的决定")
-    p.add_argument("--args", help="原样传给 /drover 的参数（@仓库、--agent、--review、--effort 等），任务描述写在请求文件里")
-    p.add_argument("--effort", help="编排者的 effort：不传时用 config.json 的 claude_effort / codex_effort，没配是 xhigh")
+    p.add_argument("--args", help="原样传给 /drover 的参数（@仓库、--agent、--review、--effort、--model 等），任务描述写在请求文件里")
+    p.add_argument("--effort", help="编排者的 effort，记进 orch.json 当任务默认：不传时沿用这个任务（resume）或上层（--parent）"
+                                    "orch.json 记的（宿主相同才继承），再是 config.json 的 claude_effort / codex_effort，没配是 xhigh")
+    p.add_argument("--model", help="编排者的模型（完整模型 ID），记进 orch.json 当任务默认，同宿主的 worker、复审、子编排者不传 "
+                                   "--model 时继承；不传时沿用规则同 --effort，再是 config.json 的 claude_model（没配是 opus[1m]）；"
+                                   "codex 不传")
     p.add_argument("--parent", help="起子编排者时写上层编排者的 slug（子任务 slug 约定 <上层 slug>-<仓库>）；"
                                     "子编排者的 rollup 由上层读、上层转达")
     p.add_argument("--dry-run", action="store_true", help="只列出要执行的命令和开场 prompt")
@@ -11113,6 +11150,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tests", help="已跑过的验证命令和结果，一行；不传则用 accept.json 里的 verify 结果生成")
     p.add_argument("--focus", help="本次改动背景与复审重点，1 到 3 句；可不传")
     p.add_argument("--accept-json", help="验收结果文件，默认 ~/.drover/<slug>/accept.json")
+    p.add_argument("--model", help="复审 codex 的模型（完整模型 ID，传 -m）：不传时用任务 orch.json 记的（编排者是 codex 才有，"
+                                   "effort 也一样继承），再不传，用 ~/.codex/config.toml 的默认")
     p.add_argument("--dry-run", action="store_true", help="只生成 prompt 文件并列出要执行的命令")
 
     p = sub.add_parser("collect", help="复审结束后存档输出原文并关闭复审 pane")

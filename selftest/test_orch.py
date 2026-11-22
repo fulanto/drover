@@ -170,7 +170,7 @@ class OrchStartTests(DroverTestCase):
         (self.state / "t6" / "dispatch.md").write_text("# dispatch: t6\n")
         for slug, parent in (("t6", None), ("t6-shop", "t6")):
             res = d.cmd_orch_start(argparse.Namespace(slug=slug, name=f"orch-{slug}", kind="claude", request_file=str(self.request),
-                                                      args=None, effort=None, parent=parent, dry_run=False))
+                                                      args=None, effort=None, model=None, parent=parent, dry_run=False))
             self.assertTrue(res["ok"], res)
             meta = json.loads((self.state / slug / "orch.json").read_text())
             self.assertEqual((meta["slug"], meta["name"], meta["kind"], meta["default_kind"], meta["parent"],
@@ -257,7 +257,7 @@ class OrchStartTests(DroverTestCase):
                                            ("t7-shop", "t7", "w9:p2", ("claude", "codex"))):
             os.environ["HERDR_PANE_ID"] = caller
             res = d.cmd_orch_start(argparse.Namespace(slug=slug, name=f"orch-{slug}", kind=None, request_file=str(self.request),
-                                                      args=None, effort=None, parent=parent, dry_run=False))
+                                                      args=None, effort=None, model=None, parent=parent, dry_run=False))
             self.assertTrue(res["ok"], res)
             self.assertEqual(kinds(res), (want[0], "caller", want[1]))
             meta = json.loads((self.state / slug / "orch.json").read_text())
