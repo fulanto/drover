@@ -386,7 +386,7 @@ agent 名：`[a-z][a-z0-9_-]{0,31}`，在 `herdr agent list` 中唯一。用 `<�
 
 每份 DONE 报告都走一遍，包括复审后修复、重新交回的报告。验收看 worktree 里的实际改动和脚本重跑的结果，不只看 agent 的自述。
 
-从报告的 verification 里挑关键命令（相关测试、tsc、lint、构建，要覆盖状态文件 brief 段的完成证据），写成相对 worktree 的命令传给 `--verify`。相关测试：JS 仓库用 `vitest run --changed <BASE_SHA>`（按 import 关系跑受影响的测试，比只跑 worker 点名的文件多抓间接影响，又不用跑全量），Python 跑相关测试文件；lint 只查改动的文件。改动碰到测试配置、依赖、全局 setup 这类影响所有测试的文件时，才放宽范围（vitest 的 `--changed` 遇到 `package.json`、vitest / vite 配置变化本来就会跑全部）。**条目验收不跑全量测试、全量 lint**，全量留到第 9.1 节集成时跑一次：
+从报告的 verification 里挑关键命令（相关测试、tsc、lint、构建，要覆盖状态文件 brief 段的完成证据），写成相对 worktree 的命令传给 `--verify`。相关测试：JS 仓库用 `vitest run --changed <BASE_SHA>`（按 import 关系跑受影响的测试，比只跑 worker 点名的文件多抓间接影响，又不用跑全量），Python 跑相关测试文件；lint 只查改动的文件。改动碰到测试配置、依赖、全局 setup 这类影响所有测试的文件时，才放宽范围（vitest 的 `--changed` 遇到 `package.json`、vitest / vite 配置变化本来就会跑全部）。改动没被任何测试引用（只改了文档，或写了功能没写测试）时 `--changed` 一个测试都跑不到、退出码却是 0（vitest 带 `--changed` 默认 passWithNoTests），accept 会判不通过：换一条能证明这次改动的命令（补测试、点名相关测试文件），只改了文档的不放测试命令。**条目验收不跑全量测试、全量 lint**，全量留到第 9.1 节集成时跑一次：
 
 ```bash
 ~/.drover/bin/drover accept --wt <WT_PATH> --base <BASE_SHA> --save ~/.drover/<slug>/accept.json --brief --verify "./.venv/bin/python -m pytest tests/test_x.py -q" [--verify "<命令 2>"]...
@@ -413,13 +413,15 @@ verify 命令在脚本里跑，不会触发审批；但测试多的命令（比�
 
 条目验收时 verify 只放相关测试、tsc、lint、build，**全量测试放到第 9.1 节的集成检查里跑一次**。
 
-**负载超时自动复核**：vitest 有失败、而且失败全是 "Test/Hook timed out" 时，脚本把失败的文件单独重跑一次；单独跑通过，这条 verify 就判通过，带 `flaky_timeouts`（文件列表）和 `note`，`exit_code` 保留第一次的结果。只要有一条不是超时的失败，就不复核、照常判失败。汇报时把 `flaky_timeouts` 列出来。
+**负载超时自动复核**：vitest 有失败、而且失败全是 "Test/Hook timed out" 时，脚本把失败的文件单独重跑一次；单独跑通过（同样要真的跑到测试），这条 verify 就判通过，带 `flaky_timeouts`（文件列表）和 `note`，`exit_code` 保留第一次的结果。只要有一条不是超时的失败（汇总里的未处理错误 `Errors  N error` 也算），就不复核、照常判失败。汇报时把 `flaky_timeouts` 列出来。
 
-**读验收结果**：`--brief` 的每条 verify 已经带 `counts`（vitest 的 "Test Files / Tests" 行、pytest 的汇总行）。要再看存档用 `drover accept-summary <存档> [--tail N] [--all] [--diff-stat]`，不要自己用 jq 读：slug 里带 `import` 之类的词时，jq 会被判成加载模块、弹无法加白名单的强制审批。
+**没有测试真的跑不算通过**：认得出是 vitest / pytest / mvn（surefire）的输出时，脚本数实际跑了几个；退出码 0 却一个都没跑（没找到测试文件、全部跳过、被 `-k` / `-t` 筛光）判不通过，`note` 写明。认不出的命令（tsc、build、脚本）照旧只看退出码。
+
+**读验收结果**：`--brief` 的每条 verify 已经带 `tests`（通过 / 失败 / 跳过 三个数，认得出测试框架时才有）和 `counts`（计数行：vitest 的 "Test Files / Tests"、pytest 和 selftest/run.py 的汇总行、mvn 的 "Tests run"）。要再看存档用 `drover accept-summary <存档> [--tail N] [--all] [--diff-stat]`，不要自己用 jq 读：slug 里带 `import` 之类的词时，jq 会被判成加载模块、弹无法加白名单的强制审批。
 
 按输出判断：
 
-1. **验证命令**：`verify` 里每条有 `exit_code`、`seconds`、`summary_line`（输出最后一行，如 pytest 的 "N passed"）、`counts`、`output_tail`。**`verify_failed: true` 就是验收不通过**（`ok` 仍是 true，只表示脚本本身没出错）：把失败的命令和 `output_tail` 发给 agent 修。
+1. **验证命令**：`verify` 里每条有 `exit_code`、`seconds`、`summary_line`（输出最后一行，如 pytest 的 "N passed"）、`tests`、`counts`、`output_tail`。**`verify_failed: true` 就是验收不通过**（`ok` 仍是 true，只表示脚本本身没出错）：把失败的命令和 `output_tail` 发给 agent 修。
 2. **完成证据逐条核对**：对照状态文件最后一个 brief 段的完成证据，每条都要在 verification 或 verify 结果里找到对应的命令和结果；缺哪条就让 agent 补哪条。
 3. **改动和报告对得上**：`status_porcelain`（标记前的状态）非空且与 changed_files 一致。
 4. **新文件**：`intent_to_add` 是脚本用 `git add -N` 标记的新文件。只登记路径、不暂存内容，不算提交；标记后 `git diff` 能显示新文件，用户看 diff 时不会漏。另外，`git add -N .` 会把已经删除的跟踪文件记成暂存的删除（`git status` 里显示 `D `），这和删除本身一致，不用处理，但 agent 可能会问起。汇报时告诉用户做过这一步。
@@ -565,11 +567,11 @@ worktree、workspace 保留到用户说"清理"或"收尾"（下面"任务收尾
    - 没有新增失败 → 判通过，`note` 写明"失败 N 条全部是基线上本来就有的"，`baseline.fixed` 列出这次修好的（只统计重跑了的文件）；
    - 有新增 → 判失败，`baseline.new_failures` 列出来，发给 agent 修；vitest 新增的失败全是超时时，会先把这些文件单独重跑一次（负载超时）。
    - 基线是单独跑这几个文件，某条用例单独跑能过、整套跑才失败（执行顺序、共享状态）时，会被误报成新增（只会误报，不会漏报），`note` 里有提示。遇到时在集成 worktree 里也单独跑这个文件（`drover heavy --cwd <集成WT> -- <测试命令> <文件>`）：也能过、diff 又没碰它相关的代码，就不是这次引入的，汇报时写明；单独跑仍失败才是真的新增。
-   - 支持 vitest、pytest（`FAILED` / `ERROR` 行）、tsc（文件 + 错误码）、eslint（文件 + 规则，只算 error）。条目不带行号，改动挪了行也对得上。认不出的输出、或退出码非 0 却解析不到失败条目，一律按失败处理，在 `baseline.error` 里说明。
-   - 基线结果按"仓库 + BASE + 命令 + 重跑的文件"缓存在 `~/.drover/baselines/`，同一个基线、同一批文件只跑一次。（基线上每次跑整条命令的话，大仓库每换一个上游就要多跑一整套 vitest。）
+   - 支持 vitest、pytest（`FAILED` / `ERROR` 行）、tsc（文件 + 错误码）、eslint（文件 + 规则，只算 error）。条目不带行号，改动挪了行也对得上。认不出条目格式的错误行也算条目，不会被"都是旧失败"盖掉：vitest 汇总里的未处理错误记 `(未处理错误)`，tsc 不带文件的全局错误记 `(全局) TSxxxx`，eslint 没有规则名的（语法错误）记 `文件 (无规则)`。下面这些一律按失败处理，在 `baseline.error` 里说明：认不出的输出、退出码非 0 却解析不到失败条目、工具自己报的失败数和解析出的条数对不上、输出里看得出提前停了（pytest `-x` / `--maxfail` / 收集出错，vitest `--bail`；去掉再验）。
+   - 基线结果按"仓库 + BASE + 命令 + 重跑的文件"缓存在 `~/.drover/baselines/`，同一个基线、同一批文件只跑一次。（基线上每次跑整条命令的话，大仓库每换一个上游就要多跑一整套 vitest。）基线 worktree 装依赖失败、基线命令没跑成（超时、起不来）或基线输出同样解析不全时，算基线不可信：不写缓存、按失败处理。两个验收同时比同一个基线时，后到的等前一个跑完、直接用它的缓存。
 
    **再跑检查按增量定范围**：集成 worktree 已经在同一个上游上全量通过之后，又补了条目、修了一处、改了个名，再跑检查时看这次比上次全量通过的提交（状态文件里记的 `head`）多了什么（`git -C <集成WT> diff --stat <head>`），`--base` 照旧用 integrate 返回的上游 `base`：
-   - 只加了条目提交（代码）：JS 仓库 `--verify "<tsc>"` 加 `--verify-baseline "vitest run --changed <head>"`（按 import 关系只跑受影响的测试；基线比对照常，基线上只跑失败的文件）；pytest 全量在两分钟以内的照跑全量，更长的跑相关测试文件。
+   - 只加了条目提交（代码）：JS 仓库 `--verify "<tsc>"` 加 `--verify-baseline "vitest run --changed <head>"`（按 import 关系只跑受影响的测试；基线比对照常，基线上只跑失败的文件；一个测试都没跑到会判不通过，见第 6.1 节）；pytest 全量在两分钟以内的照跑全量，更长的跑相关测试文件。
    - 只改了文档：不跑（和第 5 步 push 的 `needs_reverify: false` 同一个意思）。
    - 依赖、配置、测试初始化文件变了（`package.json` / lockfile、tsconfig、vitest / pytest 配置、`conftest.py`、全局 setup）：照第 3 步跑全量。
    - 上游换了（重新 integrate 到了新的上游提交）不算"同一个上游"，照第 3 步跑全量。推送前 rebase 后的补检查见第 5 步，不变。

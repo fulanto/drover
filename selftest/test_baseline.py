@@ -1,6 +1,7 @@
 """2. 和基线比失败集合（accept --verify-baseline → run_verify(baseline=...)）。
 
 解析单测直接喂文本；比对用假工具：基线提交里的 fake-<工具>.json 是基线上的失败，worktree 里改过的是这次的失败。
+BaselineEvidenceTests 让假工具原样回放真实输出样例（spec 的 output），测解析不出的失败、对不上数、提前停了、基线不可信。
 基线 worktree、缓存都建在临时状态目录的 baselines/ 下。
 """
 
@@ -12,6 +13,7 @@ import sys
 import unittest
 from collections import Counter
 
+import selftest_fakes
 from selftest_support import DroverTestCase
 
 A = {"file": "src/a.test.ts", "test": "math > adds", "kind": "assert"}
@@ -29,6 +31,30 @@ OTHER_TOOLS = {
                [["src/a.ts", "no-unused-vars"], ["src/c.ts", "@typescript-eslint/no-explicit-any"]],
                "src/c.ts @typescript-eslint/no-explicit-any", "src/b.ts no-undef"),
 }
+# 真实工具的输出样例（vitest 4.1.11、pytest 9.2.0 在本机实测，去掉 ANSI；eslint / tsc 按工具的格式写），回放给假工具用。
+KEY_OLD = "src/old.test.js > old broken"
+VITEST_OLD = (" RUN  v4.1.11 /x/app\n\n Test Files  1 failed | 1 passed (2)\n      Tests  1 failed | 1 passed (2)\n"
+              "\n⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯\n\n FAIL  src/old.test.js > old broken\n"
+              "AssertionError: expected 1 to be 2 // Object.is equality\n")
+# 同一次运行又多了 2 个未处理错误：汇总多一行 "Errors"（vitest 4.1.11 紧跟在 Tests 行后面），没有 FAIL 行
+VITEST_OLD_UNHANDLED = VITEST_OLD.replace("(2)\n\n", "(2)\n     Errors  2 errors\n\n", 1)
+TSC_OLD_LINE = "src/old.ts(1,14): error TS2322: Type 'string' is not assignable to type 'number'.\n"
+TSC_GLOBAL = ("error TS2688: Cannot find type definition file for 'node'.\n  The file is in the program because:\n"
+              "    Entry point of type library 'node' specified in compilerOptions\n")
+ESLINT_OLD = "src/old.js\n  3:7  error  'x' is assigned a value but never used  no-unused-vars\n\n"
+ESLINT_PARSE_ERROR = "src/new.js\n  1:18  error  Parsing error: Unexpected token ;\n\n"
+PYTEST_OLD = ("=========================== short test summary info ============================\n"
+              "FAILED tests/test_m.py::test_1 - assert 1 == 2\n")
+PYTEST_STOPPED = PYTEST_OLD + ("!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+                               "============================== 1 failed in 0.02s ===============================\n")
+PYTEST_COLLECT_STOPPED = ("=========================== short test summary info ============================\n"
+                          "ERROR tests/test_a.py\n!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection "
+                          "!!!!!!!!!!!!!!!!!!!!\n1 error in 0.05s\n")
+# vitest --bail 1：串行时没开始的文件不算进任何一项（各项之和小于总数）；并行时已开始的被取消、算成 skipped
+VITEST_BAIL_SERIAL = (" RUN  v4.1.11 /x/app\n\n Test Files  1 failed (3)\n      Tests  1 failed (1)\n\n"
+                      " FAIL  src/old.test.js > old broken\nAssertionError: expected 1 to be 2\n")
+VITEST_BAIL_PARALLEL = (" RUN  v4.1.11 /x/app\n\n Test Files  1 failed | 3 passed (4)\n      Tests  1 failed | 6 skipped (7)\n\n"
+                        " FAIL  src/old.test.js > old broken\nAssertionError: expected 1 to be 2\n")
 
 
 class ParseFailuresTests(DroverTestCase):
@@ -108,6 +134,17 @@ class ParseFailuresTests(DroverTestCase):
         """认不出的输出 → (None, None)"""
         self.assertEqual(self.d.parse_failures(["make", "check"], "Error: something broke\n", self.root),
                          (None, None))
+
+    def test_unparsed_error_lines_become_entries(self) -> None:
+        """认不出条目格式的错误行也记成条目：vitest 汇总里的未处理错误（"Errors  N errors"，没有 FAIL 行）记 N 条、
+        tsc 不带文件的全局错误记 "(全局) 错误码"、eslint 没有规则名的（Parsing error）记 "文件 (无规则)\""""
+        self.assertEqual(self.d.parse_failures(["vitest"], VITEST_OLD_UNHANDLED, self.root),
+                         ("vitest", Counter({KEY_OLD: 1, "(未处理错误)": 2})))
+        self.assertEqual(self.d.parse_failures(["npx", "tsc"], TSC_GLOBAL + TSC_OLD_LINE, self.root),
+                         ("tsc", Counter({"(全局) TS2688": 1, "src/old.ts TS2322": 1})))
+        self.assertEqual(self.d.parse_failures(["pnpm", "lint"], ESLINT_PARSE_ERROR + ESLINT_OLD
+                                               + "✖ 2 problems (2 errors, 0 warnings)\n", self.root),
+                         ("eslint", Counter({"src/new.js (无规则)": 1, "src/old.js no-unused-vars": 1})))
 
 
 class BaselineCompareTests(DroverTestCase):
@@ -205,6 +242,108 @@ class BaselineCompareTests(DroverTestCase):
         entry = self.verify("pytest", {"failures": [], "exit": 2}, "pytest -q")
         self.assertFalse(entry["ok"])
         self.assertIn("解析不到失败条目", entry["baseline"]["error"])
+
+
+class BaselineEvidenceTests(DroverTestCase):
+    """解析不出来的失败不能被"都是基线本来就有的"盖掉、基线不可信时不比也不缓存。假工具回放真实输出样例：基线提交里的
+    fake-<工具>.json 是基线上的输出，worktree 里改过的是这次的。样例里的文件不在 worktree 里，基线照整条命令跑。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.d = self.load_drover()
+        self.wt = self.work / "app"
+
+    def make(self, tool: str, base_output: str, base_exit: int, **extra) -> None:
+        """基线提交：tool 在基线上打印 base_output、以 base_exit 退出（extra 里的 sleep 等原样写进 spec）。"""
+        self.base = self.init_repo(self.wt, {f"fake-{tool}.json": json.dumps(
+            {"output": base_output, "exit": base_exit, **extra})})
+
+    def verify(self, tool: str, output: str, command: str, exit_code: int = 1, timeout: float = 60) -> dict:
+        self.write_spec(self.wt, tool, {"output": output, "exit": exit_code})
+        return self.d.run_verify(str(self.wt), command, timeout, lock=False, baseline=self.base)
+
+    def caches(self) -> list:
+        return sorted((self.state / "baselines").glob("*.json"))
+
+    def test_unparsed_new_failures_not_masked(self) -> None:
+        """基线上本来有一条旧失败，这次又多了解析不成普通条目的失败：vitest 的未处理错误（没有 FAIL 行）、tsc 不带文件的
+        全局错误、eslint 的语法错误（没有规则名）→ 判失败，new_failures 列出它们，不是"全部是基线上本来就有的\""""
+        cases = [("vitest", "vitest run", VITEST_OLD, VITEST_OLD_UNHANDLED, ["(未处理错误)"]),
+                 ("tsc", "tsc --noEmit", TSC_OLD_LINE + "\nFound 1 error.\n",
+                  TSC_GLOBAL + TSC_OLD_LINE + "\nFound 2 errors in 1 file.\n", ["(全局) TS2688"]),
+                 ("eslint", "eslint src", ESLINT_OLD + "✖ 1 problem (1 error, 0 warnings)\n",
+                  ESLINT_PARSE_ERROR + ESLINT_OLD + "✖ 2 problems (2 errors, 0 warnings)\n", ["src/new.js (无规则)"])]
+        for tool, command, base_output, output, new in cases:
+            with self.subTest(tool):
+                self.make(tool, base_output, 1)
+                entry = self.verify(tool, output, command)
+                self.assertFalse(entry["ok"], entry)
+                self.assertEqual(entry["baseline"]["new_failures"], new)
+                self.assertNotIn("note", entry)
+
+    def test_reported_total_mismatch_fails(self) -> None:
+        """工具自己报的失败数（pytest 汇总写 2 failed）和解析出的条数（1 条 FAILED 行，基线上本来就有）对不上 → 不和基线比，
+        按失败处理，baseline.error 写明，不建基线 worktree"""
+        self.make("pytest", PYTEST_OLD + "1 failed, 4 passed in 0.1s\n", 1)
+        entry = self.verify("pytest", PYTEST_OLD + "2 failed, 3 passed in 0.1s\n", "pytest -q")
+        self.assertFalse(entry["ok"], entry)
+        self.assertIn("解析出 1 条", entry["baseline"]["error"])
+        self.assertFalse((self.state / "baselines").exists())
+
+    def test_stopped_early_not_passed(self) -> None:
+        """输出里看得出提前停了（pytest -x / --maxfail 的 "stopping after"、收集出错的 "Interrupted"、vitest --bail 串行时
+        没开始的文件、命令带 --bail 1 且失败到了 1 条）→ 停在旧失败上也不判通过，error 写明提前停了。
+        对照：同样的并行输出、命令没带 --bail → 照常比（没有新增，通过）"""
+        cases = [("pytest", "pytest -x tests", PYTEST_STOPPED), ("pytest", "pytest -q tests", PYTEST_COLLECT_STOPPED),
+                 ("vitest", "vitest run --bail 1 --no-file-parallelism", VITEST_BAIL_SERIAL)]
+        for tool, command, output in cases:
+            with self.subTest(command):
+                self.make(tool, output, 1)
+                entry = self.verify(tool, output, command)
+                self.assertFalse(entry["ok"], entry)
+                self.assertIn("提前停了", entry["baseline"]["error"])
+        self.make("vitest", VITEST_BAIL_PARALLEL, 1)
+        bailed = self.verify("vitest", VITEST_BAIL_PARALLEL, "vitest run --bail=1")
+        self.assertFalse(bailed["ok"], bailed)
+        self.assertIn("提前停了", bailed["baseline"]["error"])
+        control = self.verify("vitest", VITEST_BAIL_PARALLEL, "vitest run")
+        self.assertTrue(control["ok"], control)
+        self.assertIn("没有新增", control["note"])
+
+    def test_base_deps_failure_untrusted_not_cached(self) -> None:
+        """基线 worktree 装依赖失败 → 基线不可信：不写缓存、判失败，baseline.error 写明；依赖能装了再验，重新跑基线、通过、
+        这才进缓存。旧版本写进缓存的不可信结果（deps_has_failure 是 true）不再拿来用"""
+        selftest_fakes.install_pkg_tools(self.fakebin, sys.executable)
+        (self.fakebin / "fake-pkg.json").write_text(json.dumps({"fail": ["pnpm"]}))
+        self.base = self.init_repo(self.wt, {
+            "package.json": '{"name": "app", "private": true}\n', "pnpm-lock.yaml": "lockfileVersion: '9.0'\n",
+            ".gitignore": "node_modules/\n", "fake-tsc.json": json.dumps({"output": TSC_OLD_LINE, "exit": 2})})
+        entry = self.verify("tsc", TSC_OLD_LINE, "tsc --noEmit")
+        self.assertFalse(entry["ok"], entry)
+        self.assertIn("基线不可信", entry["baseline"]["error"])
+        self.assertIn("装依赖失败", entry["baseline"]["error"])
+        self.assertEqual(self.caches(), [])
+        (self.fakebin / "fake-pkg.json").write_text(json.dumps({"fail": []}))
+        fixed = self.verify("tsc", TSC_OLD_LINE, "tsc --noEmit")
+        self.assertTrue(fixed["ok"], fixed)
+        self.assertFalse(fixed["baseline"]["cached"])
+        [cache] = self.caches()
+        old = json.loads(cache.read_text())
+        cache.write_text(json.dumps(dict(old, deps_has_failure=True)))  # 旧版本照样会缓存的不可信结果
+        again = self.verify("tsc", TSC_OLD_LINE, "tsc --noEmit")
+        self.assertTrue(again["ok"], again)
+        self.assertFalse(again["baseline"]["cached"])
+        self.assertFalse(json.loads(cache.read_text())["deps_has_failure"])
+
+    def test_base_timeout_untrusted_not_cached(self) -> None:
+        """基线上命令没跑成（超时）→ 基线不可信：不写缓存、判失败并写明，不是把这次的旧失败全报成新增"""
+        self.make("tsc", TSC_OLD_LINE, 2, sleep=5)
+        entry = self.verify("tsc", TSC_OLD_LINE, "tsc --noEmit", timeout=1.5)
+        self.assertFalse(entry["ok"], entry)
+        self.assertIn("基线不可信", entry["baseline"]["error"])
+        self.assertIn("没跑成", entry["baseline"]["error"])
+        self.assertNotIn("new_failures", entry["baseline"])
+        self.assertEqual(self.caches(), [])
 
 
 D = {"file": "src/d.test.ts", "test": "new > feature", "kind": "assert"}

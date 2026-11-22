@@ -40,6 +40,9 @@
 假测试工具：按调用名（vitest / tsc / eslint / pytest）打印对应格式的输出，失败条目读当前目录的 fake-<工具>.json，
 调用（工具名、参数、cwd）记进 tool-calls.log。vitest / pytest / eslint 的参数里带文件时只报这些文件里的失败
 （基线子集、超时复核）；vitest 的超时单独跑时通过，rerun_fail 里的文件除外。tsc 不看参数。
+spec 里有 output 时原样回放（真实工具的输出样例），退出码取 exit（默认 0）；带 sleep 的先睡这么多秒，再重读一次 spec
+（真工具边跑边读文件：跑的过程中目录被删了就读不到、报错退出）。vitest 另有 unhandled（汇总里 N 个未处理错误，没有 FAIL 行；
+只在整条跑时出现）、rerun_no_tests（复核点名文件时 "No test files found"、退出码 0）。
 """
 
 from __future__ import annotations
@@ -362,6 +365,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 TOOL = Path(sys.argv[0]).name
@@ -371,10 +375,19 @@ with (Path(__file__).resolve().parent / "tool-calls.log").open("a") as f:
 spec_file = Path("fake-%s.json" % TOOL)
 spec = json.loads(spec_file.read_text()) if spec_file.exists() else {}
 TEST_FILE_RE = re.compile(r"\.(test|spec)\.[cm]?[jt]sx?$")
+if "output" in spec:
+    if spec.get("sleep"):
+        time.sleep(spec["sleep"])
+        spec = json.loads(spec_file.read_text())
+    sys.stdout.write(spec["output"])
+    sys.exit(spec.get("exit", 0))
 
 
 def vitest():
     picked = [a for a in args if TEST_FILE_RE.search(a)]
+    if picked and spec.get("rerun_no_tests"):  # 复核点名的文件一个都没匹配上，命令又带 passWithNoTests（vitest 4.1.11 的样子）
+        print(" RUN  v4.1.11 %s\n\nNo test files found, exiting with code 0\n" % os.getcwd())
+        return 0
     failures = spec.get("failures", [])
     if picked:  # 只跑指定的文件（基线子集、超时复核）：断言失败照旧失败，超时单独跑时通过；rerun_fail 里的文件还失败（按断言失败打印）
         bad = set(spec.get("rerun_fail", []))
@@ -412,6 +425,13 @@ def vitest():
                     "Error: Test timed out in 5000ms." if kind == "timeout"
                     else "AssertionError: expected 1 to be 2 // Object.is equality"]
         out.append(" ❯ %s:3:5" % path)
+    unhandled = 0 if picked else spec.get("unhandled", 0)
+    plural = "s" if unhandled > 1 else ""
+    if unhandled:  # vitest 4.1.11：Unhandled Errors 一节没有 FAIL 行，汇总多一行 "Errors  N error(s)"，退出码 1
+        out += ["", "⎯⎯⎯⎯⎯⎯ Unhandled Errors ⎯⎯⎯⎯⎯⎯", "",
+                "Vitest caught %d unhandled error%s during the test run." % (unhandled, plural),
+                "", "⎯⎯⎯⎯ Unhandled Rejection ⎯⎯⎯⎯⎯", "Error: unhandled boom",
+                'This error originated in "src/ok.test.ts" test file.']
     test_failed = spec.get("tests_failed", sum(1 for f in failures if f.get("kind") != "file-timeout"))
     n = len(files)
     out.append("")
@@ -419,8 +439,10 @@ def vitest():
                if failed_files else " Test Files  %d passed (%d)" % (n, n))
     out.append("      Tests  %d failed | 10 passed (%d)" % (test_failed, 10 + test_failed)
                if test_failed else "      Tests  10 passed (10)")
+    if unhandled:
+        out.append("     Errors  %d error%s" % (unhandled, plural))
     print("\n".join(out))
-    return 1 if failures else 0
+    return 1 if failures or unhandled else 0
 
 
 def pytest():

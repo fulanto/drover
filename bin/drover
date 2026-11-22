@@ -287,15 +287,34 @@ VITEST_BANNER_RE = re.compile(r"^\s*RUN\s+v\d", re.M)
 # key 一样，和基线（旧配置、不带标签）对得上。前缀按最短的取，用例名里再出现测试文件名也不会被当成文件。
 VITEST_FAIL_RE = re.compile(r"^\s*FAIL[ \t]+(?:.*?[ \t])??(\S+\.(?:test|spec)\.[cm]?[jt]sx?)(.*)$", re.M)
 VITEST_TIMEOUT_RE = re.compile(r"(Test|Hook) timed out in \d+\s?ms")
-VITEST_FAILED_TESTS_RE = re.compile(r"^\s*Tests\s+(\d+) failed", re.M)
-TEST_COUNT_LINE_RE = re.compile(
-    r"^\s*(?:(?:Test Files|Tests)\s+\d+ .+|=+ .*\b\d+ (?:passed|failed|errors?)\b.*=+)\s*$", re.M)
+# 汇总的 "Test Files" / "Tests" 行（vitest 4.1.11 utils.js 的 getStateString）："1 failed | 5 passed | 1 expected fail | 2 skipped
+# | 1 todo (10)"，为 0 的项不打，括号里是总数，一个都没有是 "no tests"。--bail 停下时还没开始的不算进任何一项。
+VITEST_STATE_LINE_RE = re.compile(
+    r"^\s*(?P<title>Test Files|Tests)\s+(?P<body>\d+ [a-z ]+?(?: \| \d+ [a-z ]+?)* \((?P<total>\d+)\)|no tests)\s*$", re.M)
+VITEST_STATE_ITEM_RE = re.compile(r"(\d+) (failed|passed|expected fail|skipped|todo)\b")
+# 未处理错误（Unhandled Errors 一节没有 FAIL 行、退出码照样是 1）只在汇总里多一行 "Errors  1 error" / "Errors  3 errors"。
+VITEST_ERRORS_RE = re.compile(r"^\s*Errors\s+(\d+) errors?\s*$", re.M)
+# pytest 的结尾汇总行："=== 1 failed, 2 passed, 1 skipped in 0.12s ==="，-q 时不带等号，没跑是 "no tests ran in …"；
+# drover 的 selftest/run.py 也打这种格式（"===== N passed, M skipped in X.Xs (-j J) ====="）。
+PYTEST_SUMMARY_RE = re.compile(
+    r"^(?:=+ )?(?P<body>no tests ran|\d+ \w+(?: \w+)?(?:, \d+ \w+(?: \w+)?)*) in \d+(?:\.\d+)?s\b[^=\n]*(?: =+)?\s*$", re.M)
+PYTEST_ITEM_RE = re.compile(r"(\d+) (passed|failed|error|skipped|xfailed|xpassed)s?\b")
+# pytest 没跑完就停了：-x / --maxfail（"stopping after N failures"）、收集出错（"Interrupted: N error during collection"）、
+# Ctrl-C，都打一行 "!!!! 原因 !!!!"（_pytest/terminal.py 的 write_sep("!", …)）。
+PYTEST_STOPPED_RE = re.compile(r"^!{3,} (?P<why>.+?) !{3,}\s*$", re.M)
+# mvn surefire 的 Results 汇总："[INFO] Tests run: 5, Failures: 1, Errors: 0, Skipped: 2"（Tests run 含跳过的；多模块各一行）。
+# 每个测试类那行后面还有 ", Time elapsed: …"，不算。
+SUREFIRE_SUMMARY_RE = re.compile(r"^(?:\[\w+\] )?Tests run: (\d+), Failures: (\d+), Errors: (\d+), Skipped: (\d+)\s*$", re.M)
 # 和基线比失败集合（accept --verify-baseline）：各工具的失败条目。
 BASELINE_DIR = STATE_HOME / "baselines"
 TSC_ERROR_RE = re.compile(r"^(?P<file>\S[^(\n]*)\(\d+,\d+\): error (?P<code>TS\d+)", re.M)
+TSC_GLOBAL_RE = re.compile(r"^error (?P<code>TS\d+):", re.M)  # 不带文件的（tsconfig、类型库找不到）
+TSC_FOUND_RE = re.compile(r"^Found (\d+) errors?\b", re.M)
 ESLINT_ENTRY_RE = re.compile(r"^\s+\d+:\d+\s+error\s+.*?\s{2,}(?P<rule>[@\w/.-]+)\s*$")
-ESLINT_SUMMARY_RE = re.compile(r"^✖ \d+ problems?", re.M)
+ESLINT_ERROR_LINE_RE = re.compile(r"^\s+\d+:\d+\s+error\s")  # 没有规则名的（Parsing error）只认得出是一条 error
+ESLINT_SUMMARY_RE = re.compile(r"^✖ \d+ problems? \((?P<errors>\d+) errors?", re.M)
 PYTEST_FAIL_RE = re.compile(r"^(?:FAILED|ERROR) (?P<id>\S+)", re.M)
+UNHANDLED_KEY = "(未处理错误)"
 # 基线只重跑失败所在的文件时，要去掉原命令里的位置参数（目录 / 文件）、保留选项。不带 "=" 的长选项默认当成后面跟一个值：
 # 认错了只会把原来的目录留下（基线等于照整条跑，慢但结论对）；反过来把带值的选项当成开关，它的值会被当成位置参数去掉，命令就坏了。
 # 所以这里只列常用的开关；短选项只有列出的几个带值（-q / -v / -x / -s 这类都是开关）。
@@ -6893,40 +6912,80 @@ def run_measured(argv: list, cwd: str, *, timeout: Optional[float] = None, env: 
 # ---------------------------------------------------------------- accept
 
 
-def test_counts(output: str) -> list:
-    """测试框架的计数行：vitest 的 "Test Files …" / "Tests …"，pytest 的 "=== N passed … ===" 汇总行。"""
-    return [m.group(0).strip()[:200] for m in TEST_COUNT_LINE_RE.finditer(ANSI_RE.sub("", output))][-4:]
+def vitest_summaries(text: str) -> list:
+    """vitest 汇总的 "Test Files" / "Tests" 行：[{title, line, total, items: {failed, passed, expected fail, skipped, todo}}]。"""
+    return [{"title": m["title"], "line": m.group(0).strip()[:200], "total": int(m["total"] or 0),
+             "items": {word: int(n) for n, word in VITEST_STATE_ITEM_RE.findall(m["body"])}}
+            for m in VITEST_STATE_LINE_RE.finditer(text)]
+
+
+def pytest_summaries(text: str) -> list:
+    """pytest 格式的结尾汇总行（含 selftest/run.py 的）：[{line, passed, failed, skipped}]。xfailed / xpassed 算通过（跑了、
+    结果符合标注），error 算失败；deselected、warnings 不算。一项都认不出的行不算（"12 modules transformed in 1.2s" 这类）。"""
+    out = []
+    for m in PYTEST_SUMMARY_RE.finditer(text):
+        items = {word: int(n) for n, word in PYTEST_ITEM_RE.findall(m["body"])}
+        if items or m["body"] == "no tests ran":
+            out.append({"line": m.group(0).strip()[:200],
+                        "passed": items.get("passed", 0) + items.get("xfailed", 0) + items.get("xpassed", 0),
+                        "failed": items.get("failed", 0) + items.get("error", 0), "skipped": items.get("skipped", 0)})
+    return out
+
+
+def test_tally(output: str) -> Optional[dict]:
+    """测试框架实际跑了多少：{passed, failed, skipped, lines}（lines 是计数行，存档的 counts）。认得出的：vitest（RUN 横幅；
+    数 "Tests" 行，没有这一行就是 "No test files found"，算 0 个）、pytest 和同格式的 selftest/run.py（结尾汇总行）、mvn
+    surefire（Results 汇总行，Tests run 含跳过的）；几段输出都有的相加。都认不出返回 None（tsc、build、脚本）。
+    通过含 vitest 的 expected fail，跳过含 vitest 的 todo，失败含 surefire 的 Errors。"""
+    text = ANSI_RE.sub("", output)
+    vitest = vitest_summaries(text)
+    runs = [{"passed": v["items"].get("passed", 0) + v["items"].get("expected fail", 0),
+             "failed": v["items"].get("failed", 0),
+             "skipped": v["items"].get("skipped", 0) + v["items"].get("todo", 0)} for v in vitest if v["title"] == "Tests"]
+    others = pytest_summaries(text) + [
+        {"line": m.group(0).strip()[:200], "passed": run - fail - err - skip, "failed": fail + err, "skipped": skip}
+        for m in SUREFIRE_SUMMARY_RE.finditer(text) for run, fail, err, skip in [map(int, m.groups())]]
+    if not (vitest or others or VITEST_BANNER_RE.search(text)):
+        return None
+    tally = {key: sum(r[key] for r in runs + others) for key in ("passed", "failed", "skipped")}
+    tally["lines"] = ([v["line"] for v in vitest] + [r["line"] for r in others])[-4:]
+    return tally
+
+
+def tally_fields(tally: Optional[dict]) -> dict:
+    """存档里的计数字段：counts（计数行，和以前一样总有）；认得出测试框架时加 tests（通过 / 失败 / 跳过，三个数固定都给）。"""
+    if tally is None:
+        return {"counts": []}
+    return {"counts": tally["lines"], "tests": {key: tally[key] for key in ("passed", "failed", "skipped")}}
+
+
+NO_TESTS_NOTE = ("退出码 0，但没有测试真的跑（通过 0、失败 0、跳过 {skipped}）：没找到测试文件、全部跳过或被筛掉都不算验过。"
+                 "换一条能跑到这次改动的测试的命令；只改了文档的不放测试命令")
+
+
+def judged_run(argv: list, cwd: str, *, lock: bool, timeout: float) -> dict:
+    """heavy_run 加上通过与否：ok 是退出码 0，并且认得出测试框架时至少真的跑了一个测试（vitest run --changed 没碰到测试、
+    pytest 整份跳过，退出码都是 0）；退出码 0 却一个都没跑的 no_tests 写原因。tally 见 test_tally。
+    验证命令和负载超时复核的重跑都走这里，判定只在这一处。"""
+    res = heavy_run(argv, cwd, lock=lock, timeout=timeout)
+    tally = res["tally"] = test_tally(res["output"])
+    res["ok"] = res["exit_code"] == 0
+    if res["ok"] and tally is not None and tally["passed"] + tally["failed"] == 0:
+        res["ok"] = False
+        res["no_tests"] = NO_TESTS_NOTE.format(skipped=tally["skipped"])
+    return res
 
 
 def vitest_timeout_failures(output: str, wt: Optional[str] = None) -> Optional[list]:
-    """vitest 的失败如果全是超时（Test/Hook timed out），返回失败的测试文件（相对 worktree）；
-    有任何别的失败、或解析对不上数，返回 None。"""
+    """vitest 的失败如果全是超时（Test/Hook timed out），返回失败的测试文件（相对 worktree）；有任何别的失败（含汇总里的
+    未处理错误：它们不是超时）、或解析对不上数，返回 None。"""
     text = ANSI_RE.sub("", output)
     if not VITEST_BANNER_RE.search(text):
         return None
-    matches = list(VITEST_FAIL_RE.finditer(text))
-    if not matches:
+    entries = vitest_failure_entries(text, wt or ".")
+    if not entries or not all(is_timeout for _, _, is_timeout in entries) or reported_mismatch("vitest", text, Counter()):
         return None
-    files, test_level = [], 0
-    for i, m in enumerate(matches):
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-        block = text[m.start():end]
-        if not VITEST_TIMEOUT_RE.search(block):
-            return None
-        if "[" not in m.group(2):  # " FAIL  file > suite > test"；"[ file ]" 是整个文件失败
-            test_level += 1
-        path = m.group(1)
-        if wt:
-            # vitest 打印的是相对它 root 的路径（root 经过符号链接时会出现 ../../..），换成相对 worktree 的。
-            resolved = os.path.realpath(os.path.join(wt, path))
-            if os.path.isfile(resolved):
-                path = os.path.relpath(resolved, os.path.realpath(wt))
-        if path not in files:
-            files.append(path)
-    counted = VITEST_FAILED_TESTS_RE.search(text)
-    if counted and int(counted.group(1)) != test_level:
-        return None
-    return files
+    return list(dict.fromkeys(path for _, path, _ in entries))
 
 
 # 不带值的 vitest 选项；其余不带 "=" 的选项默认后面跟一个值（--environment node、--dir src、--maxWorkers 4）。
@@ -6988,28 +7047,31 @@ def norm_path(path: str, root: str) -> str:
 
 def vitest_failure_entries(text: str, root: str) -> list:
     """vitest 汇总里的失败条目：[(key, 相对文件路径, 是否超时)]，key = 文件 + " > describe > 用例" 或 " [ 文件 ]"，
-    不带 project 标签（见 VITEST_FAIL_RE）。"""
+    不带 project 标签（见 VITEST_FAIL_RE）。汇总里的未处理错误（"Errors  N error"，没有 FAIL 行）记成 N 条
+    (UNHANDLED_KEY, None, False)：映射不到文件，也不是超时。"""
     matches = list(VITEST_FAIL_RE.finditer(text))
     entries = []
     for i, m in enumerate(matches):
         end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
         path = norm_path(m.group(1), root)
         entries.append((path + m.group(2).rstrip(), path, bool(VITEST_TIMEOUT_RE.search(text[m.start():end]))))
-    return entries
+    return entries + [(UNHANDLED_KEY, None, False)] * sum(int(n) for n in VITEST_ERRORS_RE.findall(text))
 
 
 def parse_failures(argv: list, output: str, root: str) -> tuple[Optional[str], Optional[Counter]]:
     """认出测试 / 检查工具的失败条目，返回 (工具名, Counter{条目: 次数})；认不出返回 (None, None)。
-    条目不带行号（tsc 按 文件+错误码，eslint 按 文件+规则），改动挪了行也能和基线对上。"""
+    条目不带行号（tsc 按 文件+错误码，eslint 按 文件+规则），改动挪了行也能和基线对上。认不出条目格式的错误行也记成条目，
+    免得被"没有新增"盖掉：vitest 的未处理错误记 UNHANDLED_KEY，tsc 不带文件的记 "(全局) 错误码"，eslint 没有规则名的
+    （语法错误）记 "文件 (无规则)"。别的解析不出的由 reported_mismatch 按工具自己报的总数兜住。"""
     text = ANSI_RE.sub("", output)
     names = {Path(t).name for t in argv}
     if VITEST_BANNER_RE.search(text):
         return "vitest", Counter(key for key, _, _ in vitest_failure_entries(text, root))
     if names & {"pytest", "py.test"} or "short test summary info" in text:
         return "pytest", Counter(m.group("id") for m in PYTEST_FAIL_RE.finditer(text))
-    if "tsc" in names or TSC_ERROR_RE.search(text):
-        return "tsc", Counter(f"{norm_path(m.group('file'), root)} {m.group('code')}"
-                              for m in TSC_ERROR_RE.finditer(text))
+    if "tsc" in names or TSC_ERROR_RE.search(text) or TSC_GLOBAL_RE.search(text):
+        return "tsc", Counter([f"{norm_path(m.group('file'), root)} {m.group('code')}" for m in TSC_ERROR_RE.finditer(text)]
+                              + [f"(全局) {m.group('code')}" for m in TSC_GLOBAL_RE.finditer(text)])
     if "eslint" in names or ESLINT_SUMMARY_RE.search(text):
         counter: Counter = Counter()
         current = None
@@ -7018,15 +7080,66 @@ def parse_failures(argv: list, output: str, root: str) -> tuple[Optional[str], O
                 current = norm_path(line, root)
                 continue
             m = ESLINT_ENTRY_RE.match(line)
-            if m and current:
-                counter[f"{current} {m.group('rule')}"] += 1
+            if current and (m or ESLINT_ERROR_LINE_RE.match(line)):
+                counter[f"{current} {m.group('rule') if m else '(无规则)'}"] += 1
         return "eslint", counter
     return None, None
 
 
+def reported_mismatch(parser: str, output: str, failures: Counter) -> Optional[str]:
+    """工具自己报的失败总数和解析出的条数对不上时的说明（None = 对得上，或者没打总数）：对不上就说明有解析不出来的失败，
+    拿解析出来的那部分和基线比会把它们漏掉。vitest 比 "Tests" 行的 failed 和用例级的 FAIL 行（整个文件失败的 "[ 文件 ]"、
+    未处理错误不在这个数里）；pytest 比汇总行的 failed + error 和 FAILED / ERROR 行；tsc 比 "Found N errors"；eslint 比
+    "✖ … (N errors"。几段输出的相加。"""
+    text = ANSI_RE.sub("", output)
+    parsed = sum(failures.values())
+    if parser == "vitest":
+        reported = [s["items"].get("failed", 0) for s in vitest_summaries(text) if s["title"] == "Tests"]
+        parsed = sum(1 for m in VITEST_FAIL_RE.finditer(text) if not m.group(2).lstrip().startswith("["))
+    elif parser == "pytest":
+        reported = [s["failed"] for s in pytest_summaries(text)]
+    elif parser == "tsc":
+        reported = [int(n) for n in TSC_FOUND_RE.findall(text)]
+    else:
+        reported = [int(m["errors"]) for m in ESLINT_SUMMARY_RE.finditer(text)]
+    if not reported or sum(reported) == parsed:
+        return None
+    return f"{parser} 自己报了 {sum(reported)} 条失败，解析出 {parsed} 条"
+
+
+def vitest_bail(argv: list) -> int:
+    """命令行上的 vitest --bail N / --bail=N，没有是 0。"""
+    for i, token in enumerate(argv):
+        value = token[len("--bail="):] if token.startswith("--bail=") else (
+            argv[i + 1] if token == "--bail" and i + 1 < len(argv) else "")
+        if value.isdigit():
+            return int(value)
+    return 0
+
+
+def stopped_early(argv: list, output: str) -> Optional[str]:
+    """测试没跑完就停了的原因（None = 跑完了）：停在基线上本来就有的失败那里时，"没有新增"什么也说明不了，后面的根本没跑。
+    pytest：-x / --maxfail / 收集出错 / Ctrl-C 都打 "!!!! 原因 !!!!"。vitest：汇总行各项之和小于总数（串行时 --bail 停下后
+    还没开始的文件不算进任何一项），或者命令带 --bail N 且失败到了 N 条（并行时已开始的用例被取消、算成 skipped，汇总行
+    看不出来；vitest 4.1.11 实测）。配置文件里写的 bail 看不到。"""
+    text = ANSI_RE.sub("", output)
+    m = PYTEST_STOPPED_RE.search(text)
+    if m:
+        return f"pytest 提前停了（{m['why']}）"
+    summaries = vitest_summaries(text)
+    for s in summaries:
+        if sum(s["items"].values()) < s["total"]:
+            return f"vitest 提前停了（{s['title']} 有 {s['total'] - sum(s['items'].values())} 个没跑完）"
+    bail = vitest_bail(argv)
+    if bail and sum(s["items"].get("failed", 0) for s in summaries if s["title"] == "Tests") >= bail:
+        return f"vitest 提前停了（--bail {bail}，失败到 {bail} 条就停）"
+    return None
+
+
 def failure_files(parser: str, output: str, current: Counter, wt: str) -> Optional[list]:
     """当前失败条目所在的文件（相对 worktree，排序去重），基线只重跑这些。tsc 没法按文件拆（类型错误跨文件），返回 None；
-    有任何一条映射不到 worktree 里的文件（路径相对别的 root、在 worktree 外）也返回 None：基线照整条命令跑。"""
+    有任何一条映射不到 worktree 里的文件（路径相对别的 root、在 worktree 外、vitest 的未处理错误）也返回 None：基线照整条
+    命令跑。"""
     if parser == "vitest":
         paths = [path for _, path, _ in vitest_failure_entries(ANSI_RE.sub("", output), wt)]
     elif parser == "pytest":
@@ -7035,7 +7148,7 @@ def failure_files(parser: str, output: str, current: Counter, wt: str) -> Option
         paths = [key.rsplit(" ", 1)[0] for key in current]  # "文件 规则"，规则名里没有空格
     else:
         return None
-    if not paths or any(os.path.isabs(p) or p.split("/")[0] == ".." or not os.path.isfile(os.path.join(wt, p))
+    if not paths or any(p is None or os.path.isabs(p) or p.split("/")[0] == ".." or not os.path.isfile(os.path.join(wt, p))
                         for p in paths):
         return None
     return sorted(set(paths))
@@ -7091,7 +7204,32 @@ def add_wait(entry: dict, res: dict) -> None:
 
 # accept 的几条 --verify-baseline 同时在基线上跑时：git worktree add / remove / prune 改的是同一个仓库的 worktree 元数据，
 # 同一进程里一条一条来（预防性的，只罩这几条 git 命令）；复制本地文件、装依赖、在基线上跑命令照样同时进行。
+# 同一个基线（同一个缓存键）另有跨进程的文件锁，见 baseline_run。
 BASELINE_PREP_LOCK = threading.Lock()
+
+
+def baseline_untrusted(data: dict) -> Optional[str]:
+    """基线结果为什么不能拿来比（None = 可信）。新跑出来的、缓存里读到的（含旧版本写进去的）都过这一道：不可信的不写缓存、
+    不用缓存，比对按失败处理。依赖没装好时基线会多出（或少掉）一串失败，这次真新增的同类失败会被当成本来就有。"""
+    code = data.get("exit_code")
+    if data.get("deps_has_failure"):
+        return "基线 worktree 装依赖失败"
+    if not isinstance(code, int) or code < 0:
+        return "基线上命令没跑成（超时、起不来或被信号杀掉）"
+    if data.get("parse_problem"):
+        return f"基线输出里{data['parse_problem']}"
+    if code != 0 and not data.get("failures"):
+        return "基线上命令也失败了，但解析不出失败条目（看 baseline_output_tail）"
+    return None
+
+
+def cached_baseline(cache: Path) -> Optional[dict]:
+    """读基线缓存；没有、读不了、不可信（baseline_untrusted）都返回 None，重新跑。"""
+    with contextlib.suppress(OSError, json.JSONDecodeError):
+        data = json.loads(cache.read_text())
+        if not baseline_untrusted(data):
+            return dict(data, cached=True)
+    return None
 
 
 def baseline_run(wt: str, base_sha: str, command: str, argv: list, timeout: float,
@@ -7099,6 +7237,8 @@ def baseline_run(wt: str, base_sha: str, command: str, argv: list, timeout: floa
     """在 BASE 上跑 argv（整条命令，或只带当前失败文件的子集），取基线失败集合。临时 detached worktree 建在
     ~/.drover/baselines/ 下，复制 .env 等本地文件、装依赖，跑完就删；结果按（仓库, BASE, 命令, 目标文件）缓存，
     同一个基线、同一批文件只跑一次。targets 是 None 表示跑整条命令（缓存键和以前一样）。
+    同一个缓存键整段拿跨进程的文件锁（<键>.lock）：两个 accept 同时比同一个基线时，临时 worktree 是同一个路径，以前会互删；
+    现在后到的等前一个跑完，直接读它的缓存（不可信的没进缓存，就自己再跑）。结果带 untrusted（见 baseline_untrusted）。
     只有在基线上跑命令那一步进 heavy 调度（lock）：建 worktree、复制、装依赖不占预留（以前整段在锁里）。"""
     common = git_common_dir(wt)
     if not common:
@@ -7106,41 +7246,59 @@ def baseline_run(wt: str, base_sha: str, command: str, argv: list, timeout: floa
     key_text = f"{common}|{base_sha}|{command}" + ("" if targets is None else "|targets:" + "\n".join(sorted(targets)))
     key = hashlib.sha1(key_text.encode()).hexdigest()[:16]
     cache = BASELINE_DIR / f"{key}.json"
-    if cache.exists():
-        with contextlib.suppress(OSError, json.JSONDecodeError):
-            data = json.loads(cache.read_text())
-            data["cached"] = True
+    with flock_file(BASELINE_DIR / f"{key}.lock", None):
+        data = cached_baseline(cache)
+        if data:
             return data
-    source_repo = str(common.parent)
-    tmp = BASELINE_DIR / f"wt-{key}"
-    with BASELINE_PREP_LOCK:
-        BASELINE_DIR.mkdir(parents=True, exist_ok=True)
-        if tmp.exists():
-            git(wt, "worktree", "remove", "--force", str(tmp), timeout=300)
-        p = git(wt, "worktree", "add", "--detach", str(tmp), base_sha, timeout=300)
-        if p.returncode != 0:
-            raise DroverError("建基线 worktree 失败", stderr=tail(p.stderr))
-    try:
-        copy_local_files(source_repo, str(tmp), False)
-        deps = cmd_deps(argparse.Namespace(repo=source_repo, wt=str(tmp), save=None, dry_run=False))
-        res = heavy_run(argv, str(tmp), lock=lock, timeout=timeout)
-        parser, failures = parse_failures(argv, res["output"], str(tmp))
-        data = {"base": base_sha, "command": command, "exit_code": res["exit_code"], "seconds": res["seconds"],
-                "parser": parser, "failures": dict(failures or {}), "counts": test_counts(res["output"]),
-                "deps_has_failure": deps.get("has_failure"), "at": time.strftime("%m-%d %H:%M:%S"),
-                "output_tail": tail(res["output"], 800)}
-        if targets is not None:
-            data.update(targets=sorted(targets), run_command=shlex.join(argv))
-        if res["exit_code"] == 0 or (parser and failures):
-            cache.write_text(json.dumps(data, ensure_ascii=False, indent=2))
-        data["cached"] = False
-        if res.get("lock_waited_seconds"):
-            data["lock_waited_seconds"] = res["lock_waited_seconds"]
-        return data
-    finally:
+        source_repo = str(common.parent)
+        tmp = BASELINE_DIR / f"wt-{key}"
         with BASELINE_PREP_LOCK:
-            git(wt, "worktree", "remove", "--force", str(tmp), timeout=300)
-            git(wt, "worktree", "prune")
+            BASELINE_DIR.mkdir(parents=True, exist_ok=True)
+            if tmp.exists():
+                git(wt, "worktree", "remove", "--force", str(tmp), timeout=300)
+            p = git(wt, "worktree", "add", "--detach", str(tmp), base_sha, timeout=300)
+            if p.returncode != 0:
+                raise DroverError("建基线 worktree 失败", stderr=tail(p.stderr))
+        try:
+            copy_local_files(source_repo, str(tmp), False)
+            deps = cmd_deps(argparse.Namespace(repo=source_repo, wt=str(tmp), save=None, dry_run=False))
+            res = heavy_run(argv, str(tmp), lock=lock, timeout=timeout)
+            parser, failures = parse_failures(argv, res["output"], str(tmp))
+            data = {"base": base_sha, "command": command, "exit_code": res["exit_code"], "seconds": res["seconds"],
+                    "parser": parser, "failures": dict(failures or {}),
+                    "parse_problem": reported_mismatch(parser, res["output"], failures) if parser else None,
+                    "counts": tally_fields(test_tally(res["output"]))["counts"],
+                    "deps_has_failure": deps.get("has_failure"), "at": time.strftime("%m-%d %H:%M:%S"),
+                    "output_tail": tail(res["output"], 800)}
+            if targets is not None:
+                data.update(targets=sorted(targets), run_command=shlex.join(argv))
+            data["untrusted"] = baseline_untrusted(data)
+            if not data["untrusted"]:
+                cache.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+            data["cached"] = False
+            if res.get("lock_waited_seconds"):
+                data["lock_waited_seconds"] = res["lock_waited_seconds"]
+            return data
+        finally:
+            with BASELINE_PREP_LOCK:
+                git(wt, "worktree", "remove", "--force", str(tmp), timeout=300)
+                git(wt, "worktree", "prune")
+
+
+def baseline_blocker(argv: list, output: str, parser: Optional[str], current: Optional[Counter]) -> Optional[str]:
+    """这次的输出为什么没法拿来和基线比（None = 能比）；这些情况一律按失败处理：只比解析出来的那部分，会把解析不出的、
+    没跑到的失败当成"没有新增"放过去。"""
+    if not parser:
+        return "认不出这条命令的失败条目（支持 vitest / pytest / tsc / eslint），没法和基线比，按失败处理"
+    mismatch = reported_mismatch(parser, output, current)
+    if mismatch:
+        return f"{mismatch}：解析不出的那部分没法和基线比，按失败处理"
+    stop = stopped_early(argv, output)
+    if stop:
+        return f"{stop}：后面的没跑，看不出有没有新增的失败，按失败处理（去掉 -x / --maxfail / --bail 再验）"
+    if not current:
+        return "退出码非 0，但解析不到失败条目，没法和基线比，按失败处理"
+    return None
 
 
 def compare_with_baseline(entry: dict, argv: list, output: str, wt: str, base: str, command: str,
@@ -7148,13 +7306,12 @@ def compare_with_baseline(entry: dict, argv: list, output: str, wt: str, base: s
     """命令失败时和 BASE 比失败条目：没有新增就判通过。vitest / pytest / eslint 在基线上只重跑当前失败所在的文件
     （BASE 上没有的文件不跑，它们的失败直接算新增；一个都不剩就不建基线 worktree）；tsc、拆不出文件的命令跑整条。
     vitest 新增的失败如果全是超时，再把这些文件单独重跑一次（负载超时）。结果写进 entry["baseline"]。
+    这次的输出比不了（baseline_blocker）、基线不可信（baseline_untrusted）都按失败处理，原因写进 baseline.error。
     在基线上跑和超时复核都进 heavy 调度（lock），排队秒数累加进 entry 的 lock_waited_seconds。"""
     parser, current = parse_failures(argv, output, wt)
-    if not parser:
-        entry["baseline"] = {"error": "认不出这条命令的失败条目（支持 vitest / pytest / tsc / eslint），没法和基线比，按失败处理"}
-        return
-    if not current:
-        entry["baseline"] = {"parser": parser, "error": "退出码非 0，但解析不到失败条目，没法和基线比，按失败处理"}
+    blocker = baseline_blocker(argv, output, parser, current)
+    if blocker:
+        entry["baseline"] = {**({"parser": parser} if parser else {}), "error": blocker}
         return
     base_sha = git_out(wt, "rev-parse", f"{base}^{{commit}}")
     failed_files = failure_files(parser, output, current, wt)
@@ -7185,8 +7342,8 @@ def compare_with_baseline(entry: dict, argv: list, output: str, wt: str, base: s
                      + (f"；另有 {len(not_on_base)} 个文件 BASE 上没有（新加的），它们的失败直接算新增" if not_on_base else ""))
         else:
             scope = f"当前失败的 {len(not_on_base)} 个文件 BASE 上都没有（新加的），没建基线 worktree，失败直接算新增"
-    if base_data.get("exit_code") not in (0, None) and not base_data.get("parser"):
-        info["error"] = "基线上这条命令也失败了，但认不出失败条目（看 baseline 的 output_tail）"
+    if base_data.get("untrusted"):
+        info["error"] = f"基线不可信：{base_data['untrusted']}，看不出哪些失败是本来就有的，按失败处理（结果没进缓存）"
         info["baseline_output_tail"] = base_data.get("output_tail")
         entry["baseline"] = info
         return
@@ -7198,11 +7355,11 @@ def compare_with_baseline(entry: dict, argv: list, output: str, wt: str, base: s
         timeout_only = {key for key, _, is_timeout in entries if key in new_set and is_timeout}
         if timeout_only == new_set:
             files = sorted({path for key, path, _ in entries if key in new_set})
-            again = heavy_run(vitest_rerun_argv(argv, files), wt, lock=lock, timeout=timeout)
+            again = judged_run(vitest_rerun_argv(argv, files), wt, lock=lock, timeout=timeout)
             add_wait(entry, again)
             info["new_timeout_recheck"] = {"files": files, "exit_code": again["exit_code"],
-                                           "counts": test_counts(again["output"])}
-            if again["exit_code"] == 0:
+                                           **tally_fields(again["tally"])}
+            if again["ok"]:
                 entry["flaky_timeouts"] = files
                 new = []
     info["new_failures"] = new[:30]
@@ -7221,10 +7378,27 @@ def compare_with_baseline(entry: dict, argv: list, output: str, wt: str, base: s
         entry["note"] = scope
 
 
+def recheck_timeouts(entry: dict, argv: list, wt: str, files: list, *, lock: bool, timeout: float) -> None:
+    """vitest 的失败全是超时：把这些文件单独重跑一次，通过（judged_run：退出码 0 且真的跑到了测试）就判为负载超时、不算失败。
+    结果写进 entry["timeout_recheck"]，exit_code 保留第一次的。"""
+    rerun = vitest_rerun_argv(argv, files)
+    again = judged_run(rerun, wt, lock=lock, timeout=timeout)
+    add_wait(entry, again)
+    entry["timeout_recheck"] = {"files": files, "command": shlex.join(rerun), "exit_code": again["exit_code"],
+                                "seconds": again["seconds"], **tally_fields(again["tally"]),
+                                "output_tail": tail(again["output"], 800)}
+    if "no_tests" in again:
+        entry["timeout_recheck"]["note"] = again["no_tests"]
+    if again["ok"]:
+        entry.update(ok=True, flaky_timeouts=files,
+                     note=f"全量里 {len(files)} 个文件的失败全是超时（负载），单独重跑通过，不算失败；exit_code 保留第一次的结果")
+
+
 def run_verify(wt: str, command: str, timeout: float, *, lock: bool = True, baseline: Optional[str] = None) -> dict:
-    """在 worktree 里重跑一条验证命令（shlex.split，不经 shell），记录退出码、耗时、计数行、输出尾部。
+    """在 worktree 里重跑一条验证命令（shlex.split，不经 shell），记录退出码、耗时、计数（counts、tests）、输出尾部。
+    通过与否见 judged_run：认得出测试框架时，退出码 0 却一个测试都没跑也不通过，note 写明。
     默认进 heavy 调度（lock=False 不进）：主命令、负载超时复核、基线上的那一步各自排队，排队秒数之和记在
-    lock_waited_seconds；vitest 失败且全是超时时，把失败的文件单独重跑一次，通过就判为负载超时、不算失败。"""
+    lock_waited_seconds；vitest 失败且全是超时时，把失败的文件单独重跑一次，通过（同样要真的跑到测试）就判为负载超时、不算失败。"""
     entry: dict = {"command": command, "ok": False, "exit_code": None}
     try:
         argv = shlex.split(command)
@@ -7234,26 +7408,16 @@ def run_verify(wt: str, command: str, timeout: float, *, lock: bool = True, base
     if not argv:
         entry["error"] = "空命令"
         return entry
-    res = heavy_run(argv, wt, lock=lock, timeout=timeout)
+    res = judged_run(argv, wt, lock=lock, timeout=timeout)
     add_wait(entry, res)
     output = res["output"]
-    entry.update(ok=res["exit_code"] == 0, exit_code=res["exit_code"], seconds=res["seconds"])
-    for key in ("timed_out", "error"):
+    entry.update(ok=res["ok"], exit_code=res["exit_code"], seconds=res["seconds"])
+    for key, field in (("timed_out", "timed_out"), ("error", "error"), ("no_tests", "note")):
         if key in res:
-            entry[key] = res[key]
+            entry[field] = res[key]
     files = vitest_timeout_failures(output, wt) if res["exit_code"] not in (0, None) else None
     if files:
-        rerun = vitest_rerun_argv(argv, files)
-        again = heavy_run(rerun, wt, lock=lock, timeout=timeout)
-        add_wait(entry, again)
-        entry["timeout_recheck"] = {"files": files, "command": shlex.join(rerun), "exit_code": again["exit_code"],
-                                    "seconds": again["seconds"], "counts": test_counts(again["output"]),
-                                    "output_tail": tail(again["output"], 800)}
-        if again["exit_code"] == 0:
-            entry["ok"] = True
-            entry["flaky_timeouts"] = files
-            entry["note"] = (f"全量里 {len(files)} 个文件的失败全是超时（负载），单独重跑通过，不算失败；"
-                             "exit_code 保留第一次的结果")
+        recheck_timeouts(entry, argv, wt, files, lock=lock, timeout=timeout)
     if baseline and not entry["ok"] and res["exit_code"] not in (0, None) and not res.get("timed_out"):
         entry["compare_baseline"] = True
         try:
@@ -7262,7 +7426,7 @@ def run_verify(wt: str, command: str, timeout: float, *, lock: bool = True, base
             entry["baseline"] = {"error": f"跑基线失败：{exc.message}", **exc.extra}
     last = [line.strip() for line in output.splitlines() if line.strip()]
     entry["summary_line"] = last[-1][:300] if last else ""
-    entry["counts"] = test_counts(output)
+    entry.update(tally_fields(res["tally"]))
     entry["output_tail"] = tail(output, 1500)
     return entry
 
@@ -7563,16 +7727,16 @@ def cmd_accept(a: argparse.Namespace) -> dict:
 
 
 def brief_verify(v: dict) -> dict:
-    """一条 verify 的摘要：判断要用的字段 + 测试计数行（不用再去存档里翻 output_tail）。"""
+    """一条 verify 的摘要：判断要用的字段 + 测试计数（tests 是 通过 / 失败 / 跳过 三个数，认得出测试框架时才有；counts 是
+    计数行），不用再去存档里翻 output_tail。旧存档没有 tests，照常只给 counts。"""
     out = {"command": v.get("command", "")[:120], "ok": v.get("ok"), "exit_code": v.get("exit_code"),
            "seconds": v.get("seconds"), "summary_line": v.get("summary_line") or v.get("error")}
-    for key in ("counts", "flaky_timeouts", "note", "lock_waited_seconds"):
+    for key in ("tests", "counts", "flaky_timeouts", "note", "lock_waited_seconds"):
         if v.get(key):
             out[key] = v[key]
     recheck = v.get("timeout_recheck")
     if recheck and not v.get("flaky_timeouts"):
-        out["timeout_recheck"] = {"files": recheck.get("files"), "exit_code": recheck.get("exit_code"),
-                                  "counts": recheck.get("counts")}
+        out["timeout_recheck"] = {k: recheck[k] for k in ("files", "exit_code", "tests", "counts", "note") if k in recheck}
     if v.get("baseline"):
         b = v["baseline"]
         out["baseline"] = {k: b[k] for k in ("base", "parser", "cached", "baseline_failures", "current_failures",

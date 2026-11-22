@@ -1,5 +1,7 @@
 """accept 端到端（CLI 子进程）：--verify 的负载超时复核、--verify-baseline 和基线比、--no-graph 跳过建图
 （--brief、accept-summary、review 读跳过的图谱）；不建图、锁和缓存都在临时状态目录。
+验收看证据：认得出测试框架（vitest / pytest / selftest/run.py / mvn surefire）、退出码 0 却一个测试都没跑的判不通过，
+摘要固定给 通过 / 失败 / 跳过 三个数；两个 accept 同时比同一个基线不互删。
 
 建图绕开的办法：临时环境的 PATH 去掉了有 code-review-graph 的目录，accept 走"找不到 code-review-graph"的分支，
 不会往临时仓库写 .code-review-graph，也不会花时间建图。--no-graph 的用例另外放一个只记日志的假 code-review-graph。
@@ -9,12 +11,14 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
+import subprocess
 import sys
 import unittest
 from pathlib import Path
 
-from selftest_support import DroverTestCase
+from selftest_support import DROVER, DroverTestCase
 
 # 只记日志的假 code-review-graph：证明 --no-graph 时没被调用（不带 --no-graph 时同一个假命令会被调用）。
 FAKE_GRAPH = r'''#!{python}
@@ -27,6 +31,39 @@ with (Path(__file__).resolve().parent / "graph-calls.log").open("a") as f:
 if sys.argv[1:2] == ["detect-changes"]:
     print("Analyzed 1 changed file\nOverall risk score: 0.10\nUntested: a")
 '''
+
+# 真实工具的输出样例（vitest 4.1.11、pytest 9.2.0、maven-surefire 3.5.4 在本机实测，去掉 ANSI；路径换短）。
+VITEST_NO_FILES = (" RUN  v4.1.11 /x/app\n\nNo test files found, exiting with code 0\n\n"
+                   "include: **/*.{test,spec}.?(c|m)[jt]s?(x)\nexclude:  **/node_modules/**, **/.git/**\n")
+VITEST_ALL_SKIPPED = (" RUN  v4.1.11 /x/app\n\n\n Test Files  1 skipped (1)\n      Tests  2 skipped (2)\n"
+                      "   Start at  15:26:04\n   Duration  78ms (transform 7ms, setup 0ms, import 12ms, tests 0ms)\n")
+VITEST_MIXED = (" RUN  v4.1.11 /x/app\n\n Test Files  1 failed | 3 passed (4)\n"
+                "      Tests  1 failed | 5 passed | 1 expected fail | 2 skipped | 1 todo (10)\n   Start at  15:26:04\n")
+PYTEST_Q_SKIPPED = "s                                                                        [100%]\n1 skipped in 0.02s\n"
+PYTEST_SKIPPED = ("============================= test session starts ==============================\n"
+                  "collected 1 item\n\ntests/test_calc.py s                                                     [100%]\n\n"
+                  "============================== 1 skipped in 0.12s ==============================\n")
+PYTEST_Q_PASSED = "..                                                                       [100%]\n2 passed in 0.00s\n"
+PYTEST_Q_MIXED = ("FFs.\n=========================== short test summary info ============================\n"
+                  "FAILED tests/test_m.py::test_1 - assert 1 == 2\nFAILED tests/test_m.py::test_2 - assert 2 == 3\n"
+                  "2 failed, 1 passed, 1 skipped in 0.01s\n")
+MVN_PASSED = ("[INFO] --- surefire:3.5.4:test (default-test) @ p ---\n[INFO] \n"
+              "[INFO] -------------------------------------------------------\n[INFO]  T E S T S\n"
+              "[INFO] -------------------------------------------------------\n[INFO] Running p.AppTest\n"
+              "[WARNING] Tests run: 3, Failures: 0, Errors: 0, Skipped: 1, Time elapsed: 0.021 s -- in p.AppTest\n"
+              "[INFO] \n[INFO] Results:\n[INFO] \n[WARNING] Tests run: 3, Failures: 0, Errors: 0, Skipped: 1\n"
+              "[INFO] \n[INFO] BUILD SUCCESS\n")
+MVN_ALL_SKIPPED = ("[INFO] Results:\n[INFO] \n[WARNING] Tests run: 2, Failures: 0, Errors: 0, Skipped: 2\n"
+                   "[INFO] \n[INFO] BUILD SUCCESS\n")
+SELFTEST_SUMMARY = ("最慢的 10 个用例（秒）：\n     1.2  test_x.A.test_y\n"
+                    "========== 1 failed, 40 passed, 2 skipped in 12.3s (-j 8) ==========\n")
+# 基线上本来就有的一条 tsc 错误（集成检查同时比基线的用例用）
+TSC_OLD = "src/old.ts(1,14): error TS2322: Type 'string' is not assignable to type 'number'.\n\nFound 1 error.\n"
+
+
+def printer(output: str, code: int = 0) -> str:
+    """一条只打印 output、以 code 退出的命令（不经 shell）：计数只看输出，和命令叫什么无关。"""
+    return shlex.join([sys.executable, "-c", f"import sys; sys.stdout.write({output!r}); sys.exit({code})"])
 
 
 class AcceptCliTests(DroverTestCase):
@@ -112,6 +149,110 @@ class AcceptCliTests(DroverTestCase):
         self.assertTrue(res["ok"], res)
         self.assertIn("没建图（--no-graph）", res["prompt"])
         self.assertNotIn("图谱不可用", res["prompt"])
+
+    def test_brief_gives_three_numbers_and_flags_zero_tests(self) -> None:
+        """--brief 和 accept-summary：认得出测试框架的每条 verify 固定带 tests（通过 / 失败 / 跳过）；vitest run --changed
+        一个测试文件都没找到（退出码 0）→ 判不通过、note 写明没有测试真的跑，整份验收 verify_failed"""
+        self.write_spec(self.wt, "vitest", {"output": VITEST_NO_FILES, "exit": 0})
+        res = self.accept("--no-graph", "--brief", "--verify", printer(PYTEST_Q_PASSED),
+                          "--verify", f"vitest run --changed {self.base}")
+        passed, no_tests = res["verify"]
+        self.assertTrue(passed["ok"], passed)
+        self.assertEqual(passed["tests"], {"passed": 2, "failed": 0, "skipped": 0})
+        self.assertEqual(passed["counts"], ["2 passed in 0.00s"])
+        self.assertFalse(no_tests["ok"], no_tests)
+        self.assertEqual(no_tests["exit_code"], 0)
+        self.assertEqual(no_tests["tests"], {"passed": 0, "failed": 0, "skipped": 0})
+        self.assertIn("没有测试真的跑", no_tests["note"])
+        self.assertTrue(res["verify_failed"])
+        summary = self.drover_json("accept-summary", str(self.state / "s1" / "accept.json"))
+        self.assertEqual([v.get("tests") for v in summary["verify"]], [passed["tests"], no_tests["tests"]])
+
+    def test_concurrent_accepts_share_one_baseline(self) -> None:
+        """两个 accept 同时和同一个基线比（同一仓库的两个 worktree、同一 BASE、同一条命令；基线上那次 tsc 要跑 2 秒、
+        跑的过程中还要读文件）：后到的等先到的跑完、直接用它的缓存，不删对方的基线 worktree。两边都判对（失败都是基线上
+        本来就有的），基线只跑了一次、缓存一份"""
+        repo, other = self.work / "race", self.work / "race-b"
+        base = self.init_repo(repo, {"fake-tsc.json": json.dumps({"output": TSC_OLD, "exit": 2, "sleep": 2})})
+        self.git(repo, "worktree", "add", "-q", "-b", "task/b", str(other))
+        for wt in (repo, other):
+            self.write_spec(wt, "tsc", {"output": TSC_OLD, "exit": 2})
+        procs = [subprocess.Popen([sys.executable, str(DROVER), "accept", "--wt", str(wt), "--base", base, "--no-graph",
+                                   "--brief", "--save", str(self.state / "race" / f"{n}.json"),
+                                   "--verify-baseline", "tsc --noEmit"],
+                                  env=self.env, cwd=str(self.tmp), stdout=subprocess.PIPE, text=True)
+                 for n, wt in enumerate((repo, other))]
+        results = [json.loads(p.communicate(timeout=120)[0]) for p in procs]
+        for res in results:
+            v = res["verify"][0]
+            self.assertTrue(v["ok"], v)
+            self.assertIn("没有新增", v["note"])
+        base_runs = [c for c in self.tool_calls("tsc") if c["cwd"].startswith(str(self.state / "baselines"))]
+        self.assertEqual(len(base_runs), 1, base_runs)
+        self.assertEqual(sorted(v["verify"][0]["baseline"]["cached"] for v in results), [False, True])
+        self.assertEqual(len(list((self.state / "baselines").glob("*.json"))), 1)
+        self.assertEqual(list((self.state / "baselines").glob("wt-*")), [])
+
+
+class VerifyEvidenceTests(DroverTestCase):
+    """run_verify 看证据：认得出测试框架的输出（vitest / pytest / selftest/run.py / mvn surefire）时算真的跑了几个，
+    退出码 0 却一个都没跑的判不通过；tests 固定给 通过 / 失败 / 跳过；认不出的命令（tsc、build、脚本）判定不变。
+    命令是只打印真实输出样例的 python（printer），或回放样例的假工具（fake-<工具>.json 的 output）。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.wt = self.work / "app"
+        self.base = self.init_repo(self.wt, {"README.md": "# app\n"})
+        self.d = self.load_drover()
+
+    def verify(self, command: str) -> dict:
+        return self.d.run_verify(str(self.wt), command, 60, lock=False)
+
+    def test_zero_tests_fail_with_note(self) -> None:
+        """退出码 0 但没有测试真的跑 → 不通过，note 写明：vitest 没找到测试文件（--changed 没碰到测试）、全部跳过；
+        pytest -q / 默认输出全部跳过；mvn 全部跳过"""
+        self.write_spec(self.wt, "vitest", {"output": VITEST_NO_FILES, "exit": 0})
+        cases = {"vitest --changed 没找到测试文件": f"vitest run --changed {self.base}",
+                 "vitest 全部跳过": printer(VITEST_ALL_SKIPPED), "pytest -q 全部跳过": printer(PYTEST_Q_SKIPPED),
+                 "pytest 全部跳过": printer(PYTEST_SKIPPED), "mvn 全部跳过": printer(MVN_ALL_SKIPPED)}
+        for name, command in cases.items():
+            with self.subTest(name):
+                entry = self.verify(command)
+                self.assertFalse(entry["ok"], entry)
+                self.assertEqual(entry["exit_code"], 0)
+                self.assertEqual(entry["tests"]["passed"] + entry["tests"]["failed"], 0)
+                self.assertIn("没有测试真的跑", entry["note"])
+
+    def test_counts_three_numbers(self) -> None:
+        """tests 固定三个数，counts 是计数行：pytest -q 的汇总（含 skipped）、mvn 的 Tests run（Results 汇总那行，不重复算
+        每个类那行；Tests run 含跳过的）、selftest/run.py 的汇总行、vitest 的 expected fail / todo"""
+        cases = [(printer(PYTEST_Q_PASSED), True, {"passed": 2, "failed": 0, "skipped": 0}, ["2 passed in 0.00s"]),
+                 (printer(PYTEST_Q_MIXED, 1), False, {"passed": 1, "failed": 2, "skipped": 1},
+                  ["2 failed, 1 passed, 1 skipped in 0.01s"]),
+                 (printer(MVN_PASSED), True, {"passed": 2, "failed": 0, "skipped": 1},
+                  ["[WARNING] Tests run: 3, Failures: 0, Errors: 0, Skipped: 1"]),
+                 (printer(SELFTEST_SUMMARY, 1), False, {"passed": 40, "failed": 1, "skipped": 2},
+                  ["========== 1 failed, 40 passed, 2 skipped in 12.3s (-j 8) =========="]),
+                 (printer(VITEST_MIXED, 1), False, {"passed": 6, "failed": 1, "skipped": 3},
+                  ["Test Files  1 failed | 3 passed (4)",
+                   "Tests  1 failed | 5 passed | 1 expected fail | 2 skipped | 1 todo (10)"])]
+        for command, ok, tests, counts in cases:
+            with self.subTest(counts[-1]):
+                entry = self.verify(command)
+                self.assertEqual(entry["ok"], ok, entry)
+                self.assertEqual(entry["tests"], tests)
+                self.assertEqual(entry["counts"], counts)
+                self.assertNotIn("note", entry)
+
+    def test_unrecognized_commands_unchanged(self) -> None:
+        """认不出测试框架的命令（tsc、build、脚本）只看退出码，没有 tests 字段"""
+        for command in ("tsc --noEmit", printer("vite v5 building for production...\n✓ 34 modules transformed.\n"),
+                        printer("Ran 0 checks\n")):
+            with self.subTest(command):
+                entry = self.verify(command)
+                self.assertTrue(entry["ok"], entry)
+                self.assertNotIn("tests", entry)
+                self.assertEqual(entry["counts"], [])
 
 
 if __name__ == "__main__":

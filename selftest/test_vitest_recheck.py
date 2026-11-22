@@ -1,4 +1,5 @@
-"""1. vitest 负载超时复核（run_verify / accept --verify）：失败全是超时才把失败文件单独重跑，过了就判通过。
+"""1. vitest 负载超时复核（run_verify / accept --verify）：失败全是超时才把失败文件单独重跑，过了（而且真的跑到了测试）就判通过；
+汇总里还有未处理错误时不复核。
 
 用假 vitest（selftest_fakes）：按当前目录的 fake-vitest.json 打印 vitest 格式的失败；参数里带测试文件时是复核，
 只跑这些文件（超时单独跑时通过，rerun_fail 里的复核时还失败）。
@@ -65,6 +66,24 @@ class VitestTimeoutRecheckTests(DroverTestCase):
         entry = self.verify({"failures": [TIMEOUT_A], "tests_failed": 3})
         self.assertFalse(entry["ok"])
         self.assertNotIn("timeout_recheck", entry)
+
+    def test_unhandled_error_not_rechecked(self) -> None:
+        """失败条目全是超时，但汇总里还有未处理错误（Unhandled Errors，没有 FAIL 行，别的文件抛的）→ 不复核、判失败：
+        单独重跑超时的文件能过，也洗不掉同一次运行里的未处理错误"""
+        entry = self.verify({"failures": [TIMEOUT_A], "unhandled": 1})
+        self.assertFalse(entry["ok"])
+        self.assertEqual(entry["exit_code"], 1)
+        self.assertNotIn("timeout_recheck", entry)
+        self.assertNotIn("flaky_timeouts", entry)
+        self.assertEqual(len(self.tool_calls("vitest")), 1)
+
+    def test_recheck_without_tests_not_passed(self) -> None:
+        """复核的重跑退出码 0、却一个测试都没跑（No test files found）→ 不算复核通过，判失败，timeout_recheck 写明原因"""
+        entry = self.verify({"failures": [TIMEOUT_A], "rerun_no_tests": True})
+        self.assertFalse(entry["ok"])
+        self.assertEqual(entry["timeout_recheck"]["exit_code"], 0)
+        self.assertIn("没有测试真的跑", entry["timeout_recheck"]["note"])
+        self.assertNotIn("flaky_timeouts", entry)
 
     def test_dotdot_paths_become_relative_to_worktree(self) -> None:
         """vitest 打印 ../../.. 开头的路径（root 经过符号链接）→ 复核和 flaky_timeouts 用相对 worktree 的路径"""

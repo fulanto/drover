@@ -27,7 +27,7 @@
 | `deps` | 在 worktree 里独立安装依赖（不软链源仓库） | 编排者 |
 | `agent-start` | 在 pane 里启动 claude / codex worker，自动处理启动弹窗：新目录的信任弹窗、Claude Code 对 `--add-dir` 加进来的目录弹的 "Adding a new directory" 信任框（光标默认在 "No, exit"，移到 "Yes, add it" 再确认）、codex 的升级提示 | 编排者 |
 | `brief` | 按模板生成任务书（必填完成证据），可先摸底，`--send` 生成后立刻发出（和 `prompt` 一样看到开工就返回）。模板里限了篇幅：摸底只写结论和证据位置，"和代码不符""需要决策"两部分写全、其余 100 行左右；报告每条 verification 一行、尽量 60 行内，worker 在对话里只回复报告路径和 status | 编排者 |
-| `accept` | 验收：标记新文件、建图、改动分析、diff 概览、crapper 查这次改动碰到的函数的圈复杂度、重跑验证命令；`--verify-baseline` 和基线比失败条目（基线上只重跑失败的文件），`--integration` 是集成检查（不建图、不跑 crapper，dryer 扫全仓、只留碰到改动的重复），`--no-graph` 只是不建图。建图、dryer 和验证命令都经 heavy 调度；多条验证默认同时交给调度（能同时跑的同时跑，结果按传入顺序），前后有依赖的加 `--serial` 逐条跑 | 编排者 |
+| `accept` | 验收：标记新文件、建图、改动分析、diff 概览、crapper 查这次改动碰到的函数的圈复杂度、重跑验证命令（认得出 vitest / pytest / mvn 的输出时，退出码 0 却一个测试都没跑也判不通过；每条给 通过 / 失败 / 跳过 三个数）；`--verify-baseline` 和基线比失败条目（基线上只重跑失败的文件；解析不全、提前停了、基线不可信都按失败），`--integration` 是集成检查（不建图、不跑 crapper，dryer 扫全仓、只留碰到改动的重复），`--no-graph` 只是不建图。建图、dryer 和验证命令都经 heavy 调度；多条验证默认同时交给调度（能同时跑的同时跑，结果按传入顺序），前后有依赖的加 `--serial` 逐条跑 | 编排者 |
 | `integrate` | 集成 worktree：从最新上游建（或复用），依次 cherry-pick 条目分支，装依赖。新建时和 `wt` 一样核实起点含上一轮推的提交（`--from` 的条目分支里已有的不算缺），`--carry` 同 `wt`；重建集成 worktree 不丢推送记录 | 编排者 |
 | `push` | 集成 worktree 推送：上游有新提交就 rebase 并报告（这次不推），否则推送并 `ls-remote` 核对；每次推上去都记进任务的 `pushes.jsonl`（有没有集成状态都记；记下 remote 名和推送时的地址 `remote_url`，返回里也有），定不了任务就不推、提示加 `--slug` | 编排者 |
 | `wrapup` | 收尾汇总的事实收集，不改仓库和任务记录：每个仓库每条分支的推送记录（`pushes.jsonl` 和旧任务的 `integrate-*.json`，patch 模式的也在）和远端核对（最后一次推到的是 remote 换地址之前的仓库时不核对，写明两个地址）、推送范围里的迁移 / 配置 / 部署 / 依赖文件和新增配置键线索、整体检查结果、待清理的 worktree 和分支（子编排者的一起收）；`--draft <文件>` 生成 wrapup.md 骨架（只写这一个文件，写成了在时间线记一条收尾汇总） | 编排者 |
@@ -210,7 +210,7 @@ drover/
 ├── main-session.json                # 登记上的主会话：session_id、pane、source（startup / clear / compact / resume），main-register 写；drover rollup 按 pane 认主会话
 ├── main-rules.json                  # 主会话载入时的 drover 区块，drover rules 拿它比、读完更新
 ├── main-watch.json                  # watch --main 报过的 drover 自己的事（会话重开），多个 watch 只报一次靠它
-└── baselines/                       # 基线比对缓存（按仓库 + 基线 commit + 命令 + 重跑的文件），以及临时的基线 worktree
+└── baselines/                       # 基线比对缓存（按仓库 + 基线 commit + 命令 + 重跑的文件；只存可信的结果），同一个键的跨进程锁 <键>.lock，以及临时的基线 worktree
 
 ~/.herdr/worktrees/<仓库>/…          # Herdr 管理的 worktree，条目的和集成的都在这里
 ```
