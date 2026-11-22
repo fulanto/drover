@@ -27,11 +27,11 @@ drover 是这套派发体系的名字，也是它的命令（Claude Code 的 `/d
 - 不 commit、不 push、不关 workspace、不删 worktree，除非用户明确要求：提交推送按第 9.1 节，删 worktree 按第 7 节（探测 worktree 例外，见第 9 节"pane 清理"）。
 - 每个里程碑（计划定了、worktree 建好、agent 启动、拿到结果）给用户一两句进度。
 
-**drover CLI**：建 worktree、装依赖、启动 agent、发 prompt、追踪、验收都通过 `~/.drover/bin/drover <子命令>` 执行（下文简称"脚本"）。每个子命令输出一个 JSON：`ok` 表示成功与否，失败时 `error` 写明原因和下一步。`<子命令> --help` 查参数；`wt`、`deps`、`agent-start`、`brief`、`prompt`、`integrate`、`push`、`cleanup`、`orch-start`、`review` 支持 `--dry-run`，只列出要执行的命令（`accept`、`collect` 没有）。脚本没覆盖的操作（`herdr agent read`、`send-keys`、`pane read`）直接用单条 herdr 命令。脚本内部怎么做（每一步做了什么、返回的每个字段）见包里的 docs/reference.md 和各子命令的 `--help`，本文件只写看哪个字段、接着做什么。
+**drover CLI**：建 worktree、装依赖、启动 agent、发 prompt、追踪、验收都通过 `~/.drover/bin/drover <子命令>` 执行（下文简称"脚本"）。每个子命令输出一个 JSON：`ok` 表示成功与否，失败时 `error` 写明原因和下一步。`<子命令> --help` 查参数；`wt`、`deps`、`agent-start`、`brief`、`prompt`、`integrate`、`trial`、`push`、`cleanup`、`orch-start`、`review` 支持 `--dry-run`，只列出要执行的命令（`accept`、`collect` 没有）。脚本没覆盖的操作（`herdr agent read`、`send-keys`、`pane read`）直接用单条 herdr 命令。脚本内部怎么做（每一步做了什么、返回的每个字段）见包里的 docs/reference.md 和各子命令的 `--help`，本文件只写看哪个字段、接着做什么。
 
 **宿主**：编排者可以跑在 Claude Code 或 Codex 里，本文件两边共用（它在 drover 包里是 `flow/dispatch.md`，安装后的固定位置是 `~/.drover/pkg/flow/dispatch.md`：Claude Code 的 `/drover` 命令 `~/.claude/commands/drover.md` 软链到它，Codex 由 `~/.codex/skills/drover/SKILL.md` 引到这里）。正文只写一次；追踪怎么挂、怎么向用户提问、长命令怎么放后台、子代理叫什么、沙箱，这些宿主不同的做法见文末**附录 A（Claude Code）**和**附录 B（Codex）**。正文里的 Write / Read / Edit 泛指读写文件。
 
-**走到那一步再读的几份**：本文件是每个任务都走的主干。下面四段只在走到那一步时才用得上，放在同目录的单独文件里，主干在那一步写了"先读哪份"，之前不用读：`~/.drover/pkg/flow/integrate.md`（集成与推送，第 9.1 节）、`~/.drover/pkg/flow/wrapup.md`（收尾与清理，第 9 节"任务收尾"）、`~/.drover/pkg/flow/sub-orch.md`（子编排者）、`~/.drover/pkg/flow/review.md`（复审，第 8 节）。
+**走到那一步再读的几份**：本文件是每个任务都走的主干。下面四段只在走到那一步时才用得上，放在同目录的单独文件里，主干在那一步写了"先读哪份"，之前不用读：`~/.drover/pkg/flow/integrate.md`（试集成、集成与推送：请用户批推送之前，和第 9.1 节）、`~/.drover/pkg/flow/wrapup.md`（收尾与清理，第 9 节"任务收尾"）、`~/.drover/pkg/flow/sub-orch.md`（子编排者）、`~/.drover/pkg/flow/review.md`（复审，第 8 节）。
 
 ## 编排者模式（参数带 `--orch <slug>` 时）
 
@@ -84,7 +84,7 @@ drover 是这套派发体系的名字，也是它的命令（Claude Code 的 `/d
 
   修 bug 或设计方案按根治三问（核心原则）写，主会话按这几行审（routing.md 的"转达前先审"）：第一行"应该怎样：<①，从目标推的那句>"，第二行"根因：<哪一层、为什么>；改在：<哪一层>"，接着"依据"：根因、推荐做法、每个被否的改法所依赖的事实，推荐和"应该怎样"不一样的地方，每条一行"事实 — 仓库@分支 文件:行 / 实测 / 外部平台官方文档：…"；能自己核实的先核实（核心原则"证据"），确实核实不了的标"未核实"并写明卡在哪，推荐不能建在它上面，列成要用户先查的问题；再一行"读过的仓库：…"（链路经过、没读的也列上）。推荐的不在根因层时，源头改法（要另开任务也算）也列成一个选项、写清代价；和现有链路行为不同的地方逐条列成决定项，不当实现细节；和目标冲突的已知限制不写进"未决"了事，要么修，要么列成决定项；结论自己说在噪声范围内、不能支撑决定的，不交用户选。不是修 bug / 设计类的结论（探针、评估、排查的发现），和验证、未决里的事实判断，同样按核心原则"证据"写，现象带原因。
 
-  "验证"写成证据指针，不写一句"测试通过"：每条完成证据一行 `命令或操作 → 结果（通过 / 失败 / 跳过三个数，取 accept 摘要；不是测试的写退出码）→ 谁跑的（编排者重跑 / 只有 worker 自述 / 没验证）→ 存档路径`；只有 worker 自述的照实写（有 heavy 流水、证据目录的写上路径），不写成通过；没做真实入口验证的单写一行和原因；推送了的加一行整体检查，写明覆盖了推上去的哪个提交。主会话按这几行审"完成"（routing.md"转达前先审"第 5 条）。例：
+  "验证"写成证据指针，不写一句"测试通过"：每条完成证据一行 `命令或操作 → 结果（通过 / 失败 / 跳过三个数，取 accept 摘要；不是测试的写退出码）→ 谁跑的（编排者重跑 / 只有 worker 自述 / 没验证）→ 存档路径`；只有 worker 自述的照实写（有 heavy 流水、证据目录的写上路径），不写成通过；没做真实入口验证的单写一行和原因；请用户批推送的加一行试集成的整体检查（写明试集成的树）、一行解了哪些冲突、一行合并才有的修正（integrate.md"试集成"第 4 步）；推送了的加一行整体检查，写明覆盖了推上去的哪个提交。主会话按这几行审"完成"和批推送（routing.md"转达前先审"第 5 条）。例：
 
   ```
   验证：
@@ -92,6 +92,8 @@ drover 是这套派发体系的名字，也是它的命令（Claude Code 的 `/d
   - 回归用例改前失败 → 流水 #3 失败（1 failed）→ #11 通过 → 只有 worker 自述 → ~/.drover/<slug>/heavy-runs.jsonl
   - 登录页走一遍 → 截图 ~/.drover/<slug>/evidence/w1/ → 只有 worker 自述 → 无存档
   - 没做真实入口验证（要测试环境）
+  - 试集成整体检查 `python3 selftest/run.py` → 通过（818 / 0 / 0）→ 编排者重跑 → ~/.drover/<slug>/accept-trial-drover.json，试集成的树 5a102e0
+  - 试集成解的冲突：w1 和 w2 在 docs/reference.md 同一张表相邻两行，两行都留；合并修正：无
   - 整体检查 `python3 selftest/run.py` → 通过（812 / 0 / 3）→ 编排者重跑 → ~/.drover/<slug>/accept-integrate-drover.json，覆盖已推 abc1234
   ```
 
@@ -479,6 +481,8 @@ PARTIAL / FAILED 时先读报告和屏幕（`herdr agent read <name> --source re
 
 ## 9. 汇报（最终消息）
 
+有没推的改动、要请用户批推送时（编排者模式写"等你决定"问推送），先读 `~/.drover/pkg/flow/integrate.md` 做"试集成"：把各条目没提交的改动在最新上游上叠起来、跑整体检查（不提交、永不推），结果写进"验证"再问。
+
 开头一行写目标（第 1.1 节，用户纠正过就用纠正后的），再说结论（全部完成 / 部分完成 / 需用户决定），然后每个仓库一段：
 
 - worktree 路径、分支、workspace label、agent 名与 pane_id（用户可 `herdr agent focus <name>` 跳过去看）
@@ -500,7 +504,7 @@ worktree、workspace 留着（什么时候删见第 7 节和下面"任务收尾"
 
 ### 9.1 集成与推送（用户明确要求提交 / 推送后才做）
 
-主会话转达了用户提交 / 推送的明确要求（带用户原话）之后，先读 `~/.drover/pkg/flow/integrate.md` 再动手。推送只有一条路：按条目提交 → `drover integrate` 建集成 worktree → `accept --integration` 整体检查 → 迁移 → `drover push`；用户授权之前只做条目验收（第 6.1 节），不提前把各条目的改动叠到一起做整体检查。
+主会话转达了用户提交 / 推送的明确要求（带用户原话）之后，先读 `~/.drover/pkg/flow/integrate.md` 再动手。推送只有一条路：按条目提交 → `drover integrate` 建集成 worktree → `accept --integration` 整体检查 → 迁移 → `drover push`；用户授权之前不提交：条目验收（第 6.1 节）之后先做试集成（integrate.md"试集成"：不提交地叠起来、整体检查，结果写进请用户批推送的 rollup，永远不推），批了之后正式集成的树等于试集成验过的树就沿用那次检查、不重跑。
 
 ### pane 清理（用完的 pane 要关）
 
