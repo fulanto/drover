@@ -1,5 +1,6 @@
 """selftest 用的假可执行文件：假 herdr、假 vitest / tsc / eslint / pytest。install() 把它们放进每个用例的临时目录
-（每个进程写一次、各用例硬链接，见 place）。假 ssh 只有测联网重试的用例按需装（install_ssh，见 FAKE_SSH）。
+（每个进程写一次、各用例硬链接，见 place）。假 ssh 只有测联网重试的用例按需装（install_ssh，见 FAKE_SSH）；
+假 pnpm / npm / uv 只有 deps 的用例按需装（install_pkg_tools，见 FAKE_PKG）。
 
 假 herdr：按同目录的 herdr-state.json 返回 JSON 和屏幕内容，每次调用记进 herdr-calls.log，不连任何 server。
   - agent list / get / read：state["agents"][名字] = {status, cwd, seq（state_change_seq，默认 0）,
@@ -498,6 +499,75 @@ while args and args[0].startswith("-"):  # git 给 ssh 的选项：-o SendEnv=GI
 sys.exit(subprocess.call(["sh", "-c", " ".join(args[1:])]))
 '''
 
+# 假包管理器 pnpm / npm / uv（按需装，见 install_pkg_tools；deps 的用例用）：每次调用的工具名、参数和 stdin 的样子记进
+# pkg-calls.log（stdin：tty 是终端，eof 是马上读到 EOF，open 是没关、读不到东西的管道，data 是有内容，closed 是没有 stdin；
+# 只看不读，不会卡住）；同目录 fake-pkg.json 的 fail 里列了这个工具名时打一行错误、退出 1，什么都不建。装出来的样子：
+#   pnpm install --dir <wt> …        在 <wt>/node_modules 里写 fake-installed（第几次装的）
+#   npm ci --prefix <wt>             和真的 npm ci 一样先删掉已有的 node_modules，再写 fake-installed
+#   uv sync --frozen --project <wt>  在 <wt>/.venv 里写 fake-installed（已有的 .venv 不删）
+#   uv venv --seed --python <版本> <目录>   建 <目录>/bin/python 和 pyvenv.cfg
+#   uv pip freeze --python <解释器>   打印两行固定的包和一行 -e file://<源仓库>（解释器往上三级，源 venv 里可编辑安装的本仓库）；
+#   uv pip install 只记日志
+FAKE_PKG = r'''#!{python}
+import json
+import os
+import select
+import shutil
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+TOOL = Path(sys.argv[0]).name
+args = sys.argv[1:]
+
+
+def stdin_state():
+    try:
+        if os.isatty(0):
+            return "tty"
+        ready, _, _ = select.select([0], [], [], 0)
+    except OSError:
+        return "closed"
+    if not ready:
+        return "open"
+    return "eof" if os.read(0, 1) == b"" else "data"
+
+
+with (HERE / "pkg-calls.log").open("a") as f:
+    f.write(json.dumps({"tool": TOOL, "args": args, "stdin": stdin_state()}) + "\n")
+spec_file = HERE / "fake-pkg.json"
+spec = json.loads(spec_file.read_text()) if spec_file.exists() else {}
+if TOOL in spec.get("fail", []):
+    sys.stderr.write("fake %s: install failed\n" % TOOL)
+    sys.exit(1)
+
+
+def opt(name):
+    return args[args.index(name) + 1]
+
+
+def mark(folder):
+    folder.mkdir(parents=True, exist_ok=True)
+    m = folder / "fake-installed"
+    m.write_text(str(int(m.read_text()) + 1) if m.exists() else "1")
+
+
+if TOOL == "pnpm":
+    mark(Path(opt("--dir")) / "node_modules")
+elif TOOL == "npm":
+    shutil.rmtree(Path(opt("--prefix")) / "node_modules", ignore_errors=True)
+    mark(Path(opt("--prefix")) / "node_modules")
+elif args[:1] == ["sync"]:
+    mark(Path(opt("--project")) / ".venv")
+elif args[:1] == ["venv"]:
+    venv = Path(args[-1])
+    (venv / "bin").mkdir(parents=True, exist_ok=True)
+    (venv / "bin" / "python").write_text("#!/bin/sh\n")
+    (venv / "pyvenv.cfg").write_text("version = %s\n" % opt("--python"))
+elif args[:2] == ["pip", "freeze"]:
+    print("requests==2.31.0\npytest==8.0.0\n-e file://%s" % Path(opt("--python")).parents[2])
+'''
+PKG_TOOLS = ("pnpm", "npm", "uv")
 TOOLS = ("vitest", "tsc", "eslint", "pytest")
 _shared: dict = {}  # 脚本内容 -> 这个进程里写好的那一份
 _shared_dir: Optional[Path] = None  # 放这些脚本的进程级临时目录，第一次用时建、进程退出时删
@@ -531,6 +601,12 @@ def install(fakebin: Path, python: str) -> None:
     scripts = {"herdr": FAKE_HERDR, **{name: FAKE_TOOL for name in TOOLS}}
     for name, body in scripts.items():
         place(fakebin / name, body.replace("{python}", python, 1))
+
+
+def install_pkg_tools(fakebin: Path, python: str) -> None:
+    """把假 pnpm / npm / uv 放进 fakebin（见 FAKE_PKG）：PATH 里排在本机真的包管理器前面，不联网、不装东西。"""
+    for name in PKG_TOOLS:
+        place(fakebin / name, FAKE_PKG.replace("{python}", python, 1))
 
 
 def install_ssh(fakebin: Path, python: str, fail: int, message: str) -> None:

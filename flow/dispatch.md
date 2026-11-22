@@ -250,6 +250,7 @@ slug：由你从任务描述生成，英文 kebab-case，≤ 30 字符，只含 
 - **Python**：有 `uv.lock` 用 `uv sync --frozen`；否则复刻源仓库 `.venv`（同版本解释器 + 同一份包，包括 requirements 里没写的 pytest 等），再按 worktree 的 `requirements.txt` 补装；源 venv 里指向本仓库的 `-e` 可编辑安装改为指向 worktree。
 - **Java**：依赖在全局 `~/.m2` / `~/.gradle`，不用处理。
 - **子目录里的 lockfile**（如 `web-app` 的 `mobile/`）：不自动装，在摘要里告诉 agent。
+- **worktree 里已有依赖时**：依赖清单（根目录 lockfile、各 `package.json`、`pnpm-workspace.yaml` / `.npmrc` 等安装配置，`uv.lock` / `pyproject.toml`，`requirements.txt`，以及安装命令）自上次 drover 安装以来没变才跳过（装成功后在 `node_modules` / `.venv` 里记一份 `.drover-deps.json`）；变了、或者不是 drover 装的，照常严格安装（Python 在已有 `.venv` 上 `uv sync --frozen` 或按 `requirements.txt` 补装，不重建）。所以 integrate 摘进改依赖的条目、push rebase 后上游改了依赖，重跑 `deps` 就会重装。`node_modules` / `.venv` 是软链的不经它装，摘要里写明指向哪、要独立安装先删掉这个链接。deps 是无人值守的：包管理器不继承调用方的 stdin（读到的是 EOF），pnpm 要清空 `node_modules` 重装时（升了版本、改了 hoist / node-linker 这类布局配置）直接清空重装，不停下来问。
 
 输出的 `summary_for_prompt` 由第 5 节的 `brief` 从 `--save` 的存档里读出来放进 prompt 的依赖一项；`has_failure: true` 时也写进汇报。agent 照样用 `./.venv/bin/python` 这类已在白名单里的相对路径命令。
 

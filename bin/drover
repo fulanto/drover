@@ -159,6 +159,21 @@ JS_LOCKFILES = [
     ("package-lock.json", "npm"),
 ]
 LOCKFILE_NAMES = {name for name, _ in JS_LOCKFILES} | {"uv.lock"}
+# deps 记在依赖目录（node_modules / .venv）里的安装记录：上次严格安装成功时的输入（安装命令、各输入文件内容的 sha256）。
+# 依赖目录在、记录和这次的输入一致才跳过；不一致或没有记录（旧版 drover、worker 自己装的）照常严格安装：开始装之前删掉旧记录，
+# 成功后重记（装到一半失败、被打断的，下次一定重装）。
+# 来由：原来只看依赖目录在不在，集成 worktree 复用时摘进来的条目改了 lockfile、加了工作区包，deps 照样跳过，
+# 新包没有 node_modules，tsc / 测试整片失败，只能手动重装。
+DEPS_STAMP = ".drover-deps.json"
+# 包管理器在项目根目录读的安装配置，改了会改变装出来的 node_modules：工作区成员（pnpm-workspace.yaml）、hoist / node-linker /
+# registry（.npmrc、.yarnrc、.yarnrc.yml、bunfig.toml）、pnpmfile 钩子改写依赖（.pnpmfile.cjs）。npm / yarn / bun 的工作区
+# 写在 package.json 里，各包的 package.json 另外列（js_manifests）。用不到的包管理器的文件一般不存在，列上也不多花时间。
+JS_INSTALL_CONFIG = (".npmrc", "pnpm-workspace.yaml", ".pnpmfile.cjs", ".yarnrc", ".yarnrc.yml", "bunfig.toml")
+# uv sync --frozen 的输入：锁文件、项目声明、.python-version（uv 按它挑建 .venv 的 Python）。
+UV_SYNC_INPUTS = ("uv.lock", "pyproject.toml", ".python-version")
+# deps 跑的命令一律给这个 stdin（capture_run 开一根管道、什么都不写就关上，读到的就是 EOF）：deps 是无人值守的一步，
+# 不继承调用方的 stdin。编排者在 Codex 的 exec_command（PTY）里跑 integrate 时 stdin 是终端，包管理器的交互确认会一直等到超时。
+DEPS_NO_INPUT = ""
 SCAN_SKIP_DIRS = {
     "node_modules", ".git", ".venv", "venv", ".output", "dist", "build", "target",
     ".code-review-graph", ".next", ".nuxt", "__pycache__",
@@ -1822,11 +1837,112 @@ class DepsPlan:
         if self.dry_run:
             return True, "dry-run", 0.0
         started = time.time()
-        p = run(cmd, timeout=timeout)
+        p = run(cmd, timeout=timeout, input_text=DEPS_NO_INPUT)
         return p.returncode == 0, tail(p.stderr or p.stdout, 600), round(time.time() - started, 1)
 
     def add(self, kind: str, action: str, summary: str, **extra: Any) -> None:
         self.items.append({"kind": kind, "action": action, "summary": summary, **extra})
+
+    def record(self, dep_dir: Path, inputs: dict) -> None:
+        """安装成功后在依赖目录里记下这次的输入（DEPS_STAMP）；dry-run 不记。包管理器没建目录（没有要装的包）时建个空的。"""
+        if not self.dry_run:
+            dep_dir.mkdir(exist_ok=True)
+            (dep_dir / DEPS_STAMP).write_text(json.dumps(inputs, ensure_ascii=False, indent=1) + "\n")
+
+    def forget(self, dep_dir: Path) -> None:
+        """开始安装前删掉旧记录：装到一半失败或被打断时依赖目录可能已经动过，之后输入改回原样也不能按旧记录跳过。"""
+        if not self.dry_run:
+            (dep_dir / DEPS_STAMP).unlink(missing_ok=True)
+
+    def skip_link(self, kind: str, dep_dir: Path, **extra: Any) -> None:
+        """依赖目录是软链：不经它安装、不往里写记录（经软链安装会把包装进链接目标，多半是源仓库），记一条 skipped。"""
+        target = os.readlink(dep_dir)
+        self.add(kind, "skipped",
+                 f"worktree 里的 {dep_dir.name} 是软链（指向 {target}），没有经它安装：经软链安装会把包装进链接目标。"
+                 f"要在 worktree 里独立安装，先删掉这个链接（rm {dep_dir}，只删链接本身）再跑 deps。",
+                 link_target=target, **extra)
+
+
+def deps_inputs(wt: Path, rels: tuple | list, command: list) -> dict:
+    """一次安装的输入：安装命令和各输入文件（相对 worktree，不存在的不列）内容的 sha256。按内容算，不看 mtime。"""
+    files = {rel: hashlib.sha256((wt / rel).read_bytes()).hexdigest()
+             for rel in sorted(set(rels)) if (wt / rel).is_file()}
+    return {"command": command, "files": files}
+
+
+def read_deps_stamp(dep_dir: Path) -> Optional[dict]:
+    try:
+        stamp = json.loads((dep_dir / DEPS_STAMP).read_text())
+    except (OSError, ValueError):
+        return None
+    return stamp if isinstance(stamp, dict) and isinstance(stamp.get("files"), dict) else None
+
+
+def deps_changes(old: dict, new: dict) -> list:
+    """old 是上次记的输入，new 是这次的：列出变了的（"<文件> 变了 / 新增 / 删了"、"安装命令变了"）。"""
+    before, after = old["files"], new["files"]
+    changes = [f"{rel} {'新增' if rel not in before else '删了' if rel not in after else '变了'}"
+               for rel in sorted(set(before) | set(after)) if before.get(rel) != after.get(rel)]
+    if old.get("command") != new["command"]:
+        changes.append("安装命令变了")
+    return changes
+
+
+def deps_stale_reason(dep_dir: Path, inputs: dict) -> Optional[str]:
+    """依赖目录和这次的输入对得上（上次 drover 装成功时记的输入和这次一样）返回 None，否则返回要装的原因。"""
+    if not dep_dir.exists():
+        return f"worktree 里原来没有 {dep_dir.name}"
+    stamp = read_deps_stamp(dep_dir)
+    if stamp is None:
+        return f"已有的 {dep_dir.name} 没有 drover 的安装记录（旧版 drover 或 worker 自己装的），照常严格安装"
+    changes = deps_changes(stamp, inputs)
+    if not changes:
+        return None
+    shown = "、".join(changes[:6]) + (f" 等 {len(changes)} 项" if len(changes) > 6 else "")
+    return f"依赖清单自上次安装以来变了：{shown}，所以重装"
+
+
+def install_if_stale(plan: DepsPlan, kind: str, dep_dir: Path, inputs: dict, texts: dict, **extra: Any) -> None:
+    """依赖目录和这次的输入对得上就跳过（不调用包管理器）；否则跑 inputs 里的安装命令，成功后在依赖目录里记下这次的输入，
+    失败不记（下次照样重试）。texts 是四种结果的摘要：skipped / no_tool / installed / failed。"""
+    reason = deps_stale_reason(dep_dir, inputs)
+    if reason is None:
+        plan.add(kind, "skipped", texts["skipped"], **extra)
+        return
+    cmd = inputs["command"]
+    if not shutil.which(cmd[0]):
+        plan.add(kind, "failed", texts["no_tool"], reason=reason, **extra)
+        return
+    plan.forget(dep_dir)
+    ok, out, secs = plan.step(cmd)
+    if not ok:
+        plan.add(kind, "failed", f"{texts['failed']}错误尾部：{out[-200:]}", reason=reason,
+                 command=shlex.join(cmd), error=out, seconds=secs, **extra)
+        return
+    plan.record(dep_dir, inputs)
+    plan.add(kind, "installed", f"{texts['installed']}；{reason}。", reason=reason,
+             command=shlex.join(cmd), seconds=secs, **extra)
+
+
+def js_install_cmd(tool: str, wt: Path) -> list:
+    """按根目录 lockfile 严格安装、不改写 lockfile 的命令。pnpm 带 confirm-modules-purge=false：已有的 node_modules 和当前设置
+    不兼容（pnpm 升了版本、改了 hoist / node-linker 这类布局配置）时 pnpm 要清空重装，默认先问一句、只有 --force 或 CI 才不问
+    （pnpm 10.12.4 dist/pnpm.cjs 的 purgeModulesDirsOfImporters、validateModules），不判断是不是终端：stdin 是终端就一直等，
+    stdin 是 EOF 则退出码 0 却没重装（实测）。node_modules 是 worktree 自己的（软链已排除），清空重装就是对的结果，同 npm ci。"""
+    return {
+        "bun": ["bun", "install", "--cwd", str(wt), "--frozen-lockfile"],
+        "pnpm": ["pnpm", "install", "--dir", str(wt), "--frozen-lockfile", "--config.confirm-modules-purge=false"],
+        "yarn": ["yarn", "--cwd", str(wt), "install", "--frozen-lockfile"],
+        "npm": ["npm", "ci", "--prefix", str(wt)],
+    }[tool]
+
+
+def js_manifests(wt: Path) -> list:
+    """worktree 里的 package.json：根目录和各工作区包（已跟踪的加没被忽略的未跟踪文件，新加的工作区包也算），
+    不含 node_modules 里装出来的。按 git 的忽略规则列，构建产物里的 package.json 不会让依赖白白重装。"""
+    out = git_out(str(wt), "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--",
+                  ":(glob)**/package.json", ":(exclude,glob)**/node_modules/**")
+    return [rel for rel in out.split("\0") if rel]
 
 
 def deps_js(plan: DepsPlan, wt: Path) -> None:
@@ -1837,127 +1953,156 @@ def deps_js(plan: DepsPlan, wt: Path) -> None:
         plan.add("js", "not_installed", "有 package.json 但没有 lockfile，未安装 JS 依赖；需要时请在 worktree 内自行安装。")
         return
     lockname, tool = lock
-    if (wt / "node_modules").exists():
-        plan.add("js", "skipped", f"worktree 里已有 node_modules，未重装（lockfile：{lockname}）。", tool=tool)
+    node_modules = wt / "node_modules"
+    if node_modules.is_symlink():
+        plan.skip_link("js", node_modules, tool=tool)
         return
-    if not shutil.which(tool):
-        plan.add("js", "failed", f"仓库用 {lockname}，但本机找不到 {tool}，未安装 JS 依赖；需要时请自行安装。", tool=tool)
-        return
-    cmd = {
-        "bun": ["bun", "install", "--cwd", str(wt), "--frozen-lockfile"],
-        "pnpm": ["pnpm", "install", "--dir", str(wt), "--frozen-lockfile"],
-        "yarn": ["yarn", "--cwd", str(wt), "install", "--frozen-lockfile"],
-        "npm": ["npm", "ci", "--prefix", str(wt)],
-    }[tool]
-    ok, out, secs = plan.step(cmd)
-    if ok:
-        plan.add("js", "installed",
-                 f"JS 依赖已按 {lockname} 装好（{tool}，worktree 内独立的 node_modules，不是源仓库的软链）。",
-                 command=shlex.join(cmd), seconds=secs)
-    else:
-        plan.add("js", "failed",
-                 f"JS 依赖按 {lockname} 严格安装失败（lockfile 可能和 package.json 不一致），node_modules 可能不完整；"
-                 f"需要时请在 worktree 内自行安装。错误尾部：{out[-200:]}",
-                 command=shlex.join(cmd), error=out, seconds=secs)
+    inputs = deps_inputs(wt, [lockname, *JS_INSTALL_CONFIG, *js_manifests(wt)], js_install_cmd(tool, wt))
+    install_if_stale(plan, "js", node_modules, inputs, {
+        "skipped": f"依赖清单（{lockname}、各 package.json、安装配置）自上次安装以来没变，未重装 node_modules。",
+        "no_tool": f"仓库用 {lockname}，但本机找不到 {tool}，未安装 JS 依赖；需要时请自行安装。",
+        "installed": f"JS 依赖已按 {lockname} 装好（{tool}，worktree 内独立的 node_modules，不是源仓库的软链）",
+        "failed": f"JS 依赖按 {lockname} 严格安装失败（lockfile 可能和 package.json 不一致），node_modules 可能不完整；"
+                  "需要时请在 worktree 内自行安装。",
+    }, tool=tool)
 
 
 def deps_python(plan: DepsPlan, repo: Path, wt: Path) -> None:
     wt_venv = wt / ".venv"
-    src_venv = repo / ".venv"
     has_py_project = any((wt / f).is_file() for f in ("requirements.txt", "pyproject.toml", "uv.lock"))
-    if not has_py_project and not src_venv.exists():
+    if not has_py_project and not (repo / ".venv").exists():
         return
-    if wt_venv.exists():
-        plan.add("python", "skipped", "worktree 里已有 .venv，未重建。")
-        return
-    if not shutil.which("uv"):
+    if wt_venv.is_symlink():
+        plan.skip_link("python", wt_venv)
+    elif (wt / "uv.lock").is_file():
+        deps_uv_sync(plan, wt)
+    elif wt_venv.exists():
+        deps_venv_topup(plan, wt)
+    elif not shutil.which("uv"):
         plan.add("python", "failed", "找不到 uv，未建 Python 环境；需要时请自行创建 ./.venv。")
-        return
+    else:
+        deps_venv_clone(plan, repo, wt)
 
-    if (wt / "uv.lock").is_file():
-        cmd = ["uv", "sync", "--frozen", "--project", str(wt)]
-        ok, out, secs = plan.step(cmd)
-        if ok:
-            plan.add("python", "installed", "Python 环境已按 uv.lock 同步到 ./.venv（uv sync --frozen）。",
-                     command=shlex.join(cmd), seconds=secs)
-        else:
-            plan.add("python", "failed", f"uv sync --frozen 失败，./.venv 可能不完整；需要时请自行处理。错误尾部：{out[-200:]}",
-                     command=shlex.join(cmd), error=out, seconds=secs)
-        return
 
+def deps_uv_sync(plan: DepsPlan, wt: Path) -> None:
+    """有 uv.lock：按它同步 ./.venv（已有的 .venv 上照样跑，uv 自己让它和 uv.lock 一致）。"""
+    inputs = deps_inputs(wt, UV_SYNC_INPUTS, ["uv", "sync", "--frozen", "--project", str(wt)])
+    install_if_stale(plan, "python", wt / ".venv", inputs, {
+        "skipped": "依赖清单（uv.lock、pyproject.toml）自上次同步以来没变，未重新同步 ./.venv。",
+        "no_tool": "找不到 uv，未同步 Python 环境；需要时请自行处理 ./.venv。",
+        "installed": "Python 环境已按 uv.lock 同步到 ./.venv（uv sync --frozen）",
+        "failed": "uv sync --frozen 失败，./.venv 可能不完整；需要时请自行处理。",
+    })
+
+
+def venv_topup_inputs(wt: Path) -> dict:
+    """复刻源仓库 venv 那条路里 worktree 自己的输入：requirements.txt 和补装它的命令。"""
+    cmd = ["uv", "pip", "install", "--python", str(wt / ".venv" / "bin" / "python"), "-r", str(wt / "requirements.txt")]
+    return deps_inputs(wt, ["requirements.txt"], cmd)
+
+
+def deps_venv_topup(plan: DepsPlan, wt: Path) -> None:
+    """没有 uv.lock、已有 .venv：requirements.txt 变了（或 .venv 不是 drover 建的）就在已有 .venv 上补装，不删掉重建。"""
+    if not (wt / "requirements.txt").is_file():
+        plan.add("python", "skipped", "worktree 里已有 .venv，没有 requirements.txt 要补装，未改动。")
+        return
+    install_if_stale(plan, "python", wt / ".venv", venv_topup_inputs(wt), {
+        "skipped": "requirements.txt 自上次安装以来没变，未改动 ./.venv。",
+        "no_tool": "找不到 uv，没能按 requirements.txt 补装 ./.venv；需要时请自行处理。",
+        "installed": "已有 ./.venv，按 worktree 的 requirements.txt 补装（uv pip install -r，没有重建）",
+        "failed": "按 worktree 的 requirements.txt 补装失败，./.venv 可能不完整；需要时请自行处理。",
+    })
+
+
+def deps_venv_clone(plan: DepsPlan, repo: Path, wt: Path) -> None:
+    """worktree 里还没有 .venv、也没有 uv.lock：复刻源仓库的 .venv（同版本解释器 + 同一份包），再按 worktree 的
+    requirements.txt 补装，源 venv 里指向本仓库的可编辑安装改指向 worktree。都做完才记安装记录（requirements.txt 的指纹）。"""
+    src_venv, wt_venv = repo / ".venv", wt / ".venv"
     src_py = src_venv / "bin" / "python"
     if not src_py.exists():
         plan.add("python", "not_installed", "源仓库没有 .venv，worktree 里没有建 Python 环境；需要时请自行创建 ./.venv。")
         return
-
     version = venv_python_version(src_venv)
     if not version:
         plan.add("python", "failed", "读不出源仓库 .venv 的 Python 版本，未建 Python 环境。")
         return
     started = time.time()
     commands = []
-    wt_py = wt_venv / "bin" / "python"
-
     cmd = ["uv", "venv", "--seed", "--python", version, str(wt_venv)]
     commands.append(shlex.join(cmd))
     ok, out, _ = plan.step(cmd, timeout=600)
     if not ok:
         plan.add("python", "failed", f"uv venv 创建失败（Python {version}）。错误尾部：{out[-200:]}", error=out)
         return
-
-    editable: list = []
-    if plan.dry_run:
-        commands.append(f"uv pip freeze --python {src_py} → 去掉 -e 行写入 .venv/base-freeze.txt → uv pip install -r")
-    else:
-        p = run(["uv", "pip", "freeze", "--python", str(src_py)], timeout=300)
-        if p.returncode != 0:
-            plan.add("python", "failed", "读取源仓库 venv 的包列表失败。", error=tail(p.stderr))
-            return
-        pinned = []
-        for line in p.stdout.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            (editable if line.startswith("-e ") else pinned).append(line)
-        freeze = wt_venv / "base-freeze.txt"
-        freeze.write_text("\n".join(pinned) + "\n")
-        cmd = ["uv", "pip", "install", "--python", str(wt_py), "-r", str(freeze)]
-        commands.append(shlex.join(cmd))
-        ok, out, _ = plan.step(cmd)
-        if not ok:
-            plan.add("python", "failed", f"按源仓库 venv 的包列表安装失败。错误尾部：{out[-200:]}", error=out,
-                     commands=commands)
-            return
-
-    req = wt / "requirements.txt"
-    if req.is_file():
-        cmd = ["uv", "pip", "install", "--python", str(wt_py), "-r", str(req)]
-        commands.append(shlex.join(cmd))
-        ok, out, _ = plan.step(cmd)
+    editable = clone_src_packages(plan, src_py, wt_venv, commands)
+    if editable is None:
+        return
+    topup = venv_topup_inputs(wt)
+    has_req = (wt / "requirements.txt").is_file()
+    if has_req:
+        commands.append(shlex.join(topup["command"]))
+        ok, out, _ = plan.step(topup["command"])
         if not ok:
             plan.add("python", "failed", f"按 worktree 的 requirements.txt 补装失败。错误尾部：{out[-200:]}", error=out,
                      commands=commands)
             return
+    reinstalled = repoint_editables(plan, editable, repo, wt, commands)
+    plan.record(wt_venv, topup)
+    plan.add("python", "installed", venv_clone_summary(version, has_req, reinstalled),
+             reason="worktree 里原来没有 .venv", commands=commands, editable=reinstalled,
+             seconds=round(time.time() - started, 1))
 
+
+def clone_src_packages(plan: DepsPlan, src_py: Path, wt_venv: Path, commands: list) -> Optional[list]:
+    """把源仓库 venv 的包（uv pip freeze 去掉 -e 行）装进 worktree 的 .venv，返回源 venv 里的可编辑安装行；
+    失败记一条 failed、返回 None。"""
+    if plan.dry_run:
+        commands.append(f"uv pip freeze --python {src_py} → 去掉 -e 行写入 .venv/base-freeze.txt → uv pip install -r")
+        return []
+    p = run(["uv", "pip", "freeze", "--python", str(src_py)], timeout=300, input_text=DEPS_NO_INPUT)
+    if p.returncode != 0:
+        plan.add("python", "failed", "读取源仓库 venv 的包列表失败。", error=tail(p.stderr))
+        return None
+    editable, pinned = [], []
+    for line in p.stdout.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        (editable if line.startswith("-e ") else pinned).append(line)
+    freeze = wt_venv / "base-freeze.txt"
+    freeze.write_text("\n".join(pinned) + "\n")
+    cmd = ["uv", "pip", "install", "--python", str(wt_venv / "bin" / "python"), "-r", str(freeze)]
+    commands.append(shlex.join(cmd))
+    ok, out, _ = plan.step(cmd)
+    if not ok:
+        plan.add("python", "failed", f"按源仓库 venv 的包列表安装失败。错误尾部：{out[-200:]}", error=out,
+                 commands=commands)
+        return None
+    return editable
+
+
+def repoint_editables(plan: DepsPlan, editable: list, repo: Path, wt: Path, commands: list) -> list:
+    """源 venv 里以可编辑方式装的本仓库，换成 worktree 里的同一路径重装，避免 import 到源仓库的代码。"""
     reinstalled = []
     for line in editable:
         target = line[3:].strip()
         target_path = target[len("file://"):] if target.startswith("file://") else target
         if target_path and is_under(target_path, repo):
-            # 源 venv 里以可编辑方式装的本仓库，换成 worktree 里的同一路径，避免 import 到源仓库的代码。
             target_path = str(wt / Path(target_path).resolve().relative_to(repo.resolve()))
-        cmd = ["uv", "pip", "install", "--python", str(wt_py), "-e", target_path]
+        cmd = ["uv", "pip", "install", "--python", str(wt / ".venv" / "bin" / "python"), "-e", target_path]
         commands.append(shlex.join(cmd))
         ok, out, _ = plan.step(cmd)
         reinstalled.append({"source": target, "installed_as": target_path, "ok": ok})
+    return reinstalled
 
+
+def venv_clone_summary(version: str, has_req: bool, reinstalled: list) -> str:
     summary = f"Python 环境已建好：./.venv（Python {version}）复刻了源仓库 venv 的包"
-    if req.is_file():
+    if has_req:
         summary += "，并按 requirements.txt 补装"
     if reinstalled:
         summary += f"；{len(reinstalled)} 个可编辑安装已改指向 worktree"
-    plan.add("python", "installed", summary + "。",
-             commands=commands, editable=reinstalled, seconds=round(time.time() - started, 1))
+    return summary + "。"
 
 
 def cmd_deps(a: argparse.Namespace) -> dict:
@@ -8003,7 +8148,9 @@ def cmd_integrate(a: argparse.Namespace) -> dict:
         "round_check": wt_res.get("round_check"), **({"carried": wt_res["carried"]} if wt_res.get("carried") else {}),
         "upstream": upstream, "base": state["base"], "fetch_tries": tries,
         "picked": picked_now, "skipped": skipped, "head": git_out(wt, "rev-parse", "HEAD"),
-        "deps": {"has_failure": deps.get("has_failure"), "saved_to": deps.get("saved_to")},
+        # deps 每一项这次是装了（installed）、跳过（skipped：依赖清单没变 / 软链）还是失败，原因和摘要在 saved_to 里。
+        "deps": {"has_failure": deps.get("has_failure"), "saved_to": deps.get("saved_to"),
+                 "items": [{"kind": i["kind"], "action": i["action"]} for i in deps["items"]]},
         "state_file": str(state_path),
         "next": (f"整体检查（全量测试、tsc、build 等）：drover accept --wt {wt} --base {state['base']} "
                  f"--save {STATE_HOME / a.slug}/accept-integrate-{name}.json --brief --verify …"),
@@ -10474,7 +10621,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--repo", required=True, help="源仓库路径（复刻它的 .venv）")
     p.add_argument("--wt", required=True, help="worktree 路径")
     p.add_argument("--save", help="把结果另存为 JSON（brief 用 --deps-json 读它），约定 ~/.drover/<slug>/deps-<仓库名>.json")
-    p.add_argument("--dry-run", action="store_true", help="只列出要执行的命令")
+    p.add_argument("--dry-run", action="store_true",
+                   help="不装、不记安装记录：按上次的安装记录报每一项会跳过还是会装（会装的写原因），列出要执行的命令")
 
     p = sub.add_parser("agent-start", help="启动 claude/codex agent")
     p.add_argument("--name", required=True, help="agent 名，[a-z][a-z0-9_-]{0,31}")
