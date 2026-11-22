@@ -4809,8 +4809,6 @@ BOARD_WRAPUP_HEAD = "收尾"
 BOARD_HOLD_WIDTH = 20  # 收尾格"先别：<原因>""已收尾，留 <留了什么>"的原因 / 留了什么最多 10 个字
 BOARD_ANSWERED = "已转答复，等它接着做"
 BOARD_STATE_PREFIX = {"受阻": "受阻：", "需要换编排者": "换编排者中："}
-BOARD_TAB_COUNTS = (("wait", "等你"), ("done", "完成"))
-BOARD_LINE_COUNTS = (("wait", "等你"), ("doing", "进行中"), ("done", "完成"))
 BOARD_WRAPUP_BUTTON = "[收尾]"
 # 横向滚动提示行两头能点的按钮（ASCII：以前的 ◀ ▶ 宽度不定，画成两格时点不准）
 BOARD_SCROLL_LEFT, BOARD_SCROLL_RIGHT = "[<]", "[>]"
@@ -4901,7 +4899,7 @@ BOARD_DESCRIPTION = f"""\
 自动更新被挡住或失败的「drover 自动更新暂停：<原因>」。
 文本、--plain、--json、--live 会触发 drover 的自动更新检查（到时间才在后台查，不等它）；--line、--pending 不触发。
 --tab 在主会话所在的 workspace 里开一个和主对话同级的"看板"tab 跑 --live（不抢焦点，代替以前 --pane 的下方分屏，顺带关掉它）。
---live 跑在这个 tab 里时：tab 名就是汇总（如"看板·等你2·完成1"，为 0 的不写，都为 0 叫"看板"，变了才改）；终端里能点、能滚、
+--live 跑在这个 tab 里时：tab 名就是汇总（如"看板·等你2·进行中1·完成1"，为 0 的不写，都为 0 叫"看板"，变了才改）；终端里能点、能滚、
 能拖选复制（单击是按下、松开在同一格）：
   某一行的 {BOARD_WRAPUP_BUTTON}         把"收尾：<slug>"交给 herdr-oncall 的 {ONCALL_SEND_SCRIPT} 送进主会话（它在开头加"[看板] "，
                          主会话按口令收尾），留在看板，这一格变"收尾中"，记 {WRAPUP_CLICKED_FILE} 和时间线
@@ -5425,20 +5423,19 @@ def board_frame(view: dict, now: float, width: int, extra: tuple, mouse: bool, o
     return lines, regions, layout[0] if layout else 0
 
 
-def board_counts(view: dict, labels: tuple, sep: str) -> list:
-    """按组数任务："<组名><sep><个数>"，为 0 的不写。"""
-    rows = {g["key"]: g["rows"] for g in view["groups"]}
-    return [f"{label}{sep}{len(rows[key])}" for key, label in labels if rows[key]]
+def board_counts(view: dict, sep: str) -> list:
+    """按看板的组（BOARD_SECTIONS：等你、进行中、完成，按这个顺序）数任务："<组名><sep><个数>"，为 0 的不写。"""
+    return [f"{g['title']}{sep}{len(g['rows'])}" for g in view["groups"] if g["rows"]]
 
 
 def board_tab_label(view: dict) -> str:
-    """看板 tab 的名字就是汇总："看板·等你2·完成1"；为 0 的不写，都为 0 就叫"看板"。"""
-    return "·".join([BOARD_TAB_LABEL, *board_counts(view, BOARD_TAB_COUNTS, "")])
+    """看板 tab 的名字就是汇总："看板·等你2·进行中1·完成1"；为 0 的不写，都为 0 就叫"看板"。"""
+    return "·".join([BOARD_TAB_LABEL, *board_counts(view, "")])
 
 
 def board_line(view: dict) -> str:
     """一行汇总（给状态栏）："drover 等你 2 · 进行中 1 · 完成 1"，为 0 的项不写。"""
-    parts = board_counts(view, BOARD_LINE_COUNTS, " ")
+    parts = board_counts(view, " ")
     return "drover " + " · ".join(parts) if parts else "drover 无任务"
 
 

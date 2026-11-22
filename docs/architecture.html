@@ -1428,7 +1428,7 @@ footer.end { margin-top: 64px; font-size: 13px; color: var(--muted); display: fl
             <ul>
               <li><strong>主会话的追踪只报要处理的事</strong>：<code>watch --main</code> 自动盯所有顶层编排者，只报未读的 rollup（等你决定 / 完成 / 受阻 / 需要换编排者）、确认框、接口错误、意外退出、停了 N 分钟没更新、herdr 连不上，还有 drover 自己的更新；working、进行中都不报。哪份 rollup 读过由 drover 记（主会话用 <code>drover rollup</code> 读了才算），报过的事件记在磁盘上，重挂、<code>/clear</code> 之后都不重报。Claude Code 的主会话用后台 Bash 挂 <code>--until-event</code>，只在有事时退出、叫醒它（实测挂 35 分钟，只在退出时叫醒了一次）。</li>
               <li><strong>看板</strong> <code>drover board</code>：一个状态一张表（等你 / 进行中 / 完成），一行一个任务，列是 任务（中文标题）| 当前状态 | 要你做什么 | 状态持续 | 代号，完成那张多一列收尾，提醒写在那个任务下面。终端里问进度，给 Markdown 表格；飞书里发“看板”“进度”，给 <code>--plain</code> 纯文字，按手机一屏排好；看板 tab 里是 <code>--live</code>。</li>
-              <li><strong>看板 tab</strong>：<code>board --tab</code> 在主会话旁边开一个同级 tab，tab 名就是汇总（比如“看板·等你2·完成1”），每 15 秒重画；表比终端宽时能左右滚，按住拖动选中、松开自动复制。</li>
+              <li><strong>看板 tab</strong>：<code>board --tab</code> 在主会话旁边开一个同级 tab，tab 名就是汇总（比如“看板·等你2·进行中1·完成1”），每 15 秒重画；表比终端宽时能左右滚，按住拖动选中、松开自动复制。</li>
               <li><strong>一键收尾</strong>：看板上点 [收尾] / [全部收尾]，经 herdr-oncall 送进主会话；在终端、飞书里说“全部收尾”也一样。主会话只收“完成、收尾：可以、编排者还开着”的任务；编排者在 rollup 开头写了“收尾：先别，&lt;原因&gt;”的不收。</li>
               <li><strong>rollup 开头几行</strong>：标题 / 摘要 / 要你做 / 收尾 / 提醒，看板就读这几行；状态持续、总耗时由 drover 记在每个任务的 <code>timeline.jsonl</code> 里。</li>
               <li><strong>转达带上其他在等你的</strong>：每条转达末尾附上 <code>board --pending</code> 的输出，推到手机的每一条都带着全部待定的事，前面的不会被后面的冲掉。</li>
@@ -2576,7 +2576,7 @@ cd ~/.drover/src
         <li>在主工作台的会话里直接说需求，不用写 <code>/drover</code>。可以带 <code>@仓库</code>、<code>--agent codex</code>、<code>--orch codex</code>、<code>--review</code>、<code>--effort</code>；<code>--agent</code> / <code>--orch</code> 不写就跟主会话用同一个宿主。调研、排查、写方案也直接说，一样交给编排者。</li>
         <li>主会话第一条回复就是它对目标的复述，看到不对直接纠正，它会转给编排者。</li>
         <li>想直接跟编排者聊：<code>herdr agent focus orch-xxx</code>。</li>
-        <li>看进度：主会话旁边有个“看板”tab，tab 名就是汇总（比如“看板·等你2·完成1”），点进去是一行一个任务的表；问一句“进度怎么样”，主会话把 <code>drover board</code> 的表原样给你。</li>
+        <li>看进度：主会话旁边有个“看板”tab，tab 名就是汇总（比如“看板·等你2·进行中1·完成1”），点进去是一行一个任务的表；问一句“进度怎么样”，主会话把 <code>drover board</code> 的表原样给你。</li>
         <li>编排者“等你决定”时，主会话审过再转给你，你的回答会原样转过去。</li>
         <li>说“提交推送”进入集成和推送；说“收尾”先出收尾汇总（变更、提交、数据库、配置、上线），再用 <code>drover cleanup</code> 核实后清理 worktree、分支、pane 和 tab。看板上点 [收尾] / [全部收尾]，或者说“全部收尾”，能收的一起收。只说“清理”就只清理。</li>
         <li>离开电脑（选装）：装的时候加 <code>--oncall</code>、扫码配对一次，之后主会话需要你会推到飞书，飞书里不引用直接发就是在跟主会话说话（见<a href="#oncall">离开电脑</a>）。</li>

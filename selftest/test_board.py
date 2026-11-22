@@ -1898,33 +1898,37 @@ class BoardTabTests(TabTestCase):
         self.assertEqual(self.calls("pane", "close"), [])
 
     def test_live_tab_label(self) -> None:
-        """--live 在看板 tab 里：tab 名就是汇总（等你 / 完成各几个任务，进行中不写，为 0 的不写），按计数变，没变不重复 rename；
-        不在 herdr 里（没有 HERDR_PANE_ID）、在别的 tab（--pane 的分屏）里不改名，照常画看板；stdout 不是终端时不开鼠标"""
+        """--live 在看板 tab 里：tab 名就是汇总（等你 / 进行中 / 完成各几个任务，按这个顺序，为 0 的不写，都为 0 叫"看板"），
+        按计数变，没变不重复 rename；不在 herdr 里（没有 HERDR_PANE_ID）、在别的 tab（--pane 的分屏）里不改名，照常画看板；
+        stdout 不是终端时不开鼠标"""
         self.setup_tab()
-        self.task("t-u", "orch-u", "等你决定", age=HOUR, read=True)
         self.task("t-a", "orch-a", "进行中", age=HOUR)
-        self.set_agents(**{"orch-u": {"status": "done", "screen": NORMAL}, "orch-a": {"status": "done", "screen": WEBFETCH}})
+        self.set_agents(**{"orch-a": {"status": "done", "screen": WEBFETCH}})
         out = self.live("w1:p2", iterations=2)
-        self.assertEqual(self.calls("tab", "rename"), [["tab", "rename", "w1:t2", "看板·等你1"]])  # 第二轮没变不改
+        self.assertEqual(self.calls("tab", "rename"), [["tab", "rename", "w1:t2", "看板·进行中1"]])  # 第二轮没变不改
         self.assertNotIn("\033[?1000h", out)
         self.assertNotIn("◀", out)
+        self.task("t-u", "orch-u", "等你决定", age=HOUR, read=True)
         self.task("t-w", "orch-w", "完成", summary="做完了", age=HOUR, read=True)
         self.set_agents(**{"orch-u": {"status": "done", "screen": NORMAL}, "orch-a": {"status": "done", "screen": WEBFETCH},
                            "orch-w": {"status": "idle", "screen": NORMAL}})
         self.live("w1:p2")
-        self.assertEqual(self.calls("tab", "rename")[-1], ["tab", "rename", "w1:t2", "看板·等你1·完成1"])
-        self.assertEqual(self.herdr_state()["tabs"]["w1:t2"]["label"], "看板·等你1·完成1")
+        self.assertEqual(self.calls("tab", "rename")[-1], ["tab", "rename", "w1:t2", "看板·等你1·进行中1·完成1"])
+        self.assertEqual(self.herdr_state()["tabs"]["w1:t2"]["label"], "看板·等你1·进行中1·完成1")
         before = len(self.herdr_calls())
         self.assertIn("t-u", self.live())
         self.assertEqual([c for c in self.herdr_calls()[before:] if c[0] == "tab" or c[:2] == ["pane", "get"]], [])
         self.live("w1:p101")  # --pane 的分屏：在主会话的 tab 里，不是看板 tab
         self.assertEqual(len(self.calls("tab", "rename")), 2)
         d = self.load_drover()
-        view = {"groups": [{"key": "wait", "rows": []}, {"key": "doing", "rows": [{}]}, {"key": "done", "rows": []}]}
-        self.assertEqual(d.board_tab_label(view), "看板")
+        view = {"groups": [{"key": "wait", "title": "等你", "rows": []}, {"key": "doing", "title": "进行中", "rows": []},
+                           {"key": "done", "title": "完成", "rows": []}]}
+        self.assertEqual((d.board_tab_label(view), d.board_line(view)), ("看板", "drover 无任务"))
+        view["groups"][1]["rows"] = [{}, {}, {}]
+        self.assertEqual(d.board_tab_label(view), "看板·进行中3")
         view["groups"][0]["rows"], view["groups"][2]["rows"] = [{}, {}], [{}]
-        self.assertEqual(d.board_tab_label(view), "看板·等你2·完成1")
-        self.assertEqual(d.board_line(view), "drover 等你 2 · 进行中 1 · 完成 1")
+        self.assertEqual(d.board_tab_label(view), "看板·等你2·进行中3·完成1")
+        self.assertEqual(d.board_line(view), "drover 等你 2 · 进行中 3 · 完成 1")
 
     def test_live_reregisters_from_tab_record(self) -> None:
         """--tab 开的看板（board-pane.json 已经收掉了）照样补登记：主会话的 pane 记在 board-tab.json 的 main_pane_id"""
@@ -2063,7 +2067,7 @@ class BoardClickTests(PtyTestCase):
         self.assertIn("进行中（1）".encode(), out)
         self.assertNotIn(MOUSE_ON, out)
         self.assertEqual(termios.tcgetattr(slave), before)  # 一直没碰终端属性：连 PENDIN 都一样
-        self.assertEqual(self.calls("tab", "rename"), [["tab", "rename", "w1:t2", "看板"]])
+        self.assertEqual(self.calls("tab", "rename"), [["tab", "rename", "w1:t2", "看板·进行中1"]])  # 只有看板 tab 那次改名
 
     def test_click_wrapup_buttons(self) -> None:
         """两个能收尾的完成任务（终端够宽，收尾列在屏幕上）：点 heavy 那一行的 [收尾] → 把"收尾：orch-demo-perf"交给
