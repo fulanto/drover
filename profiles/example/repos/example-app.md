@@ -14,7 +14,7 @@
 - 构建：`npm run build`
 - 相关测试（条目验收用，不跑全量）：`npx vitest run --changed <BASE_SHA>`
 - lint（只查改动的文件）：`npx eslint <改动的文件>`
-- 全量测试：`npx vitest run`。基线本来就有失败，只在集成检查（dispatch.md 第 9.1 节第 3 步）跑，放 `--verify-baseline`，不放 `--verify`。
+- 全量测试：`npx vitest run`。基线本来就有失败，只在集成检查（flow/integrate.md 第 3 步）跑，放 `--verify-baseline`，不放 `--verify`。
 
 ## 2. 迁移授权例外（对应 dispatch.md 第 7 节"必须升级 → 数据库写操作"）
 
@@ -22,7 +22,7 @@
 - 生产环境不在本地执行，随发布流程执行。
 - 改数据（清理、修数据、改用户记录）不在这条授权里，仍按 dispatch.md 第 7 节升级给用户。
 
-## 3. 迁移执行步骤（对应 dispatch.md 第 9.1 节第 4 步）
+## 3. 迁移执行步骤（对应 flow/integrate.md 第 4 步）
 
 时机：集成 worktree 整体检查通过后、推送前。
 

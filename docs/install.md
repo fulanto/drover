@@ -213,7 +213,7 @@ python3 install.py --workspace ~/work --repo-dir ~/work/company --repo-dir ~/wor
 
 **Claude Code（`--host` 含 claude）**
 
-- `~/.claude/commands/drover.md` → `~/.drover/pkg/flow/dispatch.md`（`/drover` 命令，编排者用的流程正文）
+- `~/.claude/commands/drover.md` → `~/.drover/pkg/flow/dispatch.md`（`/drover` 命令，编排者用的流程主干；拆出去的 `integrate.md` 等几份在同一目录，编排者走到那一步按路径读）
 - `~/.claude/skills/herdr/SKILL.md`：没有时用 `herdr --skill` 生成
 - 权限规则追加进 `~/.claude/settings.json` 的 `permissions.allow`（这里的规则对本机所有 Claude Code 会话生效，包括 worker）：drover CLI 只放行 `heavy`（`Bash(~/.drover/bin/drover heavy:*)`：worker 只用它，它只执行构建 / 测试工具），`~/.drover` 和 `~/.herdr/worktrees` 的读写（`Read(~/.drover/**)`、`Edit(~/.drover/**)` 等），`herdr agent` / `pane` / `worktree` / `workspace list` / `tab list` / `status`。以前的版本在这里放行整个 drover CLI（`Bash(~/.drover/bin/drover:*)`），worker 跑 `accept --verify "<任意命令>"`、`push`、`cleanup` 也不弹框；重跑 install（自动更新也会跑）时把它从这里删掉、挪到主工作台
 - `~/.claude/settings.json` 的 `hooks.PreToolUse` 加一项 cd+git 拦截 hook（matcher `Bash`，跑装好的包里的 `~/.drover/pkg/hooks/cd_git_guard.py`，timeout 5 秒）：拒绝同一条命令里既有 cd 又有 git 的命令（不分先后：`cd <目录> && git …`、`git … && cd <目录>` 都算，和 Claude Code 内置检查的范围一样），把 `git -C <目录> …` 的改法（`cd <目录> && git …` 这种形状直接给出整条命令）回给 agent，让它自己改写重试。为什么要它：这种写法会触发 Claude Code 内置的安全确认，这个确认不走白名单、也没有 "don't ask again"，每条都要人批；编排者和 worker 派出去的子代理（Explore 等）看不到 CLAUDE.md 和任务书里"用 `git -C`"的规则，最爱这么写。hook 对子代理也生效，而且在内置确认之前执行。你已有的其他 hook（比如 herdr 的 `SessionStart`）、其他 `PreToolUse` 项原样保留；hook 自己出任何问题都放行，不会挡住正常命令
@@ -263,7 +263,7 @@ link、copy 模式都是这一条。在主会话里说"更新 drover"也行，�
 - **找哪份**：按安装记录（`~/.drover/drover-install.json`）。link 模式是 `~/.drover/pkg` 指向的那份 clone，copy 模式是安装时那份 clone；宿主也按记录，不会因为本机有 `~/.codex` 就多装一套。
 - **装哪一版、只快进**：按更新通道（[自动更新](auto-update.md)）定目标：默认的 `release` 是上游（一般是 `origin/main`）历史上最新的版本 tag，`main` 是上游最新的提交。fetch 上游（`release` 顺带拉版本 tag）再快进到目标，不硬覆盖；本地比目标新（有没推送的提交，或者以前跟过 `main`）照常往下、不回退，提一句。这几种什么都不改、不重跑 install，说明原因、退出码 1：有已跟踪的本地改动又落后、和目标分叉、merge / rebase 做到一半、detached 或没有上游、上游上还没有发布的版本（`release`）、连不上远端、`update_channel` 写了不认识的值。
 - **重跑 install、再检查**：每次都按原来的 `--mode` / `--host` 重跑（已经装对的项跳过；不碰飞书配对的 `.env`、`AGENTS.md` 区块外的内容、`settings.json` 里已有的规则），以前只 `git pull`、没重跑 install 留下的过期路由区块顺带刷新；然后跑一次 `--check`。
-- **最后几行中文**：更新到哪个提交（那个提交上有版本 tag 时写出来，比如 `drover 已更新：a1b2c3d→e4f5a6b（v0.2.0，3 个新提交）`）、几个新提交和标题、install 改了哪几项、检查结果和下一步。路由区块这次改了 → 主会话跑 `drover rules` 读入改动就生效，不用 `/clear`（[自动更新](auto-update.md)；也可以 `/clear`，Codex 用 `/new`）；`flow/dispatch.md` 变了 → 正在跑的编排者还按旧流程，新起的用新流程；都不涉及就不用做别的。加 `--json` 输出一个 JSON 对象（`channel`、`release` 是这次的通道和目标 tag，`from_tag`、`to_tag` 是更新前后那个提交上的版本 tag）。`--dry-run` 报更新通道和目标、落后几个提交和标题、本地能不能快进、`flow/routing.md` / `install.py` / `flow/dispatch.md` 有没有变。
+- **最后几行中文**：更新到哪个提交（那个提交上有版本 tag 时写出来，比如 `drover 已更新：a1b2c3d→e4f5a6b（v0.2.0，3 个新提交）`）、几个新提交和标题、install 改了哪几项、检查结果和下一步。路由区块这次改了 → 主会话跑 `drover rules` 读入改动就生效，不用 `/clear`（[自动更新](auto-update.md)；也可以 `/clear`，Codex 用 `/new`）；`flow/dispatch.md` 变了 → 正在跑的编排者还按旧流程，新起的用新流程（拆出去的 `integrate.md` 等几份是走到那一步时现读的，正在跑的编排者读到的就是新版）；都不涉及就不用做别的。加 `--json` 输出一个 JSON 对象（`channel`、`release` 是这次的通道和目标 tag，`from_tag`、`to_tag` 是更新前后那个提交上的版本 tag）。`--dry-run` 报更新通道和目标、落后几个提交和标题、本地能不能快进、`flow/routing.md` / `install.py` / `flow/dispatch.md` 有没有变。
 - **手动 `update` 和后台的自动更新（[自动更新](auto-update.md)）用同一把机器级的锁**：自动更新正在跑时，手动的先说一句再等它跑完，两个 install 不会同时改 `settings.json`、`AGENTS.md`。
 - **copy 模式没留 clone 的**：`update` 报错并给出手动步骤，不替你 clone。重新 clone 一份到临时目录，在里面跑 `python3 install.py --mode copy`，跑完那份 clone 就可以删了。
 

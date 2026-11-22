@@ -1289,7 +1289,7 @@ def plan_source_sync(repo: str, base: Optional[str], prefetched: dict) -> tuple:
 
 
 # ---------------------------------------------------------------- 推送记录、新一轮的起点
-# 每次推送都记下分支和提交，不管走没走 integrate（patch 模式也记）。推送过什么是任务级的事实，和集成 worktree 怎么建、
+# 每次推送都记下分支和提交，不管走没走 integrate（旧版 patch 模式没有集成状态，它的推送也记）。推送过什么是任务级的事实，和集成 worktree 怎么建、
 # 建了几次无关，所以记在 <slug>/pushes.jsonl（一行一次推送，只追加），不挂在 integrate 状态上：那份一个仓库一份，
 # 重建或换目标分支时整个换掉（以前推两条分支要手工改名归档）。读它的：wt / integrate 定新一轮的起点并核实、cleanup 核实
 # 内容已在推过的远端分支里、wrapup 列提交。旧任务的推送记在 integrate-*.json 的 pushes 里，task_pushes 一起读。
@@ -1572,7 +1572,7 @@ def round_check(repo: str, pushes: list, start: str, remotes: list, also: tuple 
     <远端>/<T> 且推过 T 的按 T 自己的推送（同一条分支）；否则（换了分支）按最近一次推送的那条分支。参照里最后一次推上去的
     提交是 start 的祖先 → 过；否则逐次推送用 git cherry 按补丁内容比（挑到别的分支上的也算），剩下的就是缺的。合并提交
     git cherry 不比，合并带进来的普通提交照比。
-    also 是 integrate 接着要摘进来的条目分支（--from）：缺的提交已在其中的（commit 模式一轮推两条分支时，第二条集成的
+    also 是 integrate 接着要摘进来的条目分支（--from）：缺的提交已在其中的（一轮推两条分支时，第二条集成的
     就是同一批条目提交；条目 worktree 用 --carry 带上过的）不算缺，integrate 会把它们摘进来。
     返回 {status: no_records / ok / missing, …}；推送记录里的提交本地找不到时列进 unknown，也算 missing（核实不了）。
     缺提交、核实不了的推送里没记远端地址的（旧版本写的）列进 no_remote_url：分不清推的是不是现在这个远端，拒绝时多说一段。"""
@@ -1667,9 +1667,9 @@ def round_refusal(check: dict, base_flag: str, synced: bool, carry: Optional[str
 def carry_commits(wt: str, slug: str, repo: str, branch: str, check: dict, reason: str) -> list:
     """--carry：在新 worktree 里按从旧到新 cherry-pick 起点缺的上一轮提交，记进 <slug>/carry.jsonl。一条 cherry-pick 命令：
     git 自己按顺序摘，冲突时停在那个提交上，解完 --continue 接着摘剩下的。返回带上的提交 [{sha, subject, new_sha}]。
-    带上的提交在 worktree 里是提交、BASE_SHA（head_sha）在它们之后：commit 模式条目分支里有它们，integrate 核实时按 --from
-    算作已覆盖，摘条目提交时一起摘进集成分支；patch 模式补丁只含 worker 的改动，集成 worktree 用 wt --carry 建、先带上再
-    叠补丁。漏了的都会被核实挡住（集成 worktree 的起点不含、--from 里也没有）。"""
+    带上的提交在 worktree 里是提交、BASE_SHA（head_sha）在它们之后：条目分支里有它们，integrate 核实时按 --from
+    算作已覆盖，摘条目提交时一起摘进集成分支（旧版 patch 模式补丁只含 worker 的改动，集成 worktree 用 wt --carry 建、先带上再
+    叠补丁）。漏了的都会被核实挡住（集成 worktree 的起点不含、--from 里也没有）。"""
     missing = check["missing"]
     record = {"at": time.strftime("%m-%d %H:%M:%S"), "ts": round(time.time(), 3), "repo": repo, "branch": branch,
               "worktree_path": wt, "start": check["start"], "start_sha": check["start_sha"],
@@ -2541,7 +2541,7 @@ ORCH_SUB_KICKOFF = """你是任务 {slug} 的「子编排者」，由上层编�
 2. {load_skill}
    参数里有 resume 时，是接手之前的子编排者：先读 ~/.drover/{slug}/dispatch.md 和 rollup.md 恢复进度，按 dispatch.md「子模式」的 resume 接着做，不要从头分析。
 3. request.md 里的「目标」是上层给你的目标（开头是用户的目标），直接用它，不用再复述；每份 worker 任务书（brief --goal）和最终汇报都以它开头。发现行不通或者和其他仓库的约定对不上，把证据写进 {rollup}，状态标「等你决定」后停下。
-4. 之后按 dispatch.md「编排者模式」里「子编排者」一节运行：要决定的事、阶段结论都写进 {rollup}，写完就停下，等上层编排者转达答复（上层读你的 rollup，用户和主会话不直接看）。条目验收通过后在 rollup 写「等上层转达提交推送」并停下；收到上层转达的「提交推送」（写明用户已要求推送、带用户原话和这个仓库的目标分支）再提交、集成、检查、迁移、推送，没带这些的不做、写进 rollup 问上层。不要用向用户提问的工具（{ask_tool}）。{model_note}
+4. 之后先读 ~/.drover/pkg/flow/sub-orch.md（子编排者的规则，从 dispatch.md 拆出来的），照它运行：要决定的事、阶段结论都写进 {rollup}，写完就停下，等上层编排者转达答复（上层读你的 rollup，用户和主会话不直接看）。条目验收通过后在 rollup 写「等上层转达提交推送」并停下；收到上层转达的「提交推送」（写明用户已要求推送、带用户原话和这个仓库的目标分支）再提交、集成、检查、迁移、推送，没带这些的不做、写进 rollup 问上层。不要用向用户提问的工具（{ask_tool}）。{model_note}
 {host_notes}
 {routing}（CLAUDE.md 引用的就是它）的路由规则是给主会话用的，你忽略它。"""
 
@@ -2889,7 +2889,7 @@ def rollup_deliverables(roll: Optional[dict]) -> list:
 def rollup_wrapup(roll: Optional[dict]) -> tuple[bool, Optional[str], bool]:
     """(能不能收尾, 不能的原因, 编排者写没写)。按 rollup 的"收尾："：以"可以"开头能；别的（"先别，<原因>"）不能，原因取"先别"
     后面那段。没写这一行时，状态是完成就算能，别的状态不能（原因"还没完成"）。编排者最清楚能不能收（比如有没推的改动），
-    一键收尾靠它挡住不该收的；收尾本身没推送过的分支也不删、先问（dispatch.md 第 9 节）。"""
+    一键收尾靠它挡住不该收的；收尾本身没推送过的分支也不删、先问（flow/wrapup.md）。"""
     value = (roll["fields"].get("收尾") or "").strip() if roll else ""
     if value:
         return (True, None, True) if value.startswith("可以") else (False, re.sub(r"^先别[，,：:\s]*", "", value) or value, True)
@@ -3887,7 +3887,7 @@ def build_brief(a: argparse.Namespace, worktrees: list, task: str, evidence: lis
         rules.append("- 不要 git commit / git push / 切分支 / 删 worktree。")
     rules.append("- 不要 git fetch / pull / rebase / merge：基线由编排者统一管理，所有条目做完后由它在集成 worktree 里"
                  "统一同步上游、解冲突。")
-    # 迁移在集成检查通过后、推送前由编排者按仓库规则统一执行（dispatch.md 第 9.1 节第 4 步：定时间戳、试跑、核对账本）；
+    # 迁移在集成检查通过后、推送前由编排者按仓库规则统一执行（flow/integrate.md 第 4 步：定时间戳、试跑、核对账本）；
     # worker 并行、各自看不到别人的迁移，自己执行的会和它重复或乱序，写共享库还会影响别的条目和别人。
     rules.append("- 只写迁移文件和测试，不执行迁移，不对任何共享 / 生产数据库做写操作；迁移由编排者按仓库规则执行。")
     heavy = f"`{DROVER_CMD} heavy -- <命令>`"
@@ -4812,8 +4812,8 @@ BOARD_WRAPUP_BUTTON = "[收尾]"
 # 横向滚动提示行两头能点的按钮（ASCII：以前的 ◀ ▶ 宽度不定，画成两格时点不准）
 BOARD_SCROLL_LEFT, BOARD_SCROLL_RIGHT = "[<]", "[>]"
 # 收尾格的五种写法：(--live, Markdown, --plain 行末)。clicked：看板上点过、rollup 还没在点了之后重写、不到
-# WRAPUP_CLICK_SECONDS（主会话没收这个任务时 30 分钟后变回能点）；done：编排者写了"收尾：先别，已经收尾过了"（dispatch.md
-# 第 9 节第 8 步的固定写法，原因以 WRAPUP_DONE_REASON 开头）；left：收尾做完但留了东西，"收尾：先别，已经收尾过了，留 <留了
+# WRAPUP_CLICK_SECONDS（主会话没收这个任务时 30 分钟后变回能点）；done：编排者写了"收尾：先别，已经收尾过了"（flow/wrapup.md
+# 第 8 步的固定写法，原因以 WRAPUP_DONE_REASON 开头）；left：收尾做完但留了东西，"收尾：先别，已经收尾过了，留 <留了
 # 什么>"（WRAPUP_LEFT_RE 取出留了什么，同 hold 的原因截到 BOARD_HOLD_WIDTH；以前只能写
 # "可以"，看板就显示能点的 [收尾]，再点只会让 cleanup 再跑一遍、照样留下）；hold：别的"先别"。
 BOARD_WRAPUP_TEXT = {"ready": (BOARD_WRAPUP_BUTTON, "可以", "可以收尾"), "clicked": ("收尾中", "收尾中", "收尾中"),
@@ -8099,7 +8099,7 @@ def cmd_accept(a: argparse.Namespace) -> dict:
         "ok": True,
         "worktree_path": wt,
         "base": a.base,
-        # 集成检查全量通过后记下它：之后再跑检查按"比这个提交多了什么"定范围（dispatch.md 第 9.1 节第 3 步）。
+        # 集成检查全量通过后记下它：之后再跑检查按"比这个提交多了什么"定范围（flow/integrate.md 第 3 步）。
         "head": git_out(wt, "rev-parse", "HEAD"),
         "status_porcelain": status_lines,
         "intent_to_add": newly_marked,
@@ -8688,7 +8688,7 @@ HEAVY_RUNS_FILE = "heavy-runs.jsonl"
 
 def run_log_for(top: str) -> tuple:
     """worktree（git 顶层）的流水记在哪：(~/.drover/<slug>/heavy-runs.jsonl 或 None, 分支)。分支 task/<slug>…（第 3 节的条目分支、
-    第 9.1 节的集成分支）按 task_owner 归任务；别的分支名、detached、任务目录不在、git 出错都返回 None，不记。"""
+    flow/integrate.md 的集成分支）按 task_owner 归任务；别的分支名、detached、任务目录不在、git 出错都返回 None，不记。"""
     try:
         branch = current_branch(top)
     except DroverError:
@@ -9223,15 +9223,23 @@ def remote_branch_head(repo: str, remote: str, branch: str) -> tuple[Optional[st
     return next((r[0] for r in rows if r[1:2] == [ref]), None), ls, tries
 
 
+# 没有集成状态的 worktree（不是 integrate 建的）：整体检查的结论记不下，push 核对不了。推送只有一条路（flow/integrate.md）：
+# integrate 建集成 worktree → accept --integration → push；--unchecked 只留给旧版 patch 模式留下的、用户明确要推的。
+# accept 记不下结论时、push 因此拒绝时给同一句。
+NO_INTEGRATE_STATE_HINT = ("推送一律在 integrate 建的集成 worktree 上做：drover integrate --repo <仓库> --slug <任务> --target "
+                           "<上游分支> --from <条目分支>…，在它建的集成 worktree 上跑 accept --integration 再 push；"
+                           "旧版 patch 模式留下的这种 worktree，用户明确要推时才加 --unchecked \"<用户的原话或理由>\"（理由记进推送记录）")
+
+
 def record_integration_check(wt: str, result: dict, save: Optional[str]) -> dict:
     """accept --integration 的结论记进这个集成 worktree 的集成状态（integrate 写的那份，按 worktree 路径找），push 按它核对
     要推的提交检查过没有：检查的提交和树、检查时 worktree 干不干净、跑了几条、几条没过、存档在哪。通过 = 有 verify、全过、
-    检查时干净（有没提交的改动时检查的不是提交本身）。没有集成状态的（patch 模式 wt 建的）记不了，push 要带 --unchecked。
-    返回记下的内容（或记不了的说明），accept 的结果里带上。"""
+    检查时干净（有没提交的改动时检查的不是提交本身）。没有集成状态的（不是 integrate 建的，比如旧版 patch 模式 wt 建的）记不了：
+    提示改去 integrate 建的集成 worktree 上检查（NO_INTEGRATE_STATE_HINT）。返回记下的内容（或记不了的说明），accept 的结果里带上。"""
     state_path = find_integrate_state(wt, None)
     if not state_path:
-        return {"recorded": False, "note": "没找到这个 worktree 的集成状态（不是 integrate 建的），结论没有记下：push 时要带 "
-                                           "--unchecked \"<理由>\""}
+        return {"recorded": False, "note": "没找到这个 worktree 的集成状态（不是 integrate 建的），结论没有记下。"
+                                           + NO_INTEGRATE_STATE_HINT}
     verify = result.get("verify") or []
     failed = sum(1 for v in verify if not v.get("ok"))
     clean = not result.get("status_porcelain")
@@ -9306,8 +9314,7 @@ def push_check(wt: str, state: Optional[dict], slug: str) -> tuple[Optional[dict
     覆盖 = 检查通过，并且检查时的树和 HEAD 的树一样，或者只差文档（DOC_FILE_RE，同 push 的 needs_reverify：上游只改文档的
     rebase、检查之后只加了文档，都不用重跑；差的文档列在 docs_only_after）。"""
     if state is None:
-        return None, ("这个 worktree 没有集成状态（不是 integrate 建的，比如 patch 模式 wt 建的集成 worktree），整体检查的结论"
-                      "没有地方记、核对不了"), []
+        return None, "这个 worktree 没有集成状态（不是 integrate 建的），整体检查的结论没有地方记、核对不了", []
     check, notes = state.get("check"), []
     if not check:
         check = archived_check(wt, slug)
@@ -9349,18 +9356,18 @@ def push_new_branch(p: subprocess.CompletedProcess, tries: int, a: argparse.Name
     return state["create_from"]
 
 
-def push_gate(wt: str, a: argparse.Namespace, state: Optional[dict], slug: str, head: str,
-              upstream_sha: str) -> tuple[dict, list]:
-    """推之前核对整体检查（push_check）：对不上就不推、说明差在哪和怎么补，除非 --unchecked。返回 (要记进推送记录和返回的
-    字段, 提示)：覆盖它的检查 {check}，或者带 --unchecked 推的 {unchecked: 理由, check_gap: 差在哪}。"""
+def push_gate(wt: str, a: argparse.Namespace, state: Optional[dict], slug: str, head: str) -> tuple[dict, list]:
+    """推之前核对整体检查（push_check）：对不上就不推、说明差在哪和怎么补，除非 --unchecked。没有集成状态的补法是改用
+    integrate 建的集成 worktree（在这里跑 accept 也记不下）。返回 (要记进推送记录和返回的字段, 提示)：覆盖它的检查 {check}，
+    或者带 --unchecked 推的 {unchecked: 理由, check_gap: 差在哪}。"""
     check, gap, notes = push_check(wt, state, slug)
     if gap and not a.unchecked:
-        raise DroverError(
-            f"{gap}，没推。先在这个 worktree 上跑整体检查：drover accept --wt {wt} --base "
-            f"{state.get('base') if state else upstream_sha} --integration --save {STATE_HOME / slug}/accept-integrate-"
-            "<仓库名>.json --brief --verify …（检查的就是现在的 HEAD，通过后再 push）；用户明确要跳过检查时加 "
-            "--unchecked \"<用户的原话或理由>\"（理由记进推送记录）",
-            check_gap=gap, worktree_path=wt, head=head, **({"warnings": notes} if notes else {}))
+        how = NO_INTEGRATE_STATE_HINT if state is None else (
+            f"先在这个 worktree 上跑整体检查：drover accept --wt {wt} --base {state.get('base')} --integration --save "
+            f"{STATE_HOME / slug}/accept-integrate-<仓库名>.json --brief --verify …（检查的就是现在的 HEAD，通过后再 push）；"
+            "用户明确要跳过检查时加 --unchecked \"<用户的原话或理由>\"（理由记进推送记录）")
+        raise DroverError(f"{gap}，没推。{how}", check_gap=gap, worktree_path=wt, head=head,
+                          **({"warnings": notes} if notes else {}))
     if a.unchecked and not gap:
         notes.append("--unchecked 没用上：整体检查覆盖了要推的提交")
     return ({"unchecked": a.unchecked, "check_gap": gap} if gap else {"check": check}), notes
@@ -9481,7 +9488,7 @@ def cmd_push(a: argparse.Namespace) -> dict:
     if not ahead:
         return state_fields({"ok": True, "pushed": False, "head": head_before, "base": upstream_sha,
                              "note": "HEAD 已经在上游里，没有要推的提交"})
-    covered, notes = push_gate(wt, a, state, slug, head_before, upstream_sha)
+    covered, notes = push_gate(wt, a, state, slug, head_before)
     commits = git_out(wt, "log", "--oneline", f"{upstream_sha}..HEAD").splitlines()
     old = upstream_sha[:9]
     # 推到的地址（remote 名只是本地别名，换了托管地址以后同一个名字指的是另一个仓库，见 push_moved）
@@ -9719,7 +9726,7 @@ def group_branches(groups: list) -> dict:
 
 def wrapup_line(g: dict, a: argparse.Namespace, warnings: list) -> dict:
     """一组（wrapup_groups）：推送记录、远端核对、改动文件分类、新增配置键引用。集成状态有几份时 base / picked / rebases
-    取最后改的那份；集成分支和 worktree 取最后一次推送的（没推送过取集成状态的）：patch 模式的集成 worktree 是 wt 建的、
+    取最后改的那份；集成分支和 worktree 取最后一次推送的（没推送过取集成状态的）：旧版 patch 模式的集成 worktree 是 wt 建的、
     没有集成状态，每轮一个新分支。"""
     slug, pushes = g["slug"], g["pushes"]
     states = sorted(g["states"], key=lambda fs: (fs[0].stat().st_mtime, fs[0].name))
@@ -12267,8 +12274,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--slug", help="任务 slug：只在 <slug>/ 里找集成状态文件、推送记到这个任务；不传就按 worktree 路径在全部任务里找"
                                   "集成状态，再按分支名 task/<slug>… 归属，都定不了就不推")
     p.add_argument("--unchecked", metavar="理由",
-                   help="没有整体检查覆盖要推的提交（没检查、没过、检查之后又改了代码，或者没有集成状态的 patch 模式）也推："
-                        "只在用户明确要跳过时用，理由和差在哪记进 pushes.jsonl")
+                   help="没有整体检查覆盖要推的提交（没检查、没过、检查之后又改了代码，或者旧版 patch 模式留下的、没有集成状态的"
+                        "集成 worktree）也推：只在用户明确要跳过时用，理由和差在哪记进 pushes.jsonl")
     p.add_argument("--dry-run", action="store_true", help="只列出要执行的步骤（含按现在的 HEAD 核对整体检查的结果）")
 
     p = sub.add_parser("wrapup", help="收尾汇总的事实：每个仓库推到哪条分支哪个提交（含归档记录、子编排者）、远端核对、"

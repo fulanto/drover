@@ -4,7 +4,7 @@
 
 | | crapper（[unclebob/crapper](https://github.com/unclebob/crapper)，0BSD） | dryer（[unclebob/dryer](https://github.com/unclebob/dryer)，0BSD） |
 |---|---|---|
-| 什么时候跑 | 条目验收（`accept`） | 集成检查（`accept --integration`，`flow/dispatch.md` 第 9.1 节第 3 步） |
+| 什么时候跑 | 条目验收（`accept`） | 集成检查（`accept --integration`，`flow/integrate.md` 第 3 步） |
 | 跑什么 | 只算圈复杂度（不跑测试、不算覆盖率），零点几秒 | 扫全仓找结构相似的函数（相似度 ≥ 0.8），和验证命令一起交给 heavy 调度（大仓库单核约 85 秒） |
 | 报什么 | 这次改动碰到的函数里圈复杂度 ≥ 10、而且是新函数或比原来更复杂的（`complexity.over`）；碰到但本来就这么复杂的只作参考（`already_complex`） | 至少一边碰到这次改动行的重复对（`duplicates.pairs`） |
 | 要怎么处理 | worker 要么拆，要么在报告里写理由 | 要么合并，要么写理由 |

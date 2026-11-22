@@ -65,4 +65,4 @@ drover 记着主会话"载入时"的规则（`~/.drover/main-rules.json`：会�
 
 - 不因为有任务在跑就推迟更新：几乎一直有编排者活着，推迟了就几乎永远更新不了。
 - link 模式下，它们的下一条 `drover` 命令跑的就是新代码（copy 模式 install 重写了副本，一样）；已经在跑的 Python 进程（`watch`、`heavy`、`accept`）是旧代码，跑完为止。
-- `flow/dispatch.md` 变了的，正在跑的编排者照旧按它上下文里的旧流程做，新起的用新流程。所以 CLI 必须向后兼容，见[开发约定](development.md#开发约定)。
+- `flow/dispatch.md`（主干）变了的，正在跑的编排者照旧按它上下文里的旧流程做，新起的用新流程。拆出去的几份（`integrate.md`、`wrapup.md`、`sub-orch.md`、`review.md`）是走到那一步时现读的，正在跑的编排者读到的就是新版；"流程变了"的提示（`flow_changed`）只看主干。所以 CLI 必须向后兼容，见[开发约定](development.md#开发约定)。

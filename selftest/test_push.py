@@ -54,9 +54,16 @@ class PushTests(IntegrationCase):
         wt = Path(self.drover_json("wt", "--repo", str(self.src), "--branch", "task/s1-r2", "--label", "shop:s1-r2",
                                    "--base", "origin/main")["worktree_path"])
         sha = self.commit(wt, "patch round", {"app/p.py": "P = 1\n"})
+        # 在这种 worktree 上跑整体检查记不下结论：提示指向 integrate，不再只说"push 时带 --unchecked"
+        note = self.check(wt)["integration_check"]
+        self.assertFalse(note["recorded"])
+        self.assertIn("drover integrate", note["note"])
         refused = self.push(wt, rc=1)
         self.assertIn("没有集成状态", refused["error"])
         self.assertIn("--unchecked", refused["error"])
+        # 指向唯一的推送路径（integrate 建的集成 worktree），不让在这个推不了的 worktree 上跑整体检查（跑了也记不下）
+        self.assertIn("drover integrate", refused["error"])
+        self.assertNotIn("先在这个 worktree 上跑整体检查", refused["error"])
         self.assertEqual(self.remote_head(), self.base0)
         res = self.push(wt, "--unchecked", "patch 模式：整体检查在 accept-integrate-shop.json")
         self.assertTrue(res["verified"])
@@ -233,7 +240,7 @@ class PushTests(IntegrationCase):
         self.assertTrue(self.push(self.wt)["verified"])
 
     def test_docs_commit_after_check_pushes(self) -> None:
-        """检查之后只加了文档（dispatch.md 9.1：只改了文档不用重跑）→ 照推，记录里列出检查之后差的文档"""
+        """检查之后只加了文档（flow/integrate.md 第 3 步：只改了文档不用重跑）→ 照推，记录里列出检查之后差的文档"""
         self.commit(self.wt, "notes", {"docs/notes.md": "notes\n"})
         res = self.push(self.wt)
         self.assertTrue(res["pushed"] and res["verified"])

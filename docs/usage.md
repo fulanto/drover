@@ -77,7 +77,7 @@ claude 的编排者和 worker 都用 Opus（1M 上下文），在 `acceptEdits` 
 5. 按证据验收：脚本在 worktree 里重跑相关测试、类型检查、lint（退出码 0 却一个测试都没真跑，比如没找到测试文件、全部跳过，不算通过），建图看风险和没有测试覆盖的函数，读 diff 看是否改在产生问题的那一层、新增的特例和兜底有没有依据，不只看 worker 的自述。不通过就把缺口发回去补。
 6. 写 rollup 汇报，停下来等你。
 
-流程细节在 [`flow/dispatch.md`](../flow/dispatch.md)（编排者读的就是它），图解在 [`docs/architecture.html`](architecture.html)。
+流程细节在 [`flow/dispatch.md`](../flow/dispatch.md)（编排者读的主干，每个任务都走的部分），集成推送、收尾清理、子编排者、复审各拆成一份（[`flow/integrate.md`](../flow/integrate.md)、[`flow/wrapup.md`](../flow/wrapup.md)、[`flow/sub-orch.md`](../flow/sub-orch.md)、[`flow/review.md`](../flow/review.md)），编排者走到那一步时再读；图解在 [`docs/architecture.html`](architecture.html)。
 
 ## 查进度
 
@@ -187,7 +187,7 @@ rollup 的状态：
   - 编排者自己追踪 worker 时也是 `watch --until-event` 阻塞等待（1500 秒一轮），重挂时已经有 worker 卡在确认框、接口错误或退出了的立刻返回。
 - **effort 默认也是 xhigh**。脚本给 codex 的 worker、编排者、复审都传 `-c model_reasoning_effort=xhigh`；不传的话会继承 `~/.codex/config.toml` 里的设置，配的是 ultra 就会很慢（实测 worker 改两个文件花了 19 分钟）。要换就在需求里写 `--effort`，或者在 `config.json` 里配 `codex_effort`（[配置](configuration.md)，每次都用它）。
 - **Codex 不会自动加载 `~/.claude/CLAUDE.md`**。用 codex 起编排者时，本机有这个文件的话，开场 prompt 会让它先读一遍。Codex 主会话没有这一步：你的全局规则写在 `~/.claude/CLAUDE.md` 的话，可以在 `AGENTS.md` 的 drover 区块外加一句"开始前先读 `~/.claude/CLAUDE.md`"。主工作台的路由规则写在 `AGENTS.md`，Codex 会自动加载，不受影响。
-- 主会话派发时**不用**加载 `$drover`：按路由规则写 `request.md`、跑 `orch-start` 就够了。`$drover` 是给编排者用的，整份流程正文 500 多行，主会话读了白占上下文。
+- 主会话派发时**不用**加载 `$drover`：按路由规则写 `request.md`、跑 `orch-start` 就够了。`$drover` 是给编排者用的：完整读流程主干，拆出去的几份走到那一步再读，主会话读了白占上下文。
 - 脚本启动 codex 编排者、worker、复审时都会带 `--no-daemon`（codex 0.157 起交互模式默认连共享后台 server，实测会直接报错退出）和 `--no-alt-screen`（输出留在滚动缓冲区，`herdr agent read` 才读得到），不用你管。
 
 以上以 [`flow/dispatch.md`](../flow/dispatch.md) 的附录 B 和 `bin/drover` 为准。

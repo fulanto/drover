@@ -47,7 +47,7 @@
 
 规则分三层，后面的覆盖前面的：
 
-1. **包默认**：`flow/dispatch.md` 和 `bin/drover` 里的通用流程，和团队、仓库无关，包括几条安全规则（worker 只写迁移文件和测试、不执行迁移、不写共享 / 生产数据库；数据库写操作默认升级给用户）。需要团队或仓库规则的地方（worktree 位置、迁移授权例外和执行步骤、基线本来就有失败的命令、推送目标分支）只挂一个"按 playbook 做"的钩子；迁移有授权、仓库又没写步骤时用默认步骤（dispatch.md 第 9.1 节第 4 步）。另有一份包默认的编码规范 `flow/coding-rules.md`（通用原则，加上 MySQL 建表、Java 的几条，只在改到相关代码时适用；MySQL、Java 两节只给用得上的仓库带），不配 profile 也追加进每份 worker 任务书；不要就在 `config.json` 写 `"default_coding_rules": false`，只关这一份。
+1. **包默认**：`flow/dispatch.md` 和 `bin/drover` 里的通用流程，和团队、仓库无关，包括几条安全规则（worker 只写迁移文件和测试、不执行迁移、不写共享 / 生产数据库；数据库写操作默认升级给用户）。需要团队或仓库规则的地方（worktree 位置、迁移授权例外和执行步骤、基线本来就有失败的命令、推送目标分支）只挂一个"按 playbook 做"的钩子；迁移有授权、仓库又没写步骤时用默认步骤（`flow/integrate.md` 第 4 步）。另有一份包默认的编码规范 `flow/coding-rules.md`（通用原则，加上 MySQL 建表、Java 的几条，只在改到相关代码时适用；MySQL、Java 两节只给用得上的仓库带），不配 profile 也追加进每份 worker 任务书；不要就在 `config.json` 写 `"default_coding_rules": false`，只关这一份。
 2. **团队 profile**（config 的 `profile`，可选）：团队稳定的规则，一般放在团队自己的仓库里（`profile` 写那个目录），也可以随包放在 `profiles/<团队>/`（包里带了一份示例 `profiles/example/`）。团队成员装上包、设好 profile 就拿到同一套规则，Claude Code 和 Codex 都一样。
 3. **个人覆盖**（config 的 `playbook_dirs`）：只对你自己成立的补充或改写。
 

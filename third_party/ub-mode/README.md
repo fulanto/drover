@@ -21,4 +21,4 @@ drover 不直接加载这份 `SKILL.md`，而是把其中的规则改编成中�
 - Keep a Log：drover 的报告协议（verification 逐条对应完成证据）已经覆盖。
 - Guard the Context Window：drover 自己的分层（主会话、编排者、worker）就是这件事。
 - Worktree Cleanup：和 drover 冲突，drover 只在用户说"清理 / 收尾"时用 `drover cleanup` 删。
-- Commit and Push：和 drover 冲突，worker 不提交不推送，推送要用户授权、先确认目标分支；"提交信息写清为什么、改了什么、怎么验证的"这半句收进了 `flow/dispatch.md` 第 9.1 节按条目提交那一步。
+- Commit and Push：和 drover 冲突，worker 不提交不推送，推送要用户授权、先确认目标分支；"提交信息写清为什么、改了什么、怎么验证的"这半句收进了 `flow/integrate.md`（集成与推送）第 1 步按条目提交。

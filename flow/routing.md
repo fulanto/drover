@@ -100,7 +100,7 @@
 
 ## 派发约定
 
-- 编排者和 worker 默认跟主会话的宿主（主会话是 Codex 就是 codex，是 Claude Code 就是 claude；用户写了 `--orch` / `--agent` 以用户的为准），effort 为 xhigh；用 codex 时 effort 也默认 xhigh（脚本自动传，不继承 codex config 里的 ultra）。默认不做 code review（codex 审 worker 的改动，流程文档 dispatch.md 里叫"复审"），用户写了 `--review` 才做（见 dispatch.md 第 8 节）。
+- 编排者和 worker 默认跟主会话的宿主（主会话是 Codex 就是 codex，是 Claude Code 就是 claude；用户写了 `--orch` / `--agent` 以用户的为准），effort 为 xhigh；用 codex 时 effort 也默认 xhigh（脚本自动传，不继承 codex config 里的 ultra）。默认不做 code review（codex 审 worker 的改动，流程文档里叫"复审"），用户写了 `--review` 才做（见 `~/.drover/pkg/flow/review.md`）。
 - worktree 放在 `~/.herdr/worktrees/`，任务记录放在 `~/.drover/<slug>/`，CLI 是 `~/.drover/bin/drover`，编排者在 herdr 的 `orch` workspace 里，一个任务一个 tab。
 - 派发期间，用户可能随时插入别的需求。处理完插入的事，要回到追踪中的任务，不能丢下不管。
 

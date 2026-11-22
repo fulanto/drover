@@ -1774,7 +1774,7 @@ footer.end { margin-top: 64px; font-size: 13px; color: var(--muted); display: fl
       <span class="flag">别忘了这一个</span>
       <span class="n">3</span>
       <h3>集成者</h3>
-      <p>把各条目 worktree 的改动归集到自己的集成 worktree（每个仓库一个，分支 <code>task/&lt;slug&gt;</code>），在这里统一同步一次上游、整体检查一次（全量测试只在这里跑）、执行迁移，最后统一推送。worker 不提交、不各自 rebase。对应流程第 9.1 节和 <code>integrate</code> / <code>push</code> 子命令，<a href="#integrate">下面单独画了图</a>。</p>
+      <p>把各条目 worktree 的改动归集到自己的集成 worktree（每个仓库一个，分支 <code>task/&lt;slug&gt;</code>），在这里统一同步一次上游、整体检查一次（全量测试只在这里跑）、执行迁移，最后统一推送。worker 不提交、不各自 rebase。对应流程 <code>flow/integrate.md</code>（主干第 9.1 节拆出去的，用户要求推送时编排者才读）和 <code>integrate</code> / <code>push</code> 子命令，<a href="#integrate">下面单独画了图</a>。</p>
     </div>
     <div class="role">
       <span class="n">4</span>
@@ -2395,7 +2395,7 @@ footer.end { margin-top: 64px; font-size: 13px; color: var(--muted); display: fl
     <p class="eyebrow">几条原则</p>
     <h2>赶羊的几条规矩</h2>
   </header>
-  <div class="prose"><p>上面各节的做法，背后是这几条规矩。它们写在编排者的流程正文 <code>flow/dispatch.md</code> 和主会话的路由规则 <code>flow/routing.md</code> 里，编排者、主会话每次都照着做。</p></div>
+  <div class="prose"><p>上面各节的做法，背后是这几条规矩。它们写在编排者的流程正文 <code>flow/dispatch.md</code>（主干；集成推送、收尾清理、子编排者、复审拆在同目录的几份里，走到那一步再读）和主会话的路由规则 <code>flow/routing.md</code> 里，编排者、主会话每次都照着做。</p></div>
   <div class="borrow">
     <div>
       <h3>一个任务一个编排者</h3>
@@ -2449,7 +2449,11 @@ footer.end { margin-top: 64px; font-size: 13px; color: var(--muted); display: fl
       <pre class="code"><code>drover/
 ├── bin/drover           <span class="cm"># drover CLI，Python 标准库</span>
 ├── flow/
-│   ├── dispatch.md      <span class="cm"># 流程正文 + 附录 A / B</span>
+│   ├── dispatch.md      <span class="cm"># 流程主干 + 附录 A / B</span>
+│   ├── integrate.md     <span class="cm"># 走到那一步才读：集成与推送</span>
+│   ├── wrapup.md        <span class="cm"># 同上：收尾与清理</span>
+│   ├── sub-orch.md      <span class="cm"># 同上：子编排者</span>
+│   ├── review.md        <span class="cm"># 同上：复审</span>
 │   └── routing.md       <span class="cm"># 主工作台路由规则模板</span>
 ├── profiles/            <span class="cm"># 团队 profile</span>
 ├── codex/skills/drover/

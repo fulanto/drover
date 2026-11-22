@@ -7,7 +7,7 @@
 
 # example 团队通用规则（所有仓库）
 
-## 推送前确认目标分支（对应 dispatch.md 第 9.1 节第 2、5 步）
+## 推送前确认目标分支（对应 flow/integrate.md 第 2、5 步）
 
 - 推送目标分支以用户这次的授权为准；没写目标分支就在 rollup 里问，不要默认推 main / master。这里不写具体分支名：发布分支经常换，写死了会过期。
 - 定下来的分支同时用作 `integrate --target` 和 `push --target`，记进状态文件。

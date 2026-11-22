@@ -547,8 +547,9 @@ class CopyInstallTests(InstallTestBase):
         head = subprocess.run(["git", "-C", str(PKG), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
         marker = json.loads((self.pkg_dir / ".drover-copy").read_text())
         self.assertEqual((marker["source"], marker["commit"]), (str(PKG), head))
-        for rel in ["bin/drover", "flow/dispatch.md", "flow/routing.md", "codex/skills/drover/SKILL.md",
-                    "install.py"]:
+        # 拆出去、走到那一步才读的流程文件（integrate / wrapup / sub-orch / review）也要随副本带上
+        for rel in ["bin/drover", "flow/dispatch.md", "flow/integrate.md", "flow/wrapup.md", "flow/sub-orch.md",
+                    "flow/review.md", "flow/routing.md", "codex/skills/drover/SKILL.md", "install.py"]:
             self.assertEqual((self.pkg_dir / rel).read_bytes(), (PKG / rel).read_bytes(), rel)
         self.assertTrue(os.access(self.pkg_dir / "bin" / "drover", os.X_OK))
         # 入口都经 ~/.drover/pkg 指过去，解析后落在副本里

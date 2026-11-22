@@ -35,7 +35,7 @@ drover 读的规则分三层（包默认又分流程和编码规范两份），�
 
 谁读、什么时候读：
 
-- `general.md` 和 `repos/<仓库名>.md`：编排者（orchestrator）在分析任务时跑 `drover playbook --repo <仓库>`（dispatch.md 第 2 节），按层（团队 profile → `playbook_dirs` 依次）拼好输出，后读的优先。里面的仓库约定写进计划，给 worker 的约束写进任务段的"不做"，构建 / 测试命令原样写进任务段和验收的 `--verify`。第 3.1 节（worktree 位置）、第 7 节（迁移授权例外）、第 9.1 节（基线、迁移步骤、推送目标分支）都按它做。
+- `general.md` 和 `repos/<仓库名>.md`：编排者（orchestrator）在分析任务时跑 `drover playbook --repo <仓库>`（dispatch.md 第 2 节），按层（团队 profile → `playbook_dirs` 依次）拼好输出，后读的优先。里面的仓库约定写进计划，给 worker 的约束写进任务段的"不做"，构建 / 测试命令原样写进任务段和验收的 `--verify`。第 3.1 节（worktree 位置）、第 7 节（迁移授权例外）、`flow/integrate.md`（第 9.1 节拆出去的：基线、迁移步骤、推送目标分支）都按它做。
 - `coding-rules.md`：`drover brief` 自动追加，每层一节，标题写明来源。顺序是包默认（`flow/coding-rules.md`，"## 编码规范（drover 默认；必须遵守，仓库规范冲突时按仓库的）"）→ 团队 profile（如"## 编码规范（团队 profile：example；必须遵守）"）→ 个人覆盖，后面的优先。claude、codex 两种 worker 都加：两个宿主都不会自动加载它。另外 `~/.claude/CLAUDE.md` 的"## 编码规范"一节只给 codex 追加（claude 会自动加载 CLAUDE.md）。包默认那份按语言只带相关的：通用原则总带；Java 一节在任务书涉及的任一 worktree 根目录有 `pom.xml` / `build.gradle` / `build.gradle.kts` 时带；MySQL 一节在任一 worktree 有被 git 跟踪的 `.sql` 文件、或依赖清单（`pom.xml`、`build.gradle*`、`package.json`、`requirements*.txt`、`pyproject.toml`）里出现 mysql / mariadb 字样时带（只有 ORM 不算：ORM 可能连别的数据库）。`drover playbook` 输出的 `coding_rules` 按同样的顺序列出这些文件，`default_coding_rules` 写明包默认那份在哪、开没开、按这几个 `--repo` 会带哪几节（`sections`）。
 - 这份 `README.md` 只给人看，命令不读。
 
@@ -77,7 +77,7 @@ drover 读的规则分三层（包默认又分流程和编码规范两份），�
 1. 在团队自己的仓库里建一个目录（推荐：跟团队仓库一起版本管理，不用改 drover 包），布局同上，可以从 `profiles/example/` 复制一份改。
 2. `general.md`：对团队所有仓库都成立、编排者需要知道的规则。比如推送前要确认什么、哪类改动验收时要多看什么、哪些操作在团队里有授权例外（只有仓库 playbook 写了例外的才例外）。
 3. `coding-rules.md`：团队编码规范，worker 必须遵守的那几条。只属于某个项目的，写进那个项目的 `AGENTS.md` / `CLAUDE.md`。
-4. `repos/<仓库名>.md`：仓库专属、和 drover 流程有关的。仓库自己的 `AGENTS.md` / `CLAUDE.md` 已经写了的不用重复；没写的，建议有一节"构建与测试"：能直接复制的构建、类型检查、相关测试、全量测试命令各一行，编排者原样写进 worker 任务段和验收的 `--verify`（dispatch.md 第 2 节第 1 步），worker 不用自己摸索 JDK、mvn 在哪。要设环境变量的写成 `env VAR=值 <命令>`（`accept --verify` 不经 shell，裸写的 `VAR=值 <命令>` 跑不起来）；JDK、mvn 路径这类因机器而异的放个人覆盖目录（`playbook_dirs`）里同名仓库的文件，团队 profile 只写和机器无关的部分。dispatch.md 里留了钩子的地方也都可以写：
+4. `repos/<仓库名>.md`：仓库专属、和 drover 流程有关的。仓库自己的 `AGENTS.md` / `CLAUDE.md` 已经写了的不用重复；没写的，建议有一节"构建与测试"：能直接复制的构建、类型检查、相关测试、全量测试命令各一行，编排者原样写进 worker 任务段和验收的 `--verify`（dispatch.md 第 2 节第 1 步），worker 不用自己摸索 JDK、mvn 在哪。要设环境变量的写成 `env VAR=值 <命令>`（`accept --verify` 不经 shell，裸写的 `VAR=值 <命令>` 跑不起来）；JDK、mvn 路径这类因机器而异的放个人覆盖目录（`playbook_dirs`）里同名仓库的文件，团队 profile 只写和机器无关的部分。dispatch.md 和拆出去的 integrate.md 里留了钩子的地方也都可以写：
    - worktree 位置（仓库规范只允许某些目录时）；
    - 数据库迁移的授权例外和执行步骤（哪个环境、谁执行、执行前后核对什么、执行记录写到哪）；没写的仓库，执行迁移一律升级给用户；
    - 整体检查时哪些命令基线本来就有失败（放 `--verify-baseline`）；

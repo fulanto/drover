@@ -104,7 +104,7 @@ class OrchStartTests(DroverTestCase):
         self.assert_no_old_names(out)
 
     def test_sub_orch_kickoff_new_names(self) -> None:
-        """子编排者（claude、codex 都试）：子编排者 / 上层编排者、--orch <slug> --parent <上层>、编排者模式里的子编排者一节"""
+        """子编排者（claude、codex 都试）：子编排者 / 上层编排者、--orch <slug> --parent <上层>、拆出去的 flow/sub-orch.md"""
         self.install_entries()
         (self.state / "t3").mkdir()
         (self.state / "t3" / "dispatch.md").write_text("# dispatch: t3\n")
@@ -116,7 +116,7 @@ class OrchStartTests(DroverTestCase):
                                                    "状态文件 ~/.drover/t3/dispatch.md）派来"), kickoff)
                 self.assertIn("--orch t3-shop --parent t3", kickoff)
                 self.assertIn("接手之前的子编排者", kickoff)
-                self.assertIn("按 dispatch.md「编排者模式」里「子编排者」一节运行", kickoff)
+                self.assertIn("先读 ~/.drover/pkg/flow/sub-orch.md", kickoff)
                 self.assertIn("等上层编排者转达答复", kickoff)
                 self.assertIn("Skill 工具调用 drover" if kind == "claude" else "$drover", kickoff)
                 self.assert_no_old_names(out)
