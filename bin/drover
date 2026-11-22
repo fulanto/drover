@@ -1148,7 +1148,7 @@ def wt_fetch_error(command: str, tries: int, stderr: str) -> str:
 
 def fetch_ref(repo: str, sync: dict, prefetched: dict, fail, ref: str, remote: str, remote_branch: str,
               missing_ok: bool = False, extra: tuple = ()) -> bool:
-    """fetch 一条远端分支（extra 是同一次 fetch 里顺带的 refspec，update 的 release 通道用它带上版本 tag），结果记进
+    """fetch 一条远端分支（extra 是同一次 fetch 里顺带的 refspec，update 用它带上版本 tag，见 update_fetch_extra），结果记进
     sync["fetch"]。prefetched 里的不再 fetch；missing_ok 时远端没有这条分支返回 False；
     其他失败抛 DroverError，文案由 fail(命令, 尝试次数, stderr) 给（wt 和 update 要说各自的话）。"""
     if ref in prefetched:
@@ -1167,11 +1167,11 @@ def fetch_ref(repo: str, sync: dict, prefetched: dict, fail, ref: str, remote: s
     raise DroverError(fail(command, tries, p.stderr), repo=repo, source_sync=sync)
 
 
-def fetch_upstream(repo: str, explicit: Optional[str], prefetched: dict, fail, extra: tuple = ()) -> tuple:
-    """fetch 主检出当前分支的上游（和显式 --base 的远端分支，同一条只 fetch 一次，prefetched 里的不再 fetch；extra 跟着上游
-    那次 fetch 顺带），定出上游。返回 (sync, up, remotes, branch)：有上游时 sync 里有 upstream / upstream_sha、status 还是 None
-    （位置由调用方判断：fetch_source 和上游比，update 按通道定目标）；没有上游时 status 是 detached / upstream_gone /
-    no_upstream。fetch 失败的文案由 fail 给（见 fetch_ref）。调用方持有 repo_sync_lock。"""
+def fetch_upstream(repo: str, explicit: Optional[str], prefetched: dict, fail, extra=lambda up: ()) -> tuple:
+    """fetch 主检出当前分支的上游（和显式 --base 的远端分支，同一条只 fetch 一次，prefetched 里的不再 fetch；extra(认出的上游)
+    给跟着上游那次 fetch 顺带的 refspec），定出上游。返回 (sync, up, remotes, branch)：有上游时 sync 里有 upstream /
+    upstream_sha、status 还是 None（位置由调用方判断：fetch_source 和上游比，update 按通道定目标）；没有上游时 status 是
+    detached / upstream_gone / no_upstream。fetch 失败的文案由 fail 给（见 fetch_ref）。调用方持有 repo_sync_lock。"""
     remotes = git_out(repo, "remote").split()
     branch = current_branch(repo)
     up = source_upstream(repo, branch, remotes)
@@ -1183,7 +1183,7 @@ def fetch_upstream(repo: str, explicit: Optional[str], prefetched: dict, fail, e
         # 远端没有这条分支不算错：没配上游时是本地分支；配了上游的多半是合并后被删了（不少仓库的
         # 主检出停在旧的 feature / bugfix 分支上）。integrate 显式传了 --base，不能因此失败。
         if not fetch_ref(repo, sync, prefetched, fail, upstream, up["remote"], up["branch"], missing_ok=True,
-                         extra=extra):
+                         extra=extra(up)):
             gone = up["configured"]
             up["reason"] = (f"{branch} 的上游 {upstream} 在远端已经没有了" if gone else
                             f"{branch} 没配上游，远端 origin 也没有这条分支")
@@ -4327,7 +4327,8 @@ watch 起来之后新起的也算），写了名字只盯这些；子编排者�
                           {BACKGROUND_WAIT_MAX_SECONDS // 60} 分钟上限：停满 --idle-minutes 报一次（看板、时间线同一个判定），停的这一段变了重新计时
   herdr unreachable       herdr 连不上（--until-event 时退出码 1）
 drover 自己的事，名字位置写 drover（EVENT drover <事件> @<时间>），同样每件只报一次、重挂不重报：
-  updated(<旧>..<新>)[ rules]  自动更新装上了新版本（两边是版本 tag，那个提交上没有 tag 时是 7 位 sha；还没报过的几次
+  updated(<旧>..<新>)[ rules]  自动更新装上了新版本（两边是版本号：正好在版本 tag 上是 tag，tag 之后 N 个提交是 vX.Y.Z+N，
+                          历史上没有版本 tag 时是 7 位 sha；还没报过的几次
                           并成一次）；带 rules 的是 AGENTS.md 里的 drover 规则也变了，跑 drover rules 读入改动。
                           报过记在 ~/.drover/auto-update.json 的 announced
   update-blocked          自动更新被挡住（clone 有本地改动、分叉、没上游、上游还没有发布的版本……什么都没改）或失败：
@@ -4893,9 +4894,10 @@ BOARD_DESCRIPTION = f"""\
             换编排者时 herdr tab close 它；旧的 orch.json 没有是 null）；deliverables 只解析旧 rollup 的"## 交付"（没有是 []）
 能一键收尾（--json 的 wrapup_ready）：完成、主会话读过这一版、rollup 的"收尾："是可以（没写这一行时完成就算可以）、编排者还开着；
 点过的也算（主会话收到看板送的口令时拿它核对），K 是其中还没点过的。
-第一行末尾是 drover 自己的版本（· drover <7 位 sha>，--plain 不写）。下面按需多几行 drover 自己的状态：最近 24 小时更新过的
-「drover 已自动更新 <旧>→<新>（<版本 tag>，MM-DD HH:MM）」（手动 drover update 换了版本的写「drover 已更新 <旧>→<新>
-（<版本 tag>，MM-DD HH:MM，手动）」；新版本那个提交上没有版本 tag 时不写 tag）；
+第一行末尾是 drover 自己的版本号（· drover v0.3.0，--plain 不写）：正好在版本 tag 上是 tag，tag 之后 N 个提交是 v0.3.0+N
+（跟 main 通道时常见），历史上没有版本 tag、算不出来时是 7 位 sha；copy 模式在 clone 里算。下面按需多几行 drover 自己的状态：
+最近 24 小时更新过的「drover 已自动更新 <旧>→<新>（MM-DD HH:MM）」（手动 drover update 换了版本的写「drover 已更新 <旧>→<新>
+（MM-DD HH:MM，手动）」；两头也是版本号）；
 自动更新被挡住或失败的「drover 自动更新暂停：<原因>」。
 文本、--plain、--json、--live 会触发 drover 的自动更新检查（到时间才在后台查，不等它）；--line、--pending 不触发。
 --tab 在主会话所在的 workspace 里开一个和主对话同级的"看板"tab 跑 --live（不抢焦点，代替以前 --pane 的下方分屏，顺带关掉它）。
@@ -5570,8 +5572,9 @@ def board_live(a: argparse.Namespace) -> int:
             stuck = ""  # 磁盘上有新代码、这一轮没换成的原因
             current = drover_version()
             if loaded and current and current != loaded:
-                stuck = (f"drover 看板没换成新代码 {short_sha(current)}：{board_reexec(saved)}；接着用 {short_sha(loaded)}，"
-                         "下一轮再试")
+                reason = board_reexec(saved)  # 换成了就不回来了
+                new, old = version_pair(drover_repo(), current, loaded)
+                stuck = f"drover 看板没换成新代码 {new}：{reason}；接着用 {old}，下一轮再试"
             auto_update_tick()
             now = time.time()
             with contextlib.suppress(DroverError):  # herdr 连不上：下面画看板时会显示
@@ -5906,7 +5909,7 @@ def board_live_problem(pane: str) -> Optional[str]:
         return f"心跳是 pane {beat.get('pane_id')} 的，不是看板 tab 的 pane {pane}"
     running, installed = beat.get("version"), drover_version()
     if isinstance(running, str) and running and installed and running != installed:
-        return f"看板跑的是 {short_sha(running)}，装着的是 {short_sha(installed)}"
+        return "看板跑的是 {}，装着的是 {}".format(*version_pair(drover_repo(), running, installed))
     age = time.time() - (as_float(beat.get("at")) or 0)
     if age > BOARD_LIVE_STALE:
         return f"心跳 {span(age)}没更新（超过 {BOARD_LIVE_STALE} 秒）：看板停了或卡住了"
@@ -11481,6 +11484,11 @@ RELEASE_TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
 # 带 "+"：远端挪过的 tag 照着更新，不带时 git 拒绝覆盖本地的（would clobber existing tag），整次 fetch 退出码 1，就被当成
 # 连不上了（git 2.51 实测）。远端没有这条分支时照样报 couldn't find remote ref（fetch_ref 的 missing_ok 照旧认得）。
 RELEASE_TAG_REFSPEC = "+refs/tags/v*:refs/tags/v*"
+# main 通道跟上游那次 fetch 多给一条有目标的分支 refspec（写的就是上游那条远端跟踪分支）：命令行上有一条 refspec 带目标，git 就按
+# 默认规则自动跟进 tag——指向这次拿到的（或本地已有的）提交、本地还没有的 tag 一起拿回来，远端新打的版本 tag 进了 clone，版本号
+# （version_label）才算得对；本地已有的同名 tag 不动（作者本地改过、还没推的不会被盖掉），退出码 0（git 2.51 实测）。
+# {branch} / {ref} 是 fetch_upstream 认出的上游分支名和远端跟踪分支（如 main、origin/main）。
+MAIN_TRACK_REFSPEC = "+refs/heads/{branch}:refs/remotes/{ref}"
 
 
 def home_path(p: Any) -> str:
@@ -11576,21 +11584,53 @@ def latest_release(repo: str, upstream: str) -> Optional[tuple]:
 
 
 def release_tag_at(repo: str, sha: Optional[str]) -> Optional[str]:
-    """正好指向 sha 这个提交的版本 tag（有几个取最新的），给人看装的是哪个版本；没有、算不出来（clone 不是 git 仓库）返回 None。"""
+    """正好指向 sha 这个提交的版本 tag（有几个取最新的），记进更新记录的 from_tag / to_tag；没有、算不出来（clone 不是 git 仓库）
+    返回 None。给人看的版本号用 version_label。"""
     with contextlib.suppress(DroverError):
         tags = [(version, name) for version, name, commit in release_tags(repo) if sha and commit == sha]
         return max(tags)[1] if tags else None
     return None
 
 
+def version_label(repo: Optional[str], sha: Any) -> Optional[str]:
+    """提交 → 给人看的 drover 版本号（看板、update、rules、watch --main 都用它）：正好在版本 tag 上写 tag（有几个取最新的，如
+    v0.3.0）；在 tag 之后 N 个提交写 v0.3.0+N，基准是这个提交历史上最新的版本 tag（release_tags：和 release 通道认的版本是同一套），
+    N = git rev-list --count <tag>..<提交>；历史上一个版本 tag 都没有、算不出来（repo 不是 git 仓库、里面没有这个提交）退回 7 位
+    sha。sha 是存着的完整 sha，显示时现算；没有 sha 返回 None。"""
+    if not (isinstance(sha, str) and sha):
+        return None
+    with contextlib.suppress(DroverError):
+        tags = release_tags(repo, f"--merged={sha}") if repo else []
+        if tags:  # 正好指向这个提交的优先（几个取最新的），没有就取历史上最新的
+            _, name, commit = max(tags, key=lambda t: (t[2] == sha, t[0]))
+            n = commit_count(repo, f"{commit}..{sha}")
+            return f"{name}+{n}" if n else name
+    return sha[:7]
+
+
+def version_pair(repo: Optional[str], a: Any, b: Any) -> tuple:
+    """两个提交的版本号（version_label），给"旧→新""跑的是 X、装着的是 Y"这类成对显示的地方用：版本号一样、提交却不同（同一个
+    tag 之后提交数相同：amend、换了分支）时各自带上 7 位 sha，看得出是两个版本。"""
+    la, lb = version_label(repo, a), version_label(repo, b)
+    if la == lb and a != b and la != short_sha(a):
+        return f"{la}（{short_sha(a)}）", f"{lb}（{short_sha(b)}）"
+    return la, lb
+
+
+def update_fetch_extra(channel: str, up: dict) -> tuple:
+    """update 跟上游那次 fetch 顺带的 refspec（fetch_upstream 的 extra）：release 通道强制同步版本 tag（RELEASE_TAG_REFSPEC）；
+    main 通道给一条有目标的分支 refspec，让 git 自动跟进历史上的新 tag，不强制（MAIN_TRACK_REFSPEC：带 + 的 tag refspec 会盖掉
+    作者本地改过、还没推的 tag）。wt / integrate 的同步（fetch_source）不带。"""
+    return (RELEASE_TAG_REFSPEC,) if channel == "release" else (MAIN_TRACK_REFSPEC.format(**up),)
+
+
 def update_sync(clone: str, channel: str, merge: bool) -> dict:
-    """fetch clone 当前分支的上游（release 通道这次 fetch 顺带版本 tag），按通道定目标（sync 的 target / target_sha）：main 是
+    """fetch clone 当前分支的上游（顺带 tag，见 update_fetch_extra），按通道定目标（sync 的 target / target_sha）：main 是
     上游，release 是上游历史上最新的版本 tag（tag 名也记进 release）；再按 fast_forward_source 判断 clone 相对目标的位置，
     merge 时落后就快进。release 通道只和 tag 比、不和上游比：clone 停在 tag 上、落后上游是常态，不算落后；比最新的 tag 还新
-    （以前跟过 main）算 ahead，不回退。上游上还没有版本 tag 时 status 是 no_release，什么都不改。main 通道的 fetch 不带 tag，
-    和加通道之前一样（带 + 的 tag refspec 会盖掉作者本地改过、还没推的 tag）。调用方持有 repo_sync_lock。"""
+    （以前跟过 main）算 ahead，不回退。上游上还没有版本 tag 时 status 是 no_release，什么都不改。调用方持有 repo_sync_lock。"""
     release = channel == "release"
-    sync = fetch_upstream(clone, None, {}, update_fetch_error, extra=(RELEASE_TAG_REFSPEC,) if release else ())[0]
+    sync = fetch_upstream(clone, None, {}, update_fetch_error, extra=lambda up: update_fetch_extra(channel, up))[0]
     sync["channel"] = channel
     upstream = sync["upstream"]
     if not upstream:  # detached / no_upstream / upstream_gone：fetch_upstream 已经记了
@@ -11805,7 +11845,7 @@ def update_dry_text(res: dict) -> list:
     channel = ("release：跟上游上最新的版本 tag" + (f"（{res['release']}）" if res.get("release") else "")
                if res.get("channel") == "release" else "main：跟上游最新")
     lines = ["drover update --dry-run：只 fetch 了远端，没快进、没跑 install、没写文件",
-             f"clone：{home_path(res['clone'])}（{res['mode']} 模式），当前 {res['before'][:7]}，"
+             f"clone：{home_path(res['clone'])}（{res['mode']} 模式），当前 {version_label(res['clone'], res['before'])}，"
              f"分支 {sync.get('branch') or '（detached）'}，上游 {res.get('upstream') or '（没有）'}，更新通道 {channel}"]
     if res["behind"]:
         lines.append(f"落后 {res['behind']} 个提交" + (f"（到 {res['release']}）" if res.get("release") else "") + "：")
@@ -11825,15 +11865,15 @@ def update_dry_text(res: dict) -> list:
 
 
 def update_head(res: dict) -> str:
-    """update_text 的第一行：更新到哪；没有新提交时说已是最新，本地领先、这一版上次没装好（自动更新重跑了 install）各接一句。"""
-    before, after, tag = res["before"], res["after"], res.get("to_tag")
-    tag_part = tag + "，" if tag else ""
-    if before != after:
-        return f"drover 已更新：{before[:7]}→{after[:7]}（{tag_part}{res['new_commits']['count']} 个新提交）"
+    """update_text 的第一行：更新到哪（两头是版本号，version_pair）；没有新提交时说已是最新，本地领先、这一版上次没装好（自动
+    更新重跑了 install）各接一句。"""
+    before, after = version_pair(res["clone"], res["before"], res["after"])
+    if res["before"] != res["after"]:
+        return f"drover 已更新：{before}→{after}（{res['new_commits']['count']} 个新提交）"
     notes = [update_ahead_note(res)] if res.get("ahead") else []
     if res.get("install_retry"):
         notes.append("上次没装好，重跑了 install")
-    return f"drover 已是最新（{tag_part}{after[:7]}）" + "".join(f"；{n}" for n in notes)
+    return f"drover 已是最新（{after}）" + "".join(f"；{n}" for n in notes)
 
 
 def update_text(res: dict) -> list:
@@ -12198,8 +12238,7 @@ def auto_update_log(res: dict, result: str, started: float) -> list:
     别的（包括上次没装好、这次重跑了 install 的已是最新）接 update_text。"""
     head = f"[{clock(started)}] drover update --auto：{result}"
     if result == "up_to_date" and "install" not in res:
-        tag = res.get("to_tag")
-        return [f"{head}（{tag + '，' if tag else ''}{res['after'][:7]}，没有要装的新版本，没重跑 install）"]
+        return [f"{head}（{version_label(res['clone'], res['after'])}，没有要装的新版本，没重跑 install）"]
     return [head, *update_text(res)]
 
 
@@ -12207,22 +12246,16 @@ def short_sha(value: Any) -> Optional[str]:
     return value[:7] if isinstance(value, str) and value else None
 
 
-def update_end(upd: dict, end: str) -> Optional[str]:
-    """更新记录的一头（end 是 from / to）给人看的版本：那个提交上的版本 tag，没有（或旧记录）就 7 位 sha。"""
-    tag = upd.get(f"{end}_tag")
-    return tag if isinstance(tag, str) and tag else short_sha(upd.get(end))
-
-
 def drover_take_events(record: dict, now: float, out: list) -> bool:
     """watch --main 一轮里自动更新要报的事（追加进 out，不带名字和时间），并在 record 里记上报过了；返回改没改 record。
-    updated(<旧>..<新>)[ rules]：有没报过的更新，两头是版本 tag，没有就 7 位 sha（update_end）；install 没装好（install_failed）
+    updated(<旧>..<新>)[ rules]：有没报过的更新，两头是版本号（version_pair，同看板）；install 没装好（install_failed）
     时不报、也不标已报，装好了再报。update-blocked：被挡住、失败、install 没装好，同一个原因（类型 + 文案）只报一次；
     update-unreachable(24h)：连续连不上满 AUTO_UPDATE_UNREACHABLE_HOURS 小时，这一段只报一次。"""
     changed = False
     upd = pending_update(record)
     if upd:
-        out.append(f"updated({update_end(upd, 'from')}..{update_end(upd, 'to')})"
-                   + (" rules" if upd.get("routing_changed") else ""))
+        frm, to = version_pair(drover_repo(), upd.get("from"), upd.get("to"))
+        out.append(f"updated({frm}..{to})" + (" rules" if upd.get("routing_changed") else ""))
         changed = mark_announced(record)
     result = record.get("result")
     if result in ("blocked", "failed", "install_failed"):
@@ -12281,11 +12314,22 @@ def drover_version() -> Optional[str]:
     return None
 
 
+def drover_repo() -> Optional[str]:
+    """跑着的这份 drover 的提交在哪个 git 仓库里（version_label 在这里算版本号）：link 模式就是 PKG_ROOT（clone，或开发用的
+    worktree：和主仓库共用 tag）；copy 模式副本没有 .git，取副本标记里的 source（install.py 复制时的 clone）。"""
+    marker = read_json_dict(PKG_ROOT / COPY_MARKER)
+    if not marker:
+        return str(PKG_ROOT)
+    source = marker.get("source")
+    return source if isinstance(source, str) and source else None
+
+
 def drover_board(now: float) -> tuple[dict, list]:
-    """看板上 drover 自己的状态：(board --json 的 drover 字段, 文本看板第一行下面加的行)。最近更新过的那一行按 update 的 source
-    写：手动的"drover 已更新 …（…，手动）"，自动的"drover 已自动更新 …"（--check 有失败项的接上 error：那是自动更新的）；
-    新版本那个提交上有版本 tag 的，括号里先写 tag。install 没装好（install_failed）时不写"已更新"，写"装失败"和失败项：
-    代码换了、AGENTS.md 的区块和 hook 可能还是旧的，算不上更新好了。"""
+    """看板上 drover 自己的状态：(board --json 的 drover 字段, 文本看板第一行下面加的行)。第一行写的 version 是版本号
+    （version_label），commit 是 7 位 sha。最近更新过的那一行按 update 的 source 写：手动的"drover 已更新 <旧>→<新>（…，手动）"，
+    自动的"drover 已自动更新 <旧>→<新>（…）"（--check 有失败项的接上 error：那是自动更新的），两头也是版本号（version_pair）。
+    install 没装好（install_failed）时不写"已更新"，写"装失败"和失败项：代码换了、AGENTS.md 的区块和 hook 可能还是旧的，
+    算不上更新好了。"""
     record = read_json_dict(AUTO_UPDATE_FILE)
     upd = record.get("update") if isinstance(record.get("update"), dict) else {}
     last, at = as_float(record.get("last_attempt")), as_float(upd.get("at"))
@@ -12297,14 +12341,17 @@ def drover_board(now: float) -> tuple[dict, list]:
             "routing_changed": upd.get("routing_changed"), "flow_changed": upd.get("flow_changed"),
             "updated_at": clock(at) if at else None, "announced": upd.get("announced"),
             "source": (upd.get("source") or "auto") if upd else None}
-    info = {"version": short_sha(drover_version()), "auto_update": auto, "rules_changed": rules_changed()}
+    repo, version = drover_repo(), drover_version()
+    info = {"version": version_label(repo, version), "commit": short_sha(version), "auto_update": auto,
+            "rules_changed": rules_changed()}
     notes = []
     if result == "install_failed":  # error 和它一起写（record_install_run）
         notes.append(f"drover 自动更新装失败（下次自动检查重试）：{error}")
     elif at and now - at < AUTO_UPDATE_RECENT_HOURS * 3600:
-        when = (f"{auto['to_tag']}，" if auto["to_tag"] else "") + clock(at, "%m-%d %H:%M")
-        notes.append(f"drover 已更新 {auto['from']}→{auto['to']}（{when}，手动）" if auto["source"] == "manual" else
-                     f"drover 已自动更新 {auto['from']}→{auto['to']}（{when}）"
+        frm, to = version_pair(repo, upd.get("from"), upd.get("to"))
+        when = clock(at, "%m-%d %H:%M")
+        notes.append(f"drover 已更新 {frm}→{to}（{when}，手动）" if auto["source"] == "manual" else
+                     f"drover 已自动更新 {frm}→{to}（{when}）"
                      + (f"，{error}" if result == "updated" and error else ""))
     if result in ("blocked", "failed"):
         notes.append(f"drover 自动更新暂停：{error or result}")
@@ -12360,11 +12407,18 @@ def rules_diff(old: str, new: str) -> list:
     return out
 
 
+def rules_span(repo: Optional[str], loaded: Any, running: Any) -> str:
+    """rules 开头的"从哪版到哪版"：主会话载入时的版本 → 现在跑着的，两头是版本号（version_pair，取不到写"（版本不明）"）；
+    是同一个版本时只写一个。"""
+    frm, to = (x or "（版本不明）" for x in version_pair(repo, loaded, running))
+    return frm if frm == to else f"{frm}→{to}"
+
+
 def rules_text(block: str, loaded: dict, full: bool) -> str:
-    """drover rules（和 rules --hook）的输出：开头一句说明（从哪版到哪版、以下面为准），再是改动的行或整个区块。
-    没有载入时的记录、改动超过区块的 RULES_DIFF_MAX_RATIO、--full 时给整个区块。"""
-    to = short_sha(drover_version()) or "（版本不明）"
-    frm = short_sha(loaded.get("version")) or "（版本不明）"
+    """drover rules（和 rules --hook）的输出：开头一句说明（从哪版到哪版、以下面为准，版本号见 version_label），再是改动的行或
+    整个区块。没有载入时的记录、改动超过区块的 RULES_DIFF_MAX_RATIO、--full 时给整个区块。"""
+    repo, version = drover_repo(), drover_version()
+    to = version_label(repo, version) or "（版本不明）"
     old = loaded.get("text") if loaded.get("digest") and isinstance(loaded.get("text"), str) else None
     if loaded.get("digest") == text_digest(block):
         when = as_float(loaded.get("recorded_at"))
@@ -12376,7 +12430,7 @@ def rules_text(block: str, loaded: dict, full: bool) -> str:
     if old is None:
         head = [f"drover {to} 的主会话规则（没有载入时的记录）：{RULES_REPLACE}", "下面是整个区块。"]
     else:
-        head = [f"drover {frm if frm == to else f'{frm}→{to}'} 更新了主会话规则：{RULES_REPLACE}"]
+        head = [f"drover {rules_span(repo, loaded.get('version'), version)} 更新了主会话规则：{RULES_REPLACE}"]
         head.append("下面是整个区块。" if changes is None else
                     "下面只列改动的行：@@ 后面是这处改动所在的节，- 是删掉的行，+ 是新的行，没列的没变；"
                     f"要看整个区块跑 {DROVER_CMD} rules --full。")
@@ -12588,7 +12642,8 @@ def build_parser() -> argparse.ArgumentParser:
                            "deliverables（旧 rollup 的\"## 交付\"：kind：look / doing / user / note、item、status；没有是 []）、"
                            "title、ask、display_state、state_since、state_seconds、total_seconds、wrapup_clicked、note、tab_id）、"
                            "wrapup_ready（能一键收尾的 slug，点过的也算；主会话还没读这一版的不算）、"
-                           "drover（version：7 位 sha；auto_update：enabled、result、last_attempt、error、from、to、count、"
+                           "drover（version：版本号，同第一行；commit：7 位 sha；auto_update：enabled、result、last_attempt、"
+                           "error、from、to（7 位 sha）、from_tag、to_tag、count、"
                            "titles、routing_changed、flow_changed、updated_at、announced；rules_changed：AGENTS.md 里的 "
                            "drover 区块和主会话载入时的不同，跑 drover rules 读入）")
     mode.add_argument("--line", action="store_true",
@@ -12848,11 +12903,13 @@ def build_parser() -> argparse.ArgumentParser:
                                    "~/.drover/pkg 软链指向的目录，copy 模式是记录里的 source。fetch clone 当前分支的上游，"
                                    "按更新通道（~/.drover/config.json 的 update_channel）定快进到哪：release（默认）是上游"
                                    "历史上最新的版本 tag（vX.Y.Z，上游上没打 tag 的新提交不装，一个都没有时不更新），"
-                                   "main 是上游最新。干净且落后时 merge --ff-only（本地比目标新照常继续，不回退）；有本地"
+                                   "main 是上游最新（fetch 时 git 顺带拿回上游历史上的 tag，本地已有的同名 tag 不动）。"
+                                   "干净且落后时 merge --ff-only（本地比目标新照常继续，不回退）；有本地"
                                    "改动、分叉、没上游等情况不快进、"
                                    "不跑 install，退出码 1。之后每次都重跑 clone 里的 install.py --json（幂等，装对的项跳过；"
                                    "不碰飞书配对的 .env、AGENTS.md 区块外的内容、settings.json 里别的规则和 hook），"
-                                   "再跑装好那份的 install.py --check。默认打印几行中文（装的提交上有版本 tag 时写出 tag），"
+                                   "再跑装好那份的 install.py --check。默认打印几行中文（新旧版本写版本号：正好在版本 tag 上"
+                                   "是 tag，tag 之后 N 个提交是 vX.Y.Z+N，历史上没有版本 tag 时是 7 位 sha），"
                                    "失败时退出码 1。"
                                    "跑着的这份 drover 真的换了版本时（copy 模式看副本标记，install 没复制成就不算）和自动更新"
                                    "一样记进 ~/.drover/auto-update.json 的 update（source: manual，"
@@ -12880,7 +12937,8 @@ def build_parser() -> argparse.ArgumentParser:
                                      "只给差别，读完记成载入时",
                        description="主会话载入时的区块记在 ~/.drover/main-rules.json（SessionStart hook、Codex 的 "
                                    "main-register、主会话每次 drover rules 读完都写）。输出纯文本：开头一句\"drover <旧>→<新> "
-                                   f"更新了主会话规则：{RULES_REPLACE}\"，再是改动的行（@@ 所在的节、- 删掉的、+ 新的）；"
+                                   f"更新了主会话规则：{RULES_REPLACE}\"（两头是版本号，同 board 第一行），再是改动的行"
+                                   "（@@ 所在的节、- 删掉的、+ 新的）；"
                                    "没有载入时的记录、改动超过区块的一半、--full 时给整个区块；没变时说一句没变。主会话读完把"
                                    "载入时更新成现在的，并把 ~/.drover/auto-update.json 里最近一次更新标成已报（announced，"
                                    "watch --main 不再报 drover updated，board --json 的 drover.auto_update.announced 变成 true）；"

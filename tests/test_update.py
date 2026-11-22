@@ -56,6 +56,7 @@ def dump(obj: dict) -> str:
 class UpdateTestBase(InstallTestBase):
     # 更新通道（config.json 的 update_channel）。下面这些类测的是"拉上游、只快进、重跑 install"本身，按 main 通道跑（作者本机
     # 的用法，行为和加通道之前一样）；UpdateReleaseTests 是 None：不写这个键，按默认的 release 通道（跟版本 tag）。
+    # 模板远端没打过版本 tag：这些类里输出、看板、watch --main 写的版本号都退回 7 位 sha（UpdateReleaseTests 的远端有 tag）。
     channel = "main"
 
     @classmethod
@@ -840,8 +841,9 @@ class UpdateReleaseTests(UpdateTestBase):
 
     def test_fast_forwards_to_latest_release_tag(self) -> None:
         """选 tag：v0.9.0、v0.10.0（按数字比，v0.10.0 新）、之后没打 tag 的提交上的 v0.11.0-rc1（预发布版不算）、别的分支上的
-        v9.9.9（不在上游历史上）→ 装 v0.10.0。--dry-run 报目标 tag 和落后的提交；更新后 clone 停在 v0.10.0，origin/main 是更新
-        的提交；再跑是已是最新（不因为落后 origin/main 误报）；输出、记录、看板第二行都写出 v0.10.0"""
+        v9.9.9（不在上游历史上）→ 装 v0.10.0。--dry-run 报目标 tag 和落后的提交，当前版本写版本号 v0.1.0；更新后 clone 停在 v0.10.0，
+        origin/main 是更新的提交；再跑是已是最新（不因为落后 origin/main 误报）；输出、看板第二行的两头都写版本号（v0.1.0→v0.10.0），
+        记录里照旧存完整 sha 和两头的 tag"""
         self.clone_install("--host", "claude")
         old = self.head(self.clone)
         self.push_change("flow/routing.md", MARK_LINE, "routing：加一条规则")
@@ -858,12 +860,13 @@ class UpdateReleaseTests(UpdateTestBase):
         self.assertEqual((out["target_sha"], out["upstream_sha"]), (v010, latest))
         self.assertEqual(out["upstream_commits"], {"count": 2, "titles": ["readme：第 2 条", "routing：加一条规则"]})
         dry = self.update("--dry-run").stdout
+        self.assertIn("当前 v0.1.0，", dry)
         self.assertIn("更新通道 release：跟上游上最新的版本 tag（v0.10.0）", dry)
         self.assertIn("落后 2 个提交（到 v0.10.0）：", dry)
         self.assertEqual(self.head(self.clone), old)
 
         lines = self.update().stdout.splitlines()
-        self.assertEqual(lines[0], f"drover 已更新：{old[:7]}→{v010[:7]}（v0.10.0，2 个新提交）")
+        self.assertEqual(lines[0], "drover 已更新：v0.1.0→v0.10.0（2 个新提交）")
         self.assertEqual((self.head(self.clone), self.tracking()), (v010, latest))
         self.assertIn(MARK, self.agents.read_text())
         upd = self.record()["update"]
@@ -871,22 +874,22 @@ class UpdateReleaseTests(UpdateTestBase):
                          (old, v010, "v0.1.0", "v0.10.0", 2))
         d = self.load_cli(self.pkg_dir / "bin" / "drover")
         stamp = time.strftime("%m-%d %H:%M", time.localtime(upd["at"]))
-        self.assertEqual(d.drover_board(time.time())[1], [f"drover 已更新 {old[:7]}→{v010[:7]}（v0.10.0，{stamp}，手动）"])
+        self.assertEqual(d.drover_board(time.time())[1], [f"drover 已更新 v0.1.0→v0.10.0（{stamp}，手动）"])
 
         out = self.update_json()
         self.assertTrue(out["ok"], dump(out))
         self.assertEqual((out["status"], out["before"], out["after"], out["to_tag"]), ("up_to_date", v010, v010, "v0.10.0"))
-        self.assertEqual(self.update().stdout.splitlines()[0], f"drover 已是最新（v0.10.0，{v010[:7]}）")
+        self.assertEqual(self.update().stdout.splitlines()[0], "drover 已是最新（v0.10.0）")
         self.assertEqual(self.head(self.clone), v010)
 
     def test_auto_untagged_commits_not_installed(self) -> None:
-        """--auto：上游上没打 tag 的新提交不装（up_to_date，HEAD、AGENTS.md、安装记录都不动，没有 update 记录）；作者打了 tag
-        之后才装，记录的 from_tag / to_tag 是 v0.1.0 / v0.2.0，watch --main 报 updated(v0.1.0..v0.2.0) rules"""
+        """--auto：上游上没打 tag 的新提交不装（up_to_date，日志写当前版本号 v0.1.0；HEAD、AGENTS.md、安装记录都不动，没有 update
+        记录）；作者打了 tag 之后才装，记录的 from_tag / to_tag 是 v0.1.0 / v0.2.0，watch --main 报 updated(v0.1.0..v0.2.0) rules"""
         self.clone_install("--host", "claude")
         old, mtime = self.head(self.clone), self.state.stat().st_mtime_ns
         new = self.push_change("flow/routing.md", MARK_LINE, "routing：还没发版")
         p = self.update("--auto")
-        self.assertIn(f"up_to_date（v0.1.0，{old[:7]}，没有要装的新版本，没重跑 install）", p.stdout.splitlines()[0])
+        self.assertIn("up_to_date（v0.1.0，没有要装的新版本，没重跑 install）", p.stdout.splitlines()[0])
         self.assertEqual((self.head(self.clone), self.tracking()), (old, new))
         self.assertNotIn(MARK, self.agents.read_text())
         self.assertEqual(self.state.stat().st_mtime_ns, mtime)
@@ -896,7 +899,7 @@ class UpdateReleaseTests(UpdateTestBase):
 
         self.release("v0.2.0")
         p = self.update("--auto")
-        self.assertIn(f"drover 已更新：{old[:7]}→{new[:7]}（v0.2.0，1 个新提交）", p.stdout.splitlines())
+        self.assertIn("drover 已更新：v0.1.0→v0.2.0（1 个新提交）", p.stdout.splitlines())
         self.assertEqual(self.head(self.clone), new)
         self.assertIn(MARK, self.agents.read_text())
         rec = self.record()
@@ -958,25 +961,39 @@ class UpdateReleaseTests(UpdateTestBase):
         self.assertTrue(out["ok"], dump(out))
         self.assertEqual((out["status"], out["ahead"], out["after"], out["to_tag"]), ("ahead", 1, newest, None))
         first = self.update().stdout.splitlines()[0]
-        self.assertEqual(first, f"drover 已是最新（{newest[:7]}）；本地比最新版本 v0.2.0 新 1 个提交，不回退")
+        self.assertEqual(first, "drover 已是最新（v0.2.0+1）；本地比最新版本 v0.2.0 新 1 个提交，不回退")
         self.assertEqual(self.head(self.clone), newest)
 
     def test_main_channel_follows_branch(self) -> None:
-        """config.json 写 update_channel: main（作者本机）：和加通道之前一样跟上游最新，没打 tag 的提交照样装；fetch 不带 tag
-        （作者本地打了还没推的 tag 不会被远端的覆盖），所以远端的 v0.1.0 没进 clone，输出里也不写 tag"""
+        """config.json 写 update_channel: main（作者本机）：和加通道之前一样跟上游最新，没打 tag 的提交照样装。fetch 多给一条有目的端
+        的分支 refspec，git 自动跟进上游历史上的 tag：远端新打的 v0.2.0 进了 clone（--dry-run 那次 fetch 就带回来了）；不强制拉
+        tag，作者本地改过、还没推的同名 tag（v0.1.0 换成本地的附注 tag）不被远端的盖掉，update 照常成功。输出两头写版本号：
+        --dry-run 的当前 v0.1.0，已更新 v0.1.0→v0.2.0+1，再跑已是最新（v0.2.0+1）"""
         self.clone_install("--host", "claude")
         self.write_json(self.config, {**self.load(self.config), "update_channel": "main"})
-        old = self.head(self.clone)
-        new = self.push_change("flow/routing.md", MARK_LINE, "routing：还没发版")
+        self.git(self.clone, "tag", "-a", "v0.1.0", "-m", "作者本地改过、还没推")
+        local = self.git(self.clone, "rev-parse", "refs/tags/v0.1.0")
+        self.push_change("flow/routing.md", MARK_LINE, "routing：加一条规则")
+        v020 = self.release("v0.2.0")
+        new = self.push_change("README.md", "\n还没发版\n", "readme：还没发版")
+        self.assertEqual(self.git(self.clone, "tag", "--list"), "v0.1.0")
+
+        dry = self.update("--dry-run").stdout
+        self.assertIn("当前 v0.1.0，", dry)
+        self.assertIn("落后 2 个提交：", dry)
+        self.assertEqual(self.git(self.clone, "tag", "--list").splitlines(), ["v0.1.0", "v0.2.0"])
         lines = self.update().stdout.splitlines()
-        self.assertEqual(lines[0], f"drover 已更新：{old[:7]}→{new[:7]}（1 个新提交）")
+        self.assertEqual(lines[0], "drover 已更新：v0.1.0→v0.2.0+1（2 个新提交）")
         self.assertEqual(self.head(self.clone), new)
         self.assertIn(MARK, self.agents.read_text())
+        self.assertEqual(self.git(self.clone, "rev-parse", "v0.2.0^{commit}"), v020)
+        self.assertEqual(self.git(self.clone, "rev-parse", "refs/tags/v0.1.0"), local)  # 本地改过的没被盖掉
+        self.assertNotEqual(self.git(self.dev, "rev-parse", "refs/tags/v0.1.0"), local)
         out = self.update_json()
         self.assertTrue(out["ok"], dump(out))
         self.assertEqual((out["channel"], out["target"], out["status"], out["after"], out["release"], out["to_tag"]),
                          ("main", "origin/main", "up_to_date", new, None, None))
-        self.assertEqual(self.git(self.clone, "tag", "--list"), "")
+        self.assertEqual(self.update().stdout.splitlines()[0], "drover 已是最新（v0.2.0+1）")
 
     def test_unknown_channel_changes_nothing(self) -> None:
         """update_channel 写了不认识的值：报错（说只能是 release / main），不 fetch、不快进；--auto 记 failed"""

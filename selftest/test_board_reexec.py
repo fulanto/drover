@@ -71,9 +71,11 @@ class ReexecPtyTests(PtyTestCase):
     drover_version 读它，不碰本 worktree 和真实安装。"""
 
     def make_clone(self) -> Path:
-        """link 模式：临时 clone，bin/drover 是本 worktree 的，提交一次。返回 clone。"""
+        """link 模式：临时 clone，bin/drover 是本 worktree 的，提交一次、打附注 tag v0.1.0（之后每提交一次版本号就是 v0.1.0+N）。
+        返回 clone。"""
         clone = self.tmp / "clone"
         self.init_repo(clone, {"bin/drover": DROVER.read_text()})
+        self.git(clone, "tag", "-a", "v0.1.0", "-m", "release v0.1.0")
         return clone
 
     def install_copy(self, clone: Path) -> Path:
@@ -101,16 +103,17 @@ class ReexecPtyTests(PtyTestCase):
         return out
 
     def test_new_commit_reexecs_same_process(self) -> None:
-        """link 模式：版本没变时跑几轮都不重新执行（只开过一次鼠标、没关过），心跳是这个进程、这个 pane、启动时的版本；clone 里
-        提交一版新代码 → 同一个进程（pid 不变、没退出）换成新代码：先关鼠标上报、恢复终端，再重新开鼠标，之后画的是"drover
-        新看板"、第一行版本是新的，心跳的版本跟着变；Ctrl-C 退出后终端属性和启动前一样（重新执行之前恢复过：新进程开鼠标前
-        记下的是原来的属性）"""
+        """link 模式：版本没变时跑几轮都不重新执行（只开过一次鼠标、没关过），心跳是这个进程、这个 pane、启动时的版本，第一行版本号
+        是 v0.1.0；clone 里提交一版新代码 → 同一个进程（pid 不变、没退出）换成新代码：先关鼠标上报、恢复终端，再重新开鼠标，之后画的
+        是"drover 新看板"、第一行版本号是 v0.1.0+1，心跳的版本跟着变（存的照旧是完整 sha）；Ctrl-C 退出后终端属性和启动前一样
+        （重新执行之前恢复过：新进程开鼠标前记下的是原来的属性）"""
         clone = self.make_clone()
         old = self.git(clone, "rev-parse", "HEAD")
         p, master, slave, before = self.start_pty("w1:p2", "--interval", "0.3", script=clone / "bin" / "drover")
         out = read_until(master, b"", lambda o: FIRST_FRAME in o)
         out = read_until(master, out, lambda o: o.count(FIRST_FRAME) >= 4)  # 又跑了三轮
         self.assertGreaterEqual(out.count(FIRST_FRAME), 4)
+        self.assertRegex(last_frame(out)[0], r"^drover 看板 · .* · drover v0\.1\.0$")
         self.assertEqual((out.count(MOUSE_ON), out.count(MOUSE_OFF)), (1, 0))
         self.assertEqual((self.beat()["pid"], self.beat()["pane_id"], self.beat()["version"]), (p.pid, "w1:p2", old))
         new = self.commit(clone, "看板第一行改成新看板", {"bin/drover": new_code()})
@@ -121,24 +124,24 @@ class ReexecPtyTests(PtyTestCase):
         self.assertLess(first_on, off)
         self.assertLess(second_on, out.index(NEW_BOARD))
         self.assertNotIn(NEW_BOARD, out[:second_on])
-        self.assertRegex(last_frame(out)[0], rf"^drover 新看板 · .* · drover {new[:7]}$")
+        self.assertRegex(last_frame(out)[0], r"^drover 新看板 · .* · drover v0\.1\.0\+1$")
         self.assertEqual((self.beat()["pid"], self.beat()["version"]), (p.pid, new))
         self.stop(p, master, slave, before)
 
     def test_broken_new_code_keeps_board_and_retries(self) -> None:
         """新提交的代码加载就报 SyntaxError → 不重新执行（没关鼠标、进程还是那个），看板接着用旧代码画（第一行还是"drover 看板"），
-        多一行"drover 看板没换成新代码 <新>：新代码跑不起来（退出码 1：SyntaxError: …）；接着用 <旧>，下一轮再试"；再提交一版能跑
-        的 → 下一轮就换过去（同一个进程），那一行没了"""
+        多一行"drover 看板没换成新代码 <新>：新代码跑不起来（退出码 1：SyntaxError: …）；接着用 <旧>，下一轮再试"（两头是版本号：
+        v0.1.0+1、v0.1.0）；再提交一版能跑的 → 下一轮就换过去（同一个进程），那一行没了"""
         clone = self.make_clone()
         old = self.git(clone, "rev-parse", "HEAD")
         p, master, slave, before = self.start_pty("w1:p2", "--interval", "0.3", script=clone / "bin" / "drover", cols=200)
         out = read_until(master, b"", lambda o: FIRST_FRAME in o)
-        broken = self.commit(clone, "坏代码", {"bin/drover": broken_code()})
+        self.commit(clone, "坏代码", {"bin/drover": broken_code()})
         out = read_until(master, out, lambda o: o.count(STUCK.encode()) >= 2)  # 下一轮再试：又显示了一次
         frame = last_frame(out)
         self.assertTrue(frame[0].startswith("drover 看板 · "), frame[0])
         stuck = next(x for x in frame if x.startswith(STUCK))
-        self.assertRegex(stuck, rf"^{STUCK} {broken[:7]}：新代码跑不起来（退出码 1：SyntaxError: .+）；接着用 {old[:7]}，下一轮再试$")
+        self.assertRegex(stuck, rf"^{STUCK} v0\.1\.0\+1：新代码跑不起来（退出码 1：SyntaxError: .+）；接着用 v0\.1\.0，下一轮再试$")
         self.assertIsNone(p.poll())
         self.assertNotIn(MOUSE_OFF, out)
         self.assertEqual(self.beat()["version"], old)
@@ -152,7 +155,8 @@ class ReexecPtyTests(PtyTestCase):
 
     def test_copy_mode_waits_for_new_copy(self) -> None:
         """copy 模式（副本里有 .drover-copy，版本取它记的 commit）：update 先快进了 clone、副本还没重装 → 不换（换了拿到的还是旧
-        副本）；副本重装好（标记里是新 commit）→ 同一个进程换成副本里的新代码"""
+        副本）；副本重装好（标记里是新 commit）→ 同一个进程换成副本里的新代码。副本没有 .git，第一行的版本号在标记的 source（clone）
+        里算：v0.1.0+1"""
         clone = self.make_clone()
         pkg = self.install_copy(clone)
         old = self.git(clone, "rev-parse", "HEAD")
@@ -166,7 +170,7 @@ class ReexecPtyTests(PtyTestCase):
         self.install_copy(clone)
         out = read_until(master, out, lambda o: o.count(NEW_BOARD) >= 2)
         self.assertIsNone(p.poll())
-        self.assertRegex(last_frame(out)[0], rf"^drover 新看板 · .* · drover {new[:7]}$")
+        self.assertRegex(last_frame(out)[0], r"^drover 新看板 · .* · drover v0\.1\.0\+1$")
         self.assertEqual((self.beat()["pid"], self.beat()["version"]), (p.pid, new))
         self.stop(p, master, slave, before)
 
@@ -236,9 +240,12 @@ class TabRestartTests(TabTestCase):
     """board --tab 复用看板 tab（w1:t2 / pane w1:p2，见 setup_tab）时按 --live 的心跳认旧看板。进程里跑，drover_version 换成假的
     （装着的是 NEW），时间是假时钟。"""
 
-    def tab(self, *args: str, now: float, version=NEW, rc: int = 0) -> dict:
+    def tab(self, *args: str, now: float, version=NEW, rc: int = 0, root: Path = None) -> dict:
+        """root 给了就把这份 drover 当成装在 root 这个仓库里（版本号在那里算）。"""
         d = self.load_drover()
         d.drover_version = lambda: version
+        if root:
+            d.PKG_ROOT = root
         d.time = FakeClock(start=now)
         code, out, err = run_cli(d, "board", "--tab", *args)
         self.assertEqual(code, rc, out + err)
@@ -285,6 +292,23 @@ class TabRestartTests(TabTestCase):
                 self.assertEqual(self.restart_calls()[before:], RESTART_CALLS)
         self.assertEqual(self.calls("tab", "create"), [])
         self.assertEqual(self.herdr_state()["pane_keys"], [["w1:p2", "ctrl+c"]] * 4)
+
+    def test_version_labels_in_reason(self) -> None:
+        """版本不一样的原因写版本号（在这份 drover 所在的仓库里算；上面不在仓库里的假 sha 退回 7 位 sha）：v0.1.0 和 v0.1.0+1；
+        两边版本号一样、提交却不同（同一个 tag 之后提交数相同：amend、换了分支）时各自带上 7 位 sha，看得出是两个版本"""
+        self.setup_tab()
+        repo = self.tmp / "repo"
+        c1 = self.init_repo(repo, {"a.txt": "1\n"})
+        self.git(repo, "tag", "-a", "v0.1.0", "-m", "release v0.1.0")
+        c2 = self.commit(repo, "main 上的提交", {"a.txt": "2\n"})
+        self.git(repo, "switch", "-q", "-c", "other", c1)
+        o2 = self.commit(repo, "别的分支上的提交", {"a.txt": "other\n"})
+        for running, reason in ((c1, "看板跑的是 v0.1.0，装着的是 v0.1.0+1"),
+                                (o2, f"看板跑的是 v0.1.0+1（{o2[:7]}），装着的是 v0.1.0+1（{c2[:7]}）")):
+            with self.subTest(reason=reason):
+                self.beat(version=running)
+                out = self.tab(now=T0 + 5, version=c2, root=repo)
+                self.assertEqual((out["restarted"], out["restart_reason"]), (True, reason))
 
     def test_dry_run_and_failures(self) -> None:
         """--dry-run 只列两条命令（不执行）；pane run 失败 → 报错（ctrl+c 已经按了：让手动在看板 tab 里跑看板命令），退出码 1"""

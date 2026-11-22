@@ -81,6 +81,9 @@ JSON_KEYS = {"slug", "name", "group", "status", "agent_status", "screen_status",
              "tab_id"}
 HEAD_MD = r"^\*\*drover 看板\*\* · \d\d-\d\d \d\d:\d\d · "
 HEAD_PLAIN = r"^drover 看板 · \d\d-\d\d \d\d:\d\d · "
+# 第一行末尾 drover 自己的版本号（跑的是本 worktree：正好在 tag 上 v0.3.0、之后 N 个提交 v0.3.0+N、没有 tag 的 clone 是 7 位 sha；
+# 这几条测版式，版本号怎么算见 test_auto_update.py）
+VERSION = r"(?:v\d+\.\d+\.\d+(?:\+\d+)?|[0-9a-f]{7})"
 # 假的 herdr-oncall bin/run-node.sh：不跑 node，记下工作目录和参数，打印 send-reply.json（send-main.mjs 的一行 JSON）。
 FAKE_SEND_NODE = """#!/bin/bash
 root="$(cd "$(dirname "$0")/.." && pwd -P)"
@@ -239,7 +242,7 @@ class BoardGroupTests(BoardTestCase):
         那一行的第一句；要你做什么取"答法："那一句，没有写"看转达，回你的决定"，别的写"无"。完成且已退出、子编排者不显示；组内按
         状态持续长的在前。原来"要主会话处理"的收成最底下一行，各原因带各自的时长（第一次看到的写"刚发现"）"""
         blocks = self.board().strip().split("\n\n")
-        self.assertRegex(blocks[0], HEAD_MD + r"9 个任务 · drover [0-9a-f]{7}$")
+        self.assertRegex(blocks[0], HEAD_MD + r"9 个任务 · drover " + VERSION + "$")
         head = "| 任务 | 当前状态 | 要你做什么 | 状态持续 | 代号 |\n|---|---|---|---|---|\n"
         self.assertEqual(blocks[1:], [
             "**等你（2）**",
@@ -503,7 +506,7 @@ class BoardOutputTests(BoardTestCase):
         self.task("t-old", "orch-old", "完成", age=HOUR)
         self.set_agents()
         self.assertEqual(self.board("--line").strip(), "drover 无任务")
-        self.assertRegex(self.board().strip(), HEAD_MD + r"没有任务 · drover [0-9a-f]{7}$")
+        self.assertRegex(self.board().strip(), HEAD_MD + r"没有任务 · drover " + VERSION + "$")
         self.assertRegex(self.board("--plain").strip(), HEAD_PLAIN + r"没有任务$")
         self.task("t-a", "orch-a", "等你决定", age=HOUR, read=True)
         self.task("t-b", "orch-b", "受阻", age=HOUR, read=True)
@@ -569,7 +572,7 @@ class BoardOutputTests(BoardTestCase):
         self.env["COLUMNS"] = "80"
         out = self.board("--live", "--iterations", "1", "--interval", "0")
         self.assertTrue(out.startswith("\033[H\033[2J"), repr(out[:20]))
-        self.assertRegex(out.splitlines()[0], r"· 1 个任务 · drover [0-9a-f]{7}$")  # 一个任务也不再把任务名写进第一行
+        self.assertRegex(out.splitlines()[0], r"· 1 个任务 · drover " + VERSION + "$")  # 一个任务也不再把任务名写进第一行
         self.assertIn("\n\n进行中（1）\n┌──────┬──────────┬────────────┬──────────┬──────┐\n"
                       "│ 任务 │ 当前状态 │ 要你做什么 │ 状态持续 │ 代号 │\n"
                       "├──────┼──────────┼────────────┼──────────┼──────┤\n"
@@ -904,7 +907,7 @@ class BoardV5Tests(BoardTestCase):
         正好落在 [全部收尾（1 个）] 和 [收尾]（占两行的任务的第一行）上；不再写"点看板任意位置回到主对话\""""
         self.design_tasks()
         d, lines, regions, offset = self.frame(140)
-        self.assertRegex(lines[0], r"^drover 看板 · \d\d-\d\d \d\d:\d\d · 3 个任务 · drover [0-9a-f]{7}$")
+        self.assertRegex(lines[0], r"^drover 看板 · \d\d-\d\d \d\d:\d\d · 3 个任务 · drover " + VERSION + "$")
         self.assertEqual(lines[1:], ["", *DESIGN_WIDE.splitlines()])
         self.assertEqual(offset, 0)
         tables = box_tables(lines)
@@ -982,7 +985,7 @@ class BoardV5Tests(BoardTestCase):
         一行"回"全部收尾"…"）、--pending（"· <标题>（<代号>）：<要你做>（已等 <状态持续>）"）、--line、--json 的标题和要你做"""
         self.design_tasks()
         blocks = self.board().strip().split("\n\n")
-        self.assertRegex(blocks[0], HEAD_MD + r"3 个任务 · drover [0-9a-f]{7}$")
+        self.assertRegex(blocks[0], HEAD_MD + r"3 个任务 · drover " + VERSION + "$")
         self.assertEqual(blocks[1:], [
             "**等你（2）**",
             "| 任务 | 当前状态 | 要你做什么 | 状态持续 | 代号 |\n|---|---|---|---|---|\n"
@@ -1161,7 +1164,7 @@ class BoardV6Tests(BoardTestCase):
         几张表竖线上下对齐；[收尾] 点第一行点得中、第二行点不中。不在看板 tab 里（--live 子进程，没开鼠标）一样折行，收尾格写"可以\""""
         self.v6_tasks()
         d, lines, regions, offset = self.frame(140)
-        self.assertRegex(lines[0], r"^drover 看板 · \d\d-\d\d \d\d:\d\d · 3 个任务 · drover [0-9a-f]{7}$")
+        self.assertRegex(lines[0], r"^drover 看板 · \d\d-\d\d \d\d:\d\d · 3 个任务 · drover " + VERSION + "$")
         self.assertEqual((offset, lines[1:]), (0, ["", *WRAPPED_WIDE.splitlines()]))
         bars = [[d.text_width(x[:i]) for i, ch in enumerate(x) if ch in "│┌┬┐├┼┤└┴┘"] for x in lines if x[:1] in tuple("│┌├└")]
         self.assertEqual({tuple(b[:6]) for b in bars}, {tuple(bars[0])})
@@ -1422,7 +1425,7 @@ class BoardV8Tests(BoardTestCase):
         （116 格，列宽只按表头和五格算）；表下面没有单独的"提醒："段。不在看板 tab 里（--live 子进程，没开鼠标）画法一样"""
         self.v8_tasks()
         d, lines, regions, offset = self.frame(160)
-        self.assertRegex(lines[0], r"^drover 看板 · \d\d-\d\d \d\d:\d\d · 3 个任务 · drover [0-9a-f]{7}$")
+        self.assertRegex(lines[0], r"^drover 看板 · \d\d-\d\d \d\d:\d\d · 3 个任务 · drover " + VERSION + "$")
         self.assertEqual((offset, regions, lines[1:]), (0, [], ["", *NOTED_WIDE.splitlines()]))
         tables = box_tables(lines)
         self.assertEqual([{d.text_width(x) for x in t} for t in tables], [{116}, {116}])

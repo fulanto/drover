@@ -229,11 +229,11 @@ class DroverTestCase(unittest.TestCase):
 
     def drover(self, *args: str, rc: Optional[int] = 0, timeout: float = 120,
                cwd: Optional[Path] = None, input: Optional[str] = None,
-               env: Optional[dict] = None) -> subprocess.CompletedProcess:
+               env: Optional[dict] = None, script: Optional[Path] = None) -> subprocess.CompletedProcess:
         """子进程执行 bin/drover（临时环境）。rc=None 不检查退出码；input 是喂给 stdin 的文字（hook 模式用）；env 是只给这一条
-        命令加的环境变量（盖在 self.env 上）。"""
-        p = subprocess.run([sys.executable, str(DROVER), *args], env={**self.env, **(env or {})}, cwd=str(cwd or self.tmp),
-                           capture_output=True, text=True, timeout=timeout, input=input)
+        命令加的环境变量（盖在 self.env 上）；script 给了就执行它（临时 clone / 副本里的一份 bin/drover，版本按那里算）。"""
+        p = subprocess.run([sys.executable, str(script or DROVER), *args], env={**self.env, **(env or {})},
+                           cwd=str(cwd or self.tmp), capture_output=True, text=True, timeout=timeout, input=input)
         if rc is not None and p.returncode != rc:
             self.fail(f"drover {' '.join(args)} 退出码 {p.returncode}（期望 {rc}）\n"
                       f"stdout:\n{p.stdout}\nstderr:\n{p.stderr}")

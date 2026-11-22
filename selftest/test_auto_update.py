@@ -17,6 +17,7 @@ import io
 import json
 import os
 import re
+import shutil
 import sys
 import time
 import unittest
@@ -25,8 +26,9 @@ from selftest_support import DROVER, MAIN_PANE, PKG, DroverTestCase, events, wai
 
 FAST = ["--interval", "0.2"]
 HOUR = 3600
-SHA_A, SHA_B, SHA_C = "a" * 40, "b" * 40, "c" * 40
+SHA_A, SHA_B, SHA_C = "a" * 40, "b" * 40, "c" * 40  # 不在任何仓库里：版本号算不出来，退回 7 位 sha
 BEGIN, END = "<!-- drover:routing:begin -->", "<!-- drover:routing:end -->"
+REPLACE = "从现在起以下面为准，替换你上下文里 AGENTS.md drover 区块的旧版本。"
 # 假的后台更新：一起来先写 <标记>.started；然后被挡住，等测试放行（<标记>.release 出现，最多 10 秒）——tick 要是等它，
 # 就一直等不回来（证明 tick 不等它，不靠"睡得比 1 秒长"）；放行后打一行到 stdout（进日志），把会话 ID、stdin 是不是 /dev/null、
 # 是不是被放行的写进标记文件。
@@ -62,6 +64,18 @@ class AutoUpdateCase(DroverTestCase):
         super().setUp()
         self.agents_md = self.work / "AGENTS.md"
         self.auto_file = self.state / "auto-update.json"
+        self.script = None  # rules / 看板跑哪份 bin/drover：None 是本 worktree 的，make_clone 以后是临时 clone 里的
+
+    def make_clone(self) -> list:
+        """临时 clone（link 模式装的样子）：bin/drover 是本 worktree 的，三个提交，第一个打附注 tag v0.1.0，HEAD 是 v0.1.0+2；
+        之后 rules / 看板跑它的 bin/drover，版本号按这个 clone 算（不跟本 worktree 的 tag 走）。返回三个提交（完整 sha）。"""
+        self.clone = self.tmp / "clone"
+        c1 = self.init_repo(self.clone, {"bin/drover": DROVER.read_text()})
+        self.git(self.clone, "tag", "-a", "v0.1.0", "-m", "release v0.1.0")
+        c2 = self.commit(self.clone, "第 2 个提交", {"a.txt": "2\n"})
+        c3 = self.commit(self.clone, "第 3 个提交", {"a.txt": "3\n"})
+        self.script = self.clone / "bin" / "drover"
+        return [c1, c2, c3]
 
     def write_block(self, block: str) -> None:
         self.agents_md.write_text("# 我的个人规则\n- 回答要短\n\n" + block + "\n\n## 尾部\n- 个人内容\n")
@@ -85,10 +99,7 @@ class AutoUpdateCase(DroverTestCase):
                 pane = MAIN_PANE
                 path.write_text(json.dumps({"session_id": None, "pane_id": pane, "source": None, "at": time.time()}))
             env = {"HERDR_ENV": "1", "HERDR_PANE_ID": pane}
-        return self.drover("rules", *args, rc=rc, cwd=self.work, env=env).stdout
-
-    def pkg_sha7(self) -> str:
-        return self.git(PKG, "rev-parse", "HEAD")[:7]
+        return self.drover("rules", *args, rc=rc, cwd=self.work, env=env, script=self.script).stdout
 
 
 # ---------------------------------------------------------------- tick：开关、间隔、锁、只起后台进程不等它
@@ -236,31 +247,33 @@ class CallSiteTests(AutoUpdateCase):
 
 
 class RulesTests(AutoUpdateCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.commits = self.make_clone()  # rules 跑临时 clone 里的 bin/drover：HEAD 是 v0.1.0+2
+
     def test_first_same_diff_full(self) -> None:
         """第一次（没有载入时的记录）给整个区块；没变说一句；改了一条只给差别（@@ 所在的节、- 旧、+ 新，没变的不列）；
-        --full 给整个区块；改动超过一半给整个区块。每次读完都把载入时更新成现在的"""
+        --full 给整个区块；改动超过一半给整个区块。每次读完都把载入时更新成现在的。开头写跑着的 drover 的版本号（v0.1.0+2），
+        main-rules.json 里照旧存完整 sha"""
         v1 = rules_block()
         self.write_block(v1)
         out = self.rules()
         head = out.splitlines()[0]
-        self.assertRegex(head, r"^drover [0-9a-f]{7} 的主会话规则（没有载入时的记录）：从现在起以下面为准，"
-                               r"替换你上下文里 AGENTS.md drover 区块的旧版本。$")
+        self.assertEqual(head, f"drover v0.1.0+2 的主会话规则（没有载入时的记录）：{REPLACE}")
         self.assertIn(v1, out)
         self.assertNotIn("我的个人规则", out)  # 只给区块，区块外的个人内容不给
         rules = self.main_rules()
         self.assertEqual(rules["digest"], hashlib.sha1(v1.encode()).hexdigest())
-        self.assertEqual((rules["text"], rules["source"], rules["version"][:7]), (v1, "rules", self.pkg_sha7()))
+        self.assertEqual((rules["text"], rules["source"], rules["version"]), (v1, "rules", self.commits[2]))
 
         same = self.rules().splitlines()
         self.assertEqual(len(same), 1, same)
-        self.assertRegex(same[0], r"^drover [0-9a-f]{7}：主会话规则和载入时（\d\d-\d\d \d\d:\d\d）一样，不用替换。$")
+        self.assertRegex(same[0], r"^drover v0\.1\.0\+2：主会话规则和载入时（\d\d-\d\d \d\d:\d\d）一样，不用替换。$")
 
         v2 = rules_block("- 追踪第 2 条：新的写法")
         self.write_block(v2)
         lines = self.rules().splitlines()
-        sha = self.pkg_sha7()
-        self.assertEqual(lines[0], f"drover {sha} 更新了主会话规则：从现在起以下面为准，替换你上下文里 AGENTS.md drover "
-                                   "区块的旧版本。")
+        self.assertEqual(lines[0], f"drover v0.1.0+2 更新了主会话规则：{REPLACE}")
         self.assertIn("只列改动的行", lines[1])
         self.assertEqual(lines[3:], ["@@ ## 追踪与转达", "- - 追踪第 2 条：旧的写法", "+ - 追踪第 2 条：新的写法"])
         self.assertEqual(self.main_rules()["text"], v2)
@@ -279,6 +292,20 @@ class RulesTests(AutoUpdateCase):
         out = self.rules()
         self.assertIn("下面是整个区块", out.splitlines()[1])
         self.assertIn(v4, out)
+
+    def test_head_from_to_versions(self) -> None:
+        """主会话载入时的版本和现在跑着的不一样：开头写"drover <旧>→<新> 更新了主会话规则"，两头是版本号（main-rules.json 里存的
+        完整 sha 现算）：载入时是 v0.1.0 那个提交 → v0.1.0→v0.1.0+2；载入时的提交不在这个仓库里（算不出来）→ 那一头退回 7 位 sha"""
+        self.write_block(rules_block())
+        self.rules()
+        for loaded, want, block in ((self.commits[0], "v0.1.0→v0.1.0+2", rules_block("- 追踪第 2 条：新的写法")),
+                                    (SHA_A, "aaaaaaa→v0.1.0+2", rules_block("- 追踪第 2 条：第三版"))):
+            with self.subTest(want=want):
+                rules = self.main_rules()
+                rules["version"] = loaded
+                (self.state / "main-rules.json").write_text(json.dumps(rules))
+                self.write_block(block)
+                self.assertEqual(self.rules().splitlines()[0], f"drover {want} 更新了主会话规则：{REPLACE}")
 
     def test_marks_update_announced(self) -> None:
         """读完把 auto-update.json 里最近一次更新标成 announced（Codex 看 board --json 的 announced 决定要不要读）；
@@ -341,6 +368,7 @@ class RulesTests(AutoUpdateCase):
 class RulesHookTests(AutoUpdateCase):
     def setUp(self) -> None:
         super().setUp()
+        self.make_clone()  # hook 跑临时 clone 里的 bin/drover：版本号是 v0.1.0+2
         self.write_block(rules_block())
         self.rules()  # 记下载入时
         (self.state / "main-session.json").write_text(json.dumps({"session_id": "s1", "pane_id": "w1:p1",
@@ -349,19 +377,19 @@ class RulesHookTests(AutoUpdateCase):
     def hook(self, session="s1", raw: str = None):
         payload = raw if raw is not None else json.dumps(
             {"session_id": session, "hook_event_name": "UserPromptSubmit", "prompt": "看板", "cwd": str(self.work)})
-        p = self.drover("rules", "--hook", rc=None, cwd=self.work, input=payload)
+        p = self.drover("rules", "--hook", rc=None, cwd=self.work, input=payload, script=self.script)
         self.assertEqual(p.returncode, 0, p.stderr)
         return p.stdout
 
     def test_outputs_changes_once_for_main_session(self) -> None:
-        """别的会话：什么都不输出；主会话、规则没变：不输出；变了：输出和 drover rules 一样的开头和改动，记成载入时、
+        """别的会话：什么都不输出；主会话、规则没变：不输出；变了：输出和 drover rules 一样的开头（写版本号）和改动，记成载入时、
         标成 announced，下一条消息不再输出。一次 herdr 都不调"""
         self.assertEqual(self.hook(), "")
         self.write_block(rules_block("- 追踪第 2 条：新的写法"))
         self.auto_record(result="updated", update={"from": SHA_A, "to": SHA_B, "announced": False})
         self.assertEqual(self.hook("s-worker"), "")
         out = self.hook()
-        self.assertRegex(out.splitlines()[0], r"^drover [0-9a-f]{7} 更新了主会话规则：从现在起以下面为准")
+        self.assertEqual(out.splitlines()[0], f"drover v0.1.0+2 更新了主会话规则：{REPLACE}")
         self.assertIn("+ - 追踪第 2 条：新的写法", out)
         self.assertTrue(self.auto()["update"]["announced"])
         self.assertEqual(self.main_rules()["text"], rules_block("- 追踪第 2 条：新的写法"))
@@ -397,30 +425,37 @@ class RulesHookTests(AutoUpdateCase):
 
 
 class WatchDroverEventTests(AutoUpdateCase):
-    def main_watch(self, timeout: str = "2") -> list:
-        rc, evs, _ = self.watch("--main", "--until-event", *FAST, "--timeout", timeout)
+    def main_watch(self, timeout: str = "2", setup=None) -> list:
+        rc, evs, _ = self.watch("--main", "--until-event", *FAST, "--timeout", timeout, setup=setup)
         self.assertEqual(rc, 0, evs)
         return evs
 
     def test_updated_once_across_rehang(self) -> None:
         """没报过的更新：EVENT drover updated(<旧>..<新>) rules（routing 变了才带 rules），标上 announced；重挂不再报；
-        下一次更新再报。两头写版本 tag（from_tag / to_tag），没有（旧记录、那个提交上没打 tag）写 7 位 sha"""
+        下一次更新再报。两头是版本号，在跑着的 drover 所在的仓库里按记录存的完整 sha 现算（同看板）：正好在 tag 上写 tag，之后 N 个
+        提交写 vX.Y.Z+N，不在这个仓库里（算不出来）写 7 位 sha；记录里的 from_tag / to_tag 不再拿来显示"""
+        c1, c2, c3 = self.make_clone()
+
+        def in_clone(d) -> None:  # 进程里跑的 drover 当成装在临时 clone 里（link 模式）
+            d.PKG_ROOT = self.clone
+
+        def pending(frm: str, to: str, routing: bool) -> None:
+            record = self.auto()
+            record["update"] = {"from": frm, "to": to, "from_tag": "v9.9.9", "to_tag": None, "routing_changed": routing,
+                                "announced": False}
+            self.auto_file.write_text(json.dumps(record))
+
         self.auto_record(result="updated", update={"from": SHA_A, "to": SHA_B, "count": 2, "routing_changed": True,
                                                    "announced": False, "at": time.time()})
-        self.assertEqual(self.main_watch(), ["EVENT drover updated(aaaaaaa..bbbbbbb) rules"])
+        self.assertEqual(self.main_watch(setup=in_clone), ["EVENT drover updated(aaaaaaa..bbbbbbb) rules"])
         self.assertTrue(self.auto()["update"]["announced"])
-        self.assertEqual(self.main_watch("1"), ["EVENT timeout"])
-        record = self.auto()
-        record["update"] = {"from": SHA_B, "to": SHA_C, "from_tag": None, "to_tag": "v0.2.0", "routing_changed": False,
-                            "announced": False}
-        self.auto_file.write_text(json.dumps(record))
-        self.assertEqual(self.main_watch(), ["EVENT drover updated(bbbbbbb..v0.2.0)"])
-        self.assertEqual(self.main_watch("1"), ["EVENT timeout"])
-        record = self.auto()
-        record["update"] = {"from": SHA_C, "to": SHA_A, "from_tag": "v0.2.0", "to_tag": "v0.3.0", "routing_changed": True,
-                            "announced": False}
-        self.auto_file.write_text(json.dumps(record))
-        self.assertEqual(self.main_watch(), ["EVENT drover updated(v0.2.0..v0.3.0) rules"])
+        self.assertEqual(self.main_watch("1", setup=in_clone), ["EVENT timeout"])
+        pending(c1, c3, False)
+        self.assertEqual(self.main_watch(setup=in_clone), ["EVENT drover updated(v0.1.0..v0.1.0+2)"])
+        self.assertEqual(self.main_watch("1", setup=in_clone), ["EVENT timeout"])
+        self.git(self.clone, "tag", "-a", "v0.2.0", "-m", "release v0.2.0", c3)
+        pending(c2, c3, True)
+        self.assertEqual(self.main_watch(setup=in_clone), ["EVENT drover updated(v0.1.0+1..v0.2.0) rules"])
 
     def test_blocked_once_per_reason(self) -> None:
         """被挡住：EVENT drover update-blocked，同一个原因只报一次（文案里的提交数变了也算同一个）、重挂不重报；换了原因再报；
@@ -521,40 +556,93 @@ class WatchDroverEventTests(AutoUpdateCase):
                                "EVENT orch-a rollup:等你决定"], outs)
 
 
+# ---------------------------------------------------------------- 版本号：提交 → v0.3.0 / v0.3.0+N / 7 位 sha
+
+
+class VersionLabelTests(AutoUpdateCase):
+    def test_version_label(self) -> None:
+        """提交 → 版本号（version_label：看板、update、rules、watch --main 都用它）：历史上一个版本 tag 都没有 → 7 位 sha；正好在
+        tag 上 → tag（轻量、附注都认；几个取版本号最大的，按数字比：v0.10.0 比 v0.9.0 新；历史上有更大的也写正好在的那个）；tag
+        之后 N 个提交 → vX.Y.Z+N，基准是这个提交历史上版本号最大的严格 vX.Y.Z tag（之后打的预发布版 v0.11.0-rc1、别的分支上的
+        v9.9.9 不算）；算不出来（不是 git 仓库、仓库里没有这个提交、没给仓库）→ 7 位 sha；没有提交 → None"""
+        d = self.load_drover()
+        repo = self.tmp / "repo"
+        c1 = self.init_repo(repo, {"a.txt": "1\n"})
+        self.assertEqual(d.version_label(str(repo), c1), c1[:7])
+        self.git(repo, "tag", "v0.9.0")
+        self.git(repo, "tag", "-a", "v0.10.0", "-m", "release v0.10.0")
+        self.commit(repo, "第 2 个提交", {"a.txt": "2\n"})
+        c3 = self.commit(repo, "第 3 个提交", {"a.txt": "3\n"})
+        self.git(repo, "tag", "-a", "v0.11.0-rc1", "-m", "预发布")
+        self.git(repo, "switch", "-q", "-c", "side", c1)
+        side = self.commit(repo, "别的分支上的提交", {"b.txt": "side\n"})
+        self.git(repo, "tag", "v9.9.9")
+        for sha, want in ((c1, "v0.10.0"), (c3, "v0.10.0+2"), (side, "v9.9.9")):
+            self.assertEqual(d.version_label(str(repo), sha), want)
+        self.git(repo, "tag", "v0.9.1", c3)  # 正好在 tag 上就写它，哪怕历史上有更大的
+        self.assertEqual(d.version_label(str(repo), c3), "v0.9.1")
+        for where, sha in ((str(self.work), c3), (str(repo), SHA_A), (None, c3)):
+            self.assertEqual(d.version_label(where, sha), sha[:7], where)
+        self.assertIsNone(d.version_label(str(repo), None))
+
+
 # ---------------------------------------------------------------- 看板上的 drover 状态
 
 
 class BoardDroverTests(AutoUpdateCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.commits = self.make_clone()  # 看板跑临时 clone 里的 bin/drover：HEAD 是 v0.1.0+2
+
     def board(self, *args: str) -> str:
-        return self.drover("board", *args).stdout
+        return self.drover("board", *args, script=self.script).stdout
 
     def board_lines(self) -> list:
         """默认的 Markdown 看板去掉空行（各段之间空一行）。"""
         return [line for line in self.board().splitlines() if line]
 
     def test_version_and_lines(self) -> None:
-        """第一行末尾 · drover <sha7>；最近 24 小时自动更新过的加一行"drover 已自动更新 a→b（MM-DD HH:MM）"，被挡住的加一行
-        "drover 自动更新暂停：<原因>"；更新是 25 小时前的不显示"""
+        """第一行末尾 · drover <版本号>（这份代码所在的 clone 在 v0.1.0 之后 2 个提交：v0.1.0+2）；最近 24 小时自动更新过的加一行
+        "drover 已自动更新 <旧>→<新>（MM-DD HH:MM）"，两头是版本号（记录里存的完整 sha 现算；不在这个仓库里的算不出来，退回 7 位
+        sha），括号里不再单独写 tag；被挡住的加一行"drover 自动更新暂停：<原因>"；更新是 25 小时前的不显示"""
+        c1, _, c3 = self.commits
         lines = self.board_lines()
-        self.assertTrue(lines[0].endswith(f" · drover {self.pkg_sha7()}"), lines[0])
+        self.assertTrue(lines[0].endswith(" · drover v0.1.0+2"), lines[0])
         self.assertEqual(len(lines), 1)
         at = time.time() - HOUR
+        stamp = time.strftime('%m-%d %H:%M', time.localtime(at))
         self.auto_record(result="blocked", blocked_status="dirty", error="clone 里有已跟踪文件的本地改动（README.md）",
-                         update={"from": SHA_A, "to": SHA_B, "at": at, "announced": True})
+                         update={"from": c1, "to": c3, "at": at, "announced": True})
         lines = self.board_lines()
-        self.assertEqual(lines[1], f"drover 已自动更新 aaaaaaa→bbbbbbb（{time.strftime('%m-%d %H:%M', time.localtime(at))}）")
+        self.assertEqual(lines[1], f"drover 已自动更新 v0.1.0→v0.1.0+2（{stamp}）")
         self.assertEqual(lines[2], "drover 自动更新暂停：clone 里有已跟踪文件的本地改动（README.md）")
-        self.assertIn(lines[2], self.drover("board", "--plain").stdout.splitlines())  # 飞书的纯文字看板也有
+        self.assertIn(lines[2], self.board("--plain").splitlines())  # 飞书的纯文字看板也有
         self.auto_record(result="up_to_date", update={"from": SHA_A, "to": SHA_B, "to_tag": "v0.2.0", "at": at})
-        self.assertEqual(self.board_lines()[1:],  # 新版本那个提交上有版本 tag：括号里先写 tag
-                         [f"drover 已自动更新 aaaaaaa→bbbbbbb（v0.2.0，{time.strftime('%m-%d %H:%M', time.localtime(at))}）"])
+        self.assertEqual(self.board_lines()[1:], [f"drover 已自动更新 aaaaaaa→bbbbbbb（{stamp}）"])
         self.auto_record(result="up_to_date", update={"from": SHA_A, "to": SHA_B, "at": time.time() - 25 * HOUR})
         self.assertEqual(len(self.board_lines()), 1)
 
+    def test_copy_mode_version_from_clone(self) -> None:
+        """copy 模式：副本没有 .git，版本号在副本标记（.drover-copy）的 source（clone）里按标记的 commit 算——复制时 clone 在
+        v0.1.0+1，之后 clone 又多了提交，第一行照样是副本那一版 · drover v0.1.0+1（不是 clone 的 HEAD）；clone 里给这个提交打了
+        tag 就写 tag。--json 的 version、commit 跟着"""
+        c2 = self.commits[1]
+        pkg = self.tmp / "pkg"
+        shutil.copytree(self.clone, pkg, ignore=shutil.ignore_patterns(".git"))
+        (pkg / ".drover-copy").write_text(json.dumps({"source": str(self.clone), "commit": c2,
+                                                      "copied_at": "2026-11-22T20:00:00"}))
+        self.script = pkg / "bin" / "drover"
+        self.assertTrue(self.board_lines()[0].endswith(" · drover v0.1.0+1"), self.board_lines()[0])
+        self.git(self.clone, "tag", "-a", "v0.1.1", "-m", "release v0.1.1", c2)
+        self.assertTrue(self.board_lines()[0].endswith(" · drover v0.1.1"), self.board_lines()[0])
+        out = json.loads(self.board("--json"))["drover"]
+        self.assertEqual((out["version"], out["commit"]), ("v0.1.1", c2[:7]))
+
     def test_manual_update_line(self) -> None:
         """手动 drover update 换了版本（update 的 source 是 manual）：第二行写"drover 已更新 b→c（MM-DD HH:MM，手动）"，
-        不接自动更新的 error（那是上一次自动检查的）；自动的（source auto，或旧记录没有 source）照旧"drover 已自动更新 a→b（…）"，
-        安装有失败项的接上 error；--plain 一样；手动的也是 24 小时以后不显示"""
+        不接自动更新的 error（那是上一次自动检查的）；两头是版本号（v0.1.0→v0.1.0+2，算不出来的退回 7 位 sha）；自动的（source
+        auto，或旧记录没有 source）照旧"drover 已自动更新 a→b（…）"，安装有失败项的接上 error；--plain 一样；手动的也是 24 小时
+        以后不显示"""
         at = time.time() - HOUR
         stamp = time.strftime('%m-%d %H:%M', time.localtime(at))
         error = "安装：改了 1 项；失败：插件（超时）"
@@ -562,9 +650,10 @@ class BoardDroverTests(AutoUpdateCase):
                          update={"from": SHA_B, "to": SHA_C, "at": at, "announced": True, "source": "manual"})
         self.assertEqual(self.board_lines()[1:], [f"drover 已更新 bbbbbbb→ccccccc（{stamp}，手动）"])
         self.assertIn(f"drover 已更新 bbbbbbb→ccccccc（{stamp}，手动）", self.board("--plain").splitlines())
-        self.auto_record(result="updated", error=error, update={"from": SHA_B, "to": SHA_C, "to_tag": "v0.3.0", "at": at,
-                                                                "announced": True, "source": "manual"})
-        self.assertEqual(self.board_lines()[1:], [f"drover 已更新 bbbbbbb→ccccccc（v0.3.0，{stamp}，手动）"])
+        self.auto_record(result="updated", error=error,
+                         update={"from": self.commits[0], "to": self.commits[2], "to_tag": None, "at": at,
+                                 "announced": True, "source": "manual"})
+        self.assertEqual(self.board_lines()[1:], [f"drover 已更新 v0.1.0→v0.1.0+2（{stamp}，手动）"])
         for source in ("auto", None):
             with self.subTest(source=source):
                 upd = {"from": SHA_A, "to": SHA_B, "at": at, "announced": False, **({"source": source} if source else {})}
@@ -589,13 +678,15 @@ class BoardDroverTests(AutoUpdateCase):
                          [f"drover 已自动更新 aaaaaaa→bbbbbbb（{time.strftime('%m-%d %H:%M', time.localtime(at))}）"])
 
     def test_json_drover_field(self) -> None:
-        """--json 的 drover：version（7 位）、auto_update（enabled、result、last_attempt、error、from、to、from_tag、to_tag、
-        count、titles、routing_changed、flow_changed、updated_at、announced、source）、rules_changed（区块和载入时的不同；没有
-        载入时的记录算没变）。source：没有更新记录是 null，旧记录没有这个键算 auto，手动 update 写的是 manual；from_tag /
-        to_tag 是那个提交上的版本 tag，旧记录没有是 null"""
+        """--json 的 drover：version（版本号，同第一行）、commit（7 位 sha，给机器 / 排查用）、auto_update（enabled、result、
+        last_attempt、error、from、to（7 位 sha：提交字段，不换成版本号）、from_tag、to_tag、count、titles、routing_changed、
+        flow_changed、updated_at、announced、source）、rules_changed（区块和载入时的不同；没有载入时的记录算没变）。source：没有
+        更新记录是 null，旧记录没有这个键算 auto，手动 update 写的是 manual；from_tag / to_tag 是那个提交上的版本 tag，旧记录没有
+        是 null"""
+        c1, _, c3 = self.commits
         out = json.loads(self.board("--json"))["drover"]
-        self.assertEqual(set(out), {"version", "auto_update", "rules_changed"})
-        self.assertEqual(out["version"], self.pkg_sha7())
+        self.assertEqual(set(out), {"version", "commit", "auto_update", "rules_changed"})
+        self.assertEqual((out["version"], out["commit"]), ("v0.1.0+2", c3[:7]))
         self.assertEqual(set(out["auto_update"]), {"enabled", "result", "last_attempt", "error", "from", "to", "from_tag",
                                                    "to_tag", "count", "titles", "routing_changed", "flow_changed",
                                                    "updated_at", "announced", "source"})
@@ -608,15 +699,15 @@ class BoardDroverTests(AutoUpdateCase):
         self.rules()
         self.write_block(rules_block("- 追踪第 2 条：新的写法"))
         self.auto_record(last_attempt=time.time(), result="updated",
-                         update={"from": SHA_A, "to": SHA_B, "to_tag": "v0.2.0", "count": 3, "titles": ["t1", "t2", "t3"],
-                                 "routing_changed": True, "flow_changed": False, "at": time.time(),
-                                 "announced": False})
+                         update={"from": c1, "to": c3, "from_tag": "v0.1.0", "to_tag": None, "count": 3,
+                                 "titles": ["t1", "t2", "t3"], "routing_changed": True, "flow_changed": False,
+                                 "at": time.time(), "announced": False})
         auto = json.loads(self.board("--json"))["drover"]
         self.assertTrue(auto["rules_changed"])
         a = auto["auto_update"]
         self.assertEqual((a["result"], a["from"], a["to"], a["count"], a["titles"], a["routing_changed"], a["announced"],
-                          a["source"]), ("updated", "aaaaaaa", "bbbbbbb", 3, ["t1", "t2", "t3"], True, False, "auto"))
-        self.assertEqual((a["from_tag"], a["to_tag"]), (None, "v0.2.0"))
+                          a["source"]), ("updated", c1[:7], c3[:7], 3, ["t1", "t2", "t3"], True, False, "auto"))
+        self.assertEqual((a["from_tag"], a["to_tag"]), ("v0.1.0", None))
         self.assertRegex(a["updated_at"], r"^\d\d-\d\d \d\d:\d\d:\d\d$")
         self.assertRegex(a["last_attempt"], r"^\d\d-\d\d \d\d:\d\d:\d\d$")
         self.rules()

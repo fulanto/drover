@@ -12,6 +12,8 @@
 | `main` | 上游最新的提交，推上去就装 | 开发 drover 的人（作者本机：推完就装上） |
 
 - 版本 tag 只认 `vX.Y.Z`（三段数字，按数字比大小：`v0.10.0` 比 `v0.9.0` 新）。带后缀的预发布版（`v1.0.0-rc1`）、不在上游历史上的 tag（打在别的分支上的）不算。
+- 给人看的 drover 版本号（看板第一行、"已更新"那一行，`drover update`、`drover rules` 的输出，`watch --main` 的 `drover updated(…)`）按同一套 tag 算：正好在版本 tag 上写 tag（`v0.3.0`）；在 tag 之后 N 个提交（跟 `main` 通道时常见）写 `v0.3.0+N`，基准是这个提交历史上最新的版本 tag；历史上一个版本 tag 都没有、算不出来时写 7 位 sha。copy 模式的副本没有 `.git`，在 clone 里算。`auto-update.json`、`main-rules.json` 里照旧存完整 sha，显示时现算。
+- `main` 通道 fetch 上游时 git 顺带拿回上游历史上的 tag（远端新打的版本 tag 进 clone，版本号才算得对）；不强制拉，你本地改过、还没推的同名 tag 不会被远端的盖掉。`release` 通道本来就强制同步版本 tag。
 - `release` 通道的 clone 停在 tag 那个提交上，落后 `origin/main` 是正常的，不算落后；clone 比最新的 tag 还新（比如以前跟过 `main`）也不回退，等下一个更新的版本。
 - 上游上一个版本 tag 都没有时不更新：看板上"drover 自动更新暂停"那一行写原因，手动 `update` 退出码 1。
 - 切通道：编辑 `config.json`，比如加一行 `"update_channel": "main"`，下一次 `update` / 自动更新就按新的走，不用重装。从 `main` 切回 `release` 时 clone 多半已经比最新版本新，等下一个版本才会再动。
@@ -42,7 +44,7 @@
 
 drover 记着主会话"载入时"的规则（`~/.drover/main-rules.json`：会话开始时的登记记一份），`drover rules` 把现在 `AGENTS.md` 里 drover 区块和它的差别送进主会话的上下文（开头一句"从现在起以下面为准，替换你上下文里 AGENTS.md drover 区块的旧版本"），主会话跑的再把"载入时"更新成现在的。
 
-- **Claude Code**：后台更新装完，`watch --main` 报一行 `EVENT drover updated(<旧>..<新>) rules`（两头是版本 tag，比如 `updated(v0.1.0..v0.2.0)`；那个提交上没有 tag 时是 7 位 sha），主会话跑 `drover rules` 读入新规则，再跑一次 `drover board --tab`（看板 tab 里还是旧代码的看板就重启，见下面"看板换新代码"），再用一句话告诉你更新了什么。万一那条没走到（没挂 watch），**你的下一条消息就带上新规则**：install 装的 UserPromptSubmit hook（`drover rules --hook`）在你提交消息时把改动一起送进上下文，飞书发来的消息也算。两条路用同一份"载入时"记录去重，不会读两遍。之后 `/compact` 时 Claude Code 本来就会从磁盘重读 `AGENTS.md`。
+- **Claude Code**：后台更新装完，`watch --main` 报一行 `EVENT drover updated(<旧>..<新>) rules`（两头是版本号，比如 `updated(v0.1.0..v0.2.0)`、跟 `main` 通道时 `updated(v0.2.0+1..v0.2.0+4)`；算法见上面"更新通道"），主会话跑 `drover rules` 读入新规则，再跑一次 `drover board --tab`（看板 tab 里还是旧代码的看板就重启，见下面"看板换新代码"），再用一句话告诉你更新了什么。万一那条没走到（没挂 watch），**你的下一条消息就带上新规则**：install 装的 UserPromptSubmit hook（`drover rules --hook`）在你提交消息时把改动一起送进上下文，飞书发来的消息也算。两条路用同一份"载入时"记录去重，不会读两遍。之后 `/compact` 时 Claude Code 本来就会从磁盘重读 `AGENTS.md`。
 - **Codex**：没有后台任务，也不装 hook（[install 会改哪些地方](install.md#install-会改哪些地方)）。主会话每条消息先跑 `board --json`，看到 `drover.rules_changed`（或者 `drover.auto_update.announced` 是 `false`）就跑 `drover rules`，所以新规则在你下一条消息时用上；你说"盯着"时挂着的 `watch --main` 同样会报 `drover updated`。
 
 **`/clear`、`/new` 之后接上**
@@ -52,13 +54,13 @@ drover 记着主会话"载入时"的规则（`~/.drover/main-rules.json`：会�
 
 **看板换新代码**
 
-- 看板 tab 里的 `board --live` 是常驻进程，代码是启动时加载的。以前自动更新以后它第一行显示新的版本号（每轮现读），画表的还是旧代码，要关掉 tab 重开才是新的。现在它启动时记下自己这份代码的版本，每 15 秒一轮和磁盘上装着的比（link 模式是 clone 的 HEAD，copy 模式是副本 `.drover-copy` 里记的提交——update 先快进 clone 再重装副本，中间不会换到旧副本上），变了就先试跑一下新代码，没问题就恢复终端、原样重新执行自己：进程号不变，tab、tab 名照旧，最多 15 秒就是新的看板。取不到版本时不换；新代码跑不起来（比如有语法错误）时看板上多一行"drover 看板没换成新代码 <新>：<原因>；接着用 <旧>，下一轮再试"，接着用旧代码。
+- 看板 tab 里的 `board --live` 是常驻进程，代码是启动时加载的。以前自动更新以后它第一行显示新的版本号（每轮现读），画表的还是旧代码，要关掉 tab 重开才是新的。现在它启动时记下自己这份代码的版本，每 15 秒一轮和磁盘上装着的比（link 模式是 clone 的 HEAD，copy 模式是副本 `.drover-copy` 里记的提交——update 先快进 clone 再重装副本，中间不会换到旧副本上），变了就先试跑一下新代码，没问题就恢复终端、原样重新执行自己：进程号不变，tab、tab 名照旧，最多 15 秒就是新的看板。取不到版本时不换；新代码跑不起来（比如有语法错误）时看板上多一行"drover 看板没换成新代码 <新>：<原因>；接着用 <旧>，下一轮再试"（两头是版本号；版本号一样、提交不同时——比如 amend 过——各自带上 7 位 sha），接着用旧代码。
 - 自己没换过来的（看板停了、卡住了）有兜底：看板 tab 里的 `--live` 每轮写心跳 `~/.drover/board-live.json`（pid、pane、版本、时间）；`board --tab` 复用 tab 时看到没有心跳、心跳不是这个 pane 的、版本和装着的不一样、或者 2 分钟没更新，就在那个 pane 里按 ctrl+c 再重跑看板（返回 `restarted: true` 和原因）。主会话在会话开始、每次 `drover updated` 读完新规则之后都跑 `board --tab`，旧看板就在那时换掉。
 
 **看得到什么**
 
-- 看板第一行末尾是 drover 的版本（`· drover <7 位 sha>`）。最近 24 小时更新过的，下面一行"drover 已自动更新 a→b（时间）"，手动 `drover update` 换了版本的写"drover 已更新 a→b（时间，手动）"；新版本那个提交上有版本 tag 的，括号里先写 tag，比如"drover 已自动更新 a1b2c3d→e4f5a6b（v0.2.0，11-20 10:30）"（手动更新也记进 `auto-update.json`，source 记成 manual；按跑着的这份 drover 的版本算，和第一行对得上：copy 模式 install 没复制成、副本还是旧的就不记，之后重跑成功记旧副本→新版本；跑的人看到输出了，记成已告知，`watch --main` 不再为它叫醒主会话；之前有一次自动更新还没报给主会话的，并成一次照样报）；install 没装好的（`install_failed`），不写"已自动更新"，写一行"drover 自动更新装失败（下次自动检查重试）：<失败项>"，装好以后回到"已自动更新"那一行；被挡住或失败的，一行"drover 自动更新暂停：<原因>"，原因里写了怎么处理（比如先提交或 stash clone 里的改动），处理完等下一次检查或手动 `update`。
-- `watch --main` 只报一次：`drover updated(…)`、`drover update-blocked`（同一个原因一次；install 没装好也报它）、`drover update-unreachable(24h)`，重挂不重报。install 没装好时不报 `drover updated`，装好那次才报（这时带不带 `rules` 按装上的算）。`board --json` 的 `drover` 字段：`version`、`auto_update`（`result`、`from`、`to`、`from_tag`、`to_tag`、`titles`、`routing_changed`、`announced` 等）、`rules_changed`。
+- 看板第一行末尾是 drover 的版本号（`· drover v0.3.0`，跟 `main` 通道时如 `· drover v0.3.0+2`，算法见上面"更新通道"）。最近 24 小时更新过的，下面一行"drover 已自动更新 <旧>→<新>（时间）"，手动 `drover update` 换了版本的写"drover 已更新 <旧>→<新>（时间，手动）"，两头也是版本号，比如"drover 已自动更新 v0.2.0→v0.3.0（11-20 10:30）"（手动更新也记进 `auto-update.json`，source 记成 manual；按跑着的这份 drover 的版本算，和第一行对得上：copy 模式 install 没复制成、副本还是旧的就不记，之后重跑成功记旧副本→新版本；跑的人看到输出了，记成已告知，`watch --main` 不再为它叫醒主会话；之前有一次自动更新还没报给主会话的，并成一次照样报）；install 没装好的（`install_failed`），不写"已自动更新"，写一行"drover 自动更新装失败（下次自动检查重试）：<失败项>"，装好以后回到"已自动更新"那一行；被挡住或失败的，一行"drover 自动更新暂停：<原因>"，原因里写了怎么处理（比如先提交或 stash clone 里的改动），处理完等下一次检查或手动 `update`。
+- `watch --main` 只报一次：`drover updated(…)`、`drover update-blocked`（同一个原因一次；install 没装好也报它）、`drover update-unreachable(24h)`，重挂不重报。install 没装好时不报 `drover updated`，装好那次才报（这时带不带 `rules` 按装上的算）。`board --json` 的 `drover` 字段：`version`（版本号，同看板第一行）、`commit`（7 位 sha，给机器、排查用）、`auto_update`（`result`、`from`、`to`（7 位 sha）、`from_tag`、`to_tag`、`titles`、`routing_changed`、`announced` 等）、`rules_changed`。
 - 主会话的"载入时"只认主会话自己读的：`drover rules` 不是主会话跑的（你在终端里跑、编排者跑）照样输出差别，开头多一行"不是主会话……没记成主会话已读"，不改"载入时"、不把更新标成已报（认主会话的办法同 `drover rollup`：`HERDR_PANE_ID` 是 `main-session.json` 记的 pane）。
 
 **正在跑的编排者和 worker**
