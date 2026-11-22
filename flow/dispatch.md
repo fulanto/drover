@@ -63,7 +63,7 @@ drover 是这套派发体系的名字，也是它的命令（Claude Code 的 `/d
   （最多 5 行，一行一件事）
 
   ## 结论
-  （完成或受阻时写：第一行"目标：…"（第 1.1 节），修 bug / 设计类接着按下面"修 bug 或设计方案"那段写应该怎样、根因、依据、读过的仓库，然后是结论、改动范围、验证、未决、下一步；收尾的"完成"用第 9 节"任务收尾"第 8 步的精简版；主会话会原样转给用户）
+  （完成或受阻时写：第一行"目标：…"（第 1.1 节），修 bug / 设计类接着按下面"修 bug 或设计方案"那段写应该怎样、根因、依据、读过的仓库，然后是结论、改动范围、验证（每条证据一行，写法见下面"验证"一段）、未决、下一步；收尾的"完成"用第 9 节"任务收尾"第 8 步的精简版；主会话会原样转给用户）
   ```
 
   开头这几行是主会话的看板（`drover board`）用的：一行一个任务，列是 任务（"标题："）| 当前状态（"摘要："）| 要你做什么（"要你做："）| 状态持续 | 代号（slug），按状态分组（等你 / 进行中 / 完成），完成那组多一列收尾；"提醒："写在这个任务那一行下面（几个任务写了同一句各自都写）。用户在手机上靠它一眼看出每个任务走到哪、在等谁、要自己做什么。每次整份覆盖 rollup 时都写（子编排者写在"上层："下面），写短：看板每格有长度上限，超出的折行或截掉，末尾加"..."。
@@ -82,6 +82,17 @@ drover 是这套派发体系的名字，也是它的命令（Claude Code 的 `/d
   每条未决、实测、待办，都用一两句说清：它是什么、为什么做、不做会怎样。包括"需要你决定"里每个选项的代价、"当前进度"里在跑的实测、"结论"里的未决和下一步。不能只写名字或内部代号（"一晚实测""E1""探针""dr-xxx"）：主会话原样转给用户，用户没读过 dispatch.md、待办清单和 worker 报告，不知道它们指什么。比如不写"E1 在做"，写"在让 agent-start、orch-start 认得 Claude Code 新的'Adding a new directory'信任框；不修的话，以后每起一个编排者或 worker 都会停在这个框上，要有人手动批"。原因：没由头的代号转到主会话里，用户看不明白。
 
   修 bug 或设计方案按根治三问（核心原则）写，主会话按这几行审（routing.md 的"转达前先审"）：第一行"应该怎样：<①，从目标推的那句>"，第二行"根因：<哪一层、为什么>；改在：<哪一层>"，接着"依据"：根因、推荐做法、每个被否的改法所依赖的事实，推荐和"应该怎样"不一样的地方，每条一行"事实 — 仓库@分支 文件:行 / 实测 / 外部平台官方文档：…"；能自己核实的先核实（核心原则"证据"），确实核实不了的标"未核实"并写明卡在哪，推荐不能建在它上面，列成要用户先查的问题；再一行"读过的仓库：…"（链路经过、没读的也列上）。推荐的不在根因层时，源头改法（要另开任务也算）也列成一个选项、写清代价；和现有链路行为不同的地方逐条列成决定项，不当实现细节；和目标冲突的已知限制不写进"未决"了事，要么修，要么列成决定项；结论自己说在噪声范围内、不能支撑决定的，不交用户选。不是修 bug / 设计类的结论（探针、评估、排查的发现），和验证、未决里的事实判断，同样按核心原则"证据"写，现象带原因。
+
+  "验证"写成证据指针，不写一句"测试通过"：每条完成证据一行 `命令或操作 → 结果（通过 / 失败 / 跳过三个数，取 accept 摘要；不是测试的写退出码）→ 谁跑的（编排者重跑 / 只有 worker 自述 / 没验证）→ 存档路径`；只有 worker 自述的照实写（有 heavy 流水、证据目录的写上路径），不写成通过；没做真实入口验证的单写一行和原因；推送了的加一行整体检查，写明覆盖了推上去的哪个提交。主会话按这几行审"完成"（routing.md"转达前先审"第 5 条）。例：
+
+  ```
+  验证：
+  - `pytest tests/test_x.py -q` → 通过（12 / 0 / 0）→ 编排者重跑 → ~/.drover/<slug>/accept-w1.json
+  - 回归用例改前失败 → 流水 #3 失败（1 failed）→ #11 通过 → 只有 worker 自述 → ~/.drover/<slug>/heavy-runs.jsonl
+  - 登录页走一遍 → 截图 ~/.drover/<slug>/evidence/w1/ → 只有 worker 自述 → 无存档
+  - 没做真实入口验证（要测试环境）
+  - 整体检查 `python3 selftest/run.py` → 通过（812 / 0 / 3）→ 编排者重跑 → ~/.drover/<slug>/accept-integrate-drover.json，覆盖已推 abc1234
+  ```
 
 - **rollup 只写结论，不写过程**：不贴 diff、日志、报告原文，要引用就写文件路径。主会话不读摸底、设计稿、报告和 diff，用户要细节时会让你答，或者直接来你的窗口问。依据要写到主会话能直接打开核对的位置（仓库@分支 文件:行）。
 - **提交、推送、收尾** 也由你做，前提是主会话转达了用户的明确要求（转达里会带用户原话）。提交推送按第 9.1 节，在你自己的集成 worktree 里做；收尾按第 9 节"任务收尾"，先写收尾汇总，再用 `drover cleanup` 清理 worktree；用户只说"清理"时只清理（同一节）。
@@ -182,7 +193,7 @@ slug：由你从任务描述生成，英文 kebab-case，≤ 30 字符，只含 
      - 背景：按"每仓库一个 worktree"派发时，同一个仓库里的五条需求只开了两个 worktree，第 2、3、4 条和第 1、5 条各自排队串行。
    - **跨仓任务**：一个需求只配一个编排者（就是你），它在每个涉及的仓库里各有一个集成 worktree（分支统一 `task/<slug>`）。跨仓接口怎么对齐、各仓库的条目怎么拆、各仓库的集成检查、推送顺序（一般先提供接口的一方、后调用方，迁移在依赖它的代码之前）和最后的联调验证都由你负责。不按仓库拆成几个编排者：这些决定一旦分散，最后都会落到主会话头上。某个仓库的工作量大到你的上下文撑不住时，给它起子编排者，见"编排者模式"的"子编排者"一节。
    - **根因**（修 bug、做设计、做评估）：三问按顺序答。①在读问题所在的实现之前写下（可以先浅读弄清它是什么），再读实现找②③；读完实现只能因为新的事实改①，不能因为"现在就是这么做的"改①。推荐的改法和①不一样的地方，逐处写依据（证据，不是代价）。三问的答案写进计划。只是嫌疑、没核实的，任务书写目标和嫌疑、不写修法，由摸底答三问。完成证据写目标层面的结果（如"同一会话追问能接上前文"），不写实现方式（如"保留压缩形态"）。评估先写判定标准（对照用户目标、按生产配置、样本量够不够）再派。"不做"不能排除根因所在的层：根因在别的仓库、服务或前一个任务留下的代码里，就纳入范围，或作为选项交用户。
-   - **完成证据**：每个 agent 的每条证据写成"用什么命令或操作、看到什么结果算通过"（例如"`./.venv/bin/python -m pytest tests/test_x.py -q` 全部通过，新增用例覆盖空白回落默认值"）。worker 的证据只要求相关测试、类型检查、lint（`vitest run --changed <基线>` 或指定文件），**不要求全量测试**，全量放进第 9.1 节的集成检查；也不要求 clean 重编译、重新全量构建这类"取证"，增量编译 / 相关测试已经通过就够（实测有 worker 为了取证多跑了一次 57 秒的 clean test-compile）。写不出来，说明任务还没拆清楚，回到本节重新分析。
+   - **完成证据**：每个 agent 的每条证据写成"用什么命令或操作、看到什么结果算通过"（例如"`./.venv/bin/python -m pytest tests/test_x.py -q` 全部通过，新增用例覆盖空白回落默认值"）；能写成命令的配上 `--evidence-cmd`（第 5 节），验收原样重跑，不再从报告里挑。改了行为的条目至少一条证据落在**真实入口**上（命令真跑、接口真调、写入后读回、原来的复现步骤现在通过）：一条命令证明不了的，让 worker 写成能重跑的脚本（退出码表示通过与否），验收用 `--verify` 重跑；界面 / 交互类改动在跑起来的应用里走一遍，截图 / 录屏 / 接口响应存进证据目录 `~/.drover/<slug>/evidence/<agent名>/`、报告列路径（brief 模板里有这一句）；确实做不到的，rollup 的"验证"写明"没做真实入口验证"和原因。测试类证据只要相关测试、类型检查、lint（`vitest run --changed <基线>` 或指定文件），**不要求全量测试**，全量放进第 9.1 节的集成检查；也不要求 clean 重编译、重新全量构建这类"取证"，增量编译 / 相关测试已经通过就够（实测有 worker 为了取证多跑了一次 57 秒的 clean test-compile）。写不出来，说明任务还没拆清楚，回到本节重新分析。
    - **是否摸底**：按第 5.1 节的标准判断。
 5. **计划不等确认**：范围（做什么、不做什么、涉及哪些仓库）、完成证据、拓扑、是否摸底、你替用户做的假设，是读完代码后的计划，不是复述（复述在第 1.1 节）。计划写进"计划定了"那条进度消息（编排者模式写进 rollup 的"当前进度"），照常往下走。读代码时发现用户要的改动行不通、或者目标本身理解错了，按第 1.1 节给证据并停下；要用户拍板的范围或产品问题，按 5.1 整理成选项交给用户。
 6. 把计划写到状态文件 `~/.drover/<slug>/dispatch.md`。**开头固定这样写**（`history` 按"涉及仓库"行检索，仓库名用目录名，逗号分隔）：
@@ -300,18 +311,20 @@ agent 名：`[a-z][a-z0-9_-]{0,31}`，在 `herdr agent list` 中唯一。用 `<�
 2. 生成并发送：
 
 ```bash
-~/.drover/bin/drover brief --slug <slug> --name <agent名> [--kind claude|codex] --repo <源仓库> --wt <WT_PATH> --deps-json ~/.drover/<slug>/deps-<仓库名>.json --task-file ~/.drover/<slug>/<agent名>.task.md --goal "<状态文件开头的目标>" --evidence "<完成证据 1>" --evidence "<完成证据 2>" [--wt-extra <仓库>=<WT_PATH2> --deps-json <它的存档>]... [--commit-allowed] [--survey] --send
+~/.drover/bin/drover brief --slug <slug> --name <agent名> [--kind claude|codex] --repo <源仓库> --wt <WT_PATH> --deps-json ~/.drover/<slug>/deps-<仓库名>.json --task-file ~/.drover/<slug>/<agent名>.task.md --goal "<状态文件开头的目标>" --evidence "<完成证据 1>" [--evidence-cmd "<验收重跑它的命令>"]... --evidence "<完成证据 2>" [--wt-extra <仓库>=<WT_PATH2> --deps-json <它的存档>]... [--commit-allowed] [--survey] --send
 ```
+
+`--evidence-cmd` 紧跟在它所属的那条 `--evidence` 后面（可以几条），写成相对 worktree、不经 shell 的命令（同 `accept --verify`），在主 worktree（`--wt`）里跑；别的仓库的命令写进证据说明，在那个 worktree 的 accept 里用 `--verify` 跑。人工操作类的证据不配命令，验收时算"只能看自述"。
 
 脚本做的事：
 
 - 宿主：`--kind` 不传时按 `--name` 这个 agent 在 herdr 里的实际宿主写（agent 还没起时同第 4 节）；传了却和活着的 agent 对不上会进 `warnings`。
-- 按模板拼出完整 prompt：开头是 `--goal` 给的用户目标（必填，第 1.1 节），然后是任务段、完成证据（编号列出，报告的 verification 要逐条对应）、工作目录（分支不传就读 worktree 当前分支，并写出基线 commit；在 `~/.herdr/worktrees/` 下时加"这个位置是允许的，不要挪动"）、依赖（取 deps 存档的 `summary_for_prompt`，按 JS / Python 给出在 worktree 里装依赖的写法）、约束（不提交不推送、不 fetch / rebase、只写迁移文件和测试、不执行迁移、不写共享 / 生产数据库、只跑相关测试不跑全量、测试 / lint / 类型检查 / 构建一律经 `~/.drover/bin/drover heavy -- <命令>` 执行（按机器余量调度，轻的不排队、重的才排；写成字面的 `~` 路径，命中安装器加的白名单不弹框；heavy 只执行构建 / 测试工具，别的命令退出码 2，直接执行就行）、审批友好写法、逐条自证、需要决策时怎么办）、完成协议（报告的篇幅要求，对话里只回复报告路径和 status）和报告路径 `~/.drover/<slug>/<agent名>.md`。源仓库有、worktree 里没有的规范文件（`CLAUDE.md` / `AGENTS.md` 等没提交的），约束里写明源仓库原文的路径，让 agent 先读（源仓库在主工作台下时，读权限一般已由 `Read(<workspace>/**)` 这类规则放行）；其中被忽略、本该已复制的会进 `warnings`，重跑一次 `wt`（同分支复用）就会补上。
+- 按模板拼出完整 prompt：开头是 `--goal` 给的用户目标（必填，第 1.1 节），然后是任务段、完成证据（编号列出，带命令的下面写"验收会重跑"；报告的 verification 要逐条对应，每条引用 heavy 打的流水号）、工作目录（分支不传就读 worktree 当前分支，并写出基线 commit；在 `~/.herdr/worktrees/` 下时加"这个位置是允许的，不要挪动"）、依赖（取 deps 存档的 `summary_for_prompt`，按 JS / Python 给出在 worktree 里装依赖的写法）、约束（不提交不推送、不 fetch / rebase、只写迁移文件和测试、不执行迁移、不写共享 / 生产数据库、只跑相关测试不跑全量、测试 / lint / 类型检查 / 构建一律经 `~/.drover/bin/drover heavy -- <命令>` 执行（按机器余量调度，轻的不排队、重的才排；写成字面的 `~` 路径，命中安装器加的白名单不弹框；heavy 只执行构建 / 测试工具，别的命令退出码 2，直接执行就行）、审批友好写法、逐条自证、需要决策时怎么办）、完成协议（报告的篇幅要求，对话里只回复报告路径和 status）和报告路径 `~/.drover/<slug>/<agent名>.md`。源仓库有、worktree 里没有的规范文件（`CLAUDE.md` / `AGENTS.md` 等没提交的），约束里写明源仓库原文的路径，让 agent 先读（源仓库在主工作台下时，读权限一般已由 `Read(<workspace>/**)` 这类规则放行）；其中被忽略、本该已复制的会进 `warnings`，重跑一次 `wt`（同分支复用）就会补上。
 - 编码规范：先追加包默认的 `flow/coding-rules.md`（"drover 默认"一节；config 的 `default_coding_rules` 为 `false` 时整份不加），再是团队 profile（及 `playbook_dirs`）的 `coding-rules.md`，每层一节，后面的优先；claude、codex 都加（哪个宿主都不会自动加载它），标题写明来源；配置了 profile 但目录不存在时进 `warnings`。包默认那份按语言只带相关的：通用原则总带；Java 一节在任一 worktree 根目录有 `pom.xml` / `build.gradle` / `build.gradle.kts` 时带；MySQL 一节在任一 worktree 有被 git 跟踪的 `.sql` 文件、或依赖清单（`pom.xml`、`build.gradle*`、`package.json`、`requirements*.txt`、`pyproject.toml`）里出现 mysql / mariadb 字样时带（只有 ORM 不算）。会带哪几节，第 2 节 `drover playbook --repo` 输出的 `default_coding_rules.sections` 里有。
 - `--kind codex`：约束改成 codex 的沙箱说明，并追加全局 CLAUDE.md 的"编码规范"一节原文（codex 不会自动加载 CLAUDE.md；没有这个文件或这一节就不加）。
 - `--commit-allowed`：用户要求提交时才加，约束改成"可以在当前分支 commit，不要 push / 切分支 / 改写已有提交"。
 - `--survey`：prompt 开头加"第一步：先摸底"，见 5.1。
-- 写到 `<slug>/<agent名>.prompt.md`；在状态文件末尾追加 `## brief：<agent名>（时间，kind，摸底：是/否）` 段，列出完成证据（第 6.1 节逐条核对）。重新生成会再追加一段，以最后一段为准。
+- 写到 `<slug>/<agent名>.prompt.md`，证据清单（每条证据和它的命令）写到 `<slug>/<agent名>.evidence.json`（第 6.1 节 accept 读它）；在状态文件末尾追加 `## brief：<agent名>（时间，kind，摸底：是/否）` 段，列出完成证据和命令（第 6.1 节逐条核对）。状态文件拿锁追加，几个 brief 同时跑也不丢段。重新生成会再追加一段，以最后一段为准；同一个 agent 上一轮的任务书、报告、摸底先挪成 `<agent名>.prompt.rN.md` / `<agent名>.rN.md` / `<agent名>.survey.rN.md`（新 brief 段写出挪到哪了），返工时上一轮的留着可查。
 - `--send`：写好后立刻发出，看到 agent 开工（working）就返回（正常 1 秒内，最多等 30 秒），返回值的 `sent` 和下面 `prompt` 的结果一样。`--dry-run` 只把生成的 prompt 放在输出里，不写文件、不发送，用来检查。
 - 输出的 `warnings` 非空要看：比如依赖存档是 dry-run 的、某个 worktree 没有依赖存档。
 
@@ -387,17 +400,19 @@ agent 名：`[a-z][a-z0-9_-]{0,31}`，在 `herdr agent list` 中唯一。用 `<�
 
 每份 DONE 报告都走一遍，包括复审后修复、重新交回的报告。验收看 worktree 里的实际改动和脚本重跑的结果，不只看 agent 的自述。
 
-从报告的 verification 里挑关键命令（相关测试、tsc、lint、构建，要覆盖状态文件 brief 段的完成证据），写成相对 worktree 的命令传给 `--verify`。相关测试：JS 仓库用 `vitest run --changed <BASE_SHA>`（按 import 关系跑受影响的测试，比只跑 worker 点名的文件多抓间接影响，又不用跑全量），Python 跑相关测试文件；lint 只查改动的文件。改动碰到测试配置、依赖、全局 setup 这类影响所有测试的文件时，才放宽范围（vitest 的 `--changed` 遇到 `package.json`、vitest / vite 配置变化本来就会跑全部）。改动没被任何测试引用（只改了文档，或写了功能没写测试）时 `--changed` 一个测试都跑不到、退出码却是 0（vitest 带 `--changed` 默认 passWithNoTests），accept 会判不通过：换一条能证明这次改动的命令（补测试、点名相关测试文件），只改了文档的不放测试命令。**条目验收不跑全量测试、全量 lint**，全量留到第 9.1 节集成时跑一次：
+完成证据里带命令的（brief 的 `--evidence-cmd`）由 `accept --slug --name` 自动当 verify 跑；再从报告的 verification 里补关键命令（相关测试、tsc、lint、构建），写成相对 worktree 的命令传给 `--verify`，和证据命令字面相同的只跑一次。相关测试：JS 仓库用 `vitest run --changed <BASE_SHA>`（按 import 关系跑受影响的测试，比只跑 worker 点名的文件多抓间接影响，又不用跑全量），Python 跑相关测试文件；lint 只查改动的文件。改动碰到测试配置、依赖、全局 setup 这类影响所有测试的文件时，才放宽范围（vitest 的 `--changed` 遇到 `package.json`、vitest / vite 配置变化本来就会跑全部）。改动没被任何测试引用（只改了文档，或写了功能没写测试）时 `--changed` 一个测试都跑不到、退出码却是 0（vitest 带 `--changed` 默认 passWithNoTests），accept 会判不通过：换一条能证明这次改动的命令（补测试、点名相关测试文件），只改了文档的不放测试命令。**条目验收不跑全量测试、全量 lint**，全量留到第 9.1 节集成时跑一次：
 
 ```bash
-~/.drover/bin/drover accept --wt <WT_PATH> --base <BASE_SHA> --save ~/.drover/<slug>/accept.json --brief --verify "./.venv/bin/python -m pytest tests/test_x.py -q" [--verify "<命令 2>"]...
+~/.drover/bin/drover accept --wt <WT_PATH> --base <BASE_SHA> --slug <slug> --name <agent名> --brief [--verify "./.venv/bin/python -m pytest tests/test_x.py -q"]...
 ```
 
-`--brief` 只在屏幕上打印摘要：文件数、删除数、新文件数、diff 汇总、图谱风险和无测试覆盖的函数、复杂度要处理的函数、每条 verify 的结果。完整结果在 `--save` 的文件里，要看改动清单、图谱全文或 verify 的输出尾部时再去读，不要整份读进上下文。
+`--name` 要配 `--slug`：读 `<slug>/<agent名>.evidence.json`（它是别的 worktree 的就报错），存档默认是 `<slug>/accept-<agent名>.json`（一个条目一份，不互相覆盖；`--save` 可另指）。旧版 brief 没留证据清单的，`evidence` 写明"没有证据清单"、只跑 `--verify`。不带 `--name` 的老写法（`--save` 任意路径）照旧。
+
+`--brief` 只在屏幕上打印摘要：文件数、删除数、新文件数、diff 汇总、图谱风险和无测试覆盖的函数、复杂度要处理的函数、每条 verify 的结果、证据逐条的结论（`evidence`）、worker 的 heavy 流水（`worker_runs`）。完整结果在存档里，要看改动清单、图谱全文或 verify 的输出尾部时再去读，不要整份读进上下文。
 
 仓库基线本来就有失败的命令（全量测试、全量 lint）放 `--verify-baseline` 和上游比失败条目，这是集成检查的用法，说明在第 9.1 节第 3 步；条目验收只跑相关命令，一般用不到它（相关测试碰上了主干本来就失败的用例，把这条相关测试命令改放 `--verify-baseline` 就行，不要因此换成全量）。
 
-脚本依次执行：记录 `git status --porcelain` → `git add -N .` 把新文件纳入 diff → 在 worktree 里全量建图 → `detect-changes --brief` → `git diff <BASE_SHA> --stat` → crapper 算这次改动碰到的函数的圈复杂度 → 在 worktree 里重跑 `--verify`（shlex 拆分、不经 shell，所以不能用管道、`&&`、重定向；每条默认超时 1800 秒，`--verify-timeout` 可改，只算执行、不算排队）。多条 `--verify` / `--verify-baseline` 默认同时交给调度，结果按传入顺序；前后有依赖的（先 build 再查产物、两条命令写同一个产物目录）加 `--serial` 逐条跑。图谱步骤失败不影响其他输出（`graph.ok: false` 并带 `error`）；带 `--integration` 时是集成检查（第 9.1 节第 3 步）：不建图（`graph.skipped: true`）、不跑 crapper、改跑 dryer，条目验收不要加。`--save` 把结果存成 JSON，第 8 节的 `review` 从这里取图谱摘要和验证结果。
+脚本依次执行：记录 `git status --porcelain` → `git add -N .` 把新文件纳入 diff → 在 worktree 里全量建图 → `detect-changes --brief` → `git diff <BASE_SHA> --stat` → crapper 算这次改动碰到的函数的圈复杂度 → 在 worktree 里重跑 `--verify`（shlex 拆分、不经 shell，所以不能用管道、`&&`、重定向；每条默认超时 1800 秒，`--verify-timeout` 可改，只算执行、不算排队）。多条 `--verify` / `--verify-baseline` 默认同时交给调度，结果按传入顺序；前后有依赖的（先 build 再查产物、两条命令写同一个产物目录）加 `--serial` 逐条跑。图谱步骤失败不影响其他输出（`graph.ok: false` 并带 `error`）；带 `--integration` 时是集成检查（第 9.1 节第 3 步）：不建图（`graph.skipped: true`）、不跑 crapper、改跑 dryer，条目验收不要加。存档还记着 worktree、HEAD 和改动指纹，第 8 节的 `review` 从这里取图谱摘要和验证结果，并核对它就是要审的这份代码。
 
 verify 命令在脚本里跑，不会触发审批；但测试多的命令（比如集成检查的全量测试）可能超过宿主单条命令的时长上限（Claude Code 的 Bash 是 10 分钟），预计会超时就放后台执行 accept（见附录），等完成再读结果。
 
@@ -423,12 +438,13 @@ verify 命令在脚本里跑，不会触发审批；但测试多的命令（比�
 按输出判断：
 
 1. **验证命令**：`verify` 里每条有 `exit_code`、`seconds`、`summary_line`（输出最后一行，如 pytest 的 "N passed"）、`tests`、`counts`、`output_tail`。**`verify_failed: true` 就是验收不通过**（`ok` 仍是 true，只表示脚本本身没出错）：把失败的命令和 `output_tail` 发给 agent 修。
-2. **完成证据逐条核对**：对照状态文件最后一个 brief 段的完成证据，每条都要在 verification 或 verify 结果里找到对应的命令和结果；缺哪条就让 agent 补哪条。
+2. **完成证据逐条核对**：`evidence.summary` 是"证据 N 条 / 有命令 M 条 / 通过 K 条 / 只能看自述 X 条"，`evidence.items` 是每条的结论（通过 / 失败 / 只能看自述）。失败的按第 1 项发回；只能看自述的对照报告的 verification、`worker_runs` 和证据目录逐条找到对应的结果，能写成命令的让 agent 补成命令（下一轮 brief 带上）；缺哪条就让 agent 补哪条。`evidence.items` 是 null（旧版 brief）时对照状态文件最后一个 brief 段人工对。
+   - `worker_runs`：worker 经 heavy 跑过的验证（heavy 在 `task/<slug>…` 分支的 worktree 里每跑完一条就往 `<slug>/heavy-runs.jsonl` 记一行：worktree、命令、退出码、汇总行、跑之前和跑完的改动指纹），`passed_on_current` 是在现在的代码上通过过的命令，`red_then_green` 是同一条命令先失败后通过的。报告 verification 里引用的流水号（`#N`）在这里对得上。只列事实，不参与判定；没有流水时 `note` 写原因。
 3. **改动和报告对得上**：`status_porcelain`（标记前的状态）非空且与 changed_files 一致。
 4. **新文件**：`intent_to_add` 是脚本用 `git add -N` 标记的新文件。只登记路径、不暂存内容，不算提交；标记后 `git diff` 能显示新文件，用户看 diff 时不会漏。另外，`git add -N .` 会把已经删除的跟踪文件记成暂存的删除（`git status` 里显示 `D `），这和删除本身一致，不用处理，但 agent 可能会问起。汇报时告诉用户做过这一步。
 5. **图谱**（`graph.ok: true` 时）：`graph.brief` 记为 GRAPH_CONTEXT，追加到状态文件。
    - `graph.changed_files` 比 changed_files 多：多出来的是越界改动或临时文件，让 agent 说明理由或撤回。
-   - `graph.untested` 里的函数连间接调用到它的测试都没有。对照 verification：既没有测试、也没有实际运行覆盖到的，让 agent 补测试，或补一次真实运行的证据（命令和输出）。
+   - `graph.untested` 里的函数连间接调用到它的测试都没有。对照 verification：既没有测试、也没有实际运行覆盖到的，让 agent 补测试，或补一条能用 accept 重跑的命令（一条命令证明不了的写成证据目录里的脚本）。
    - `graph.risk_score` 只用来排阅读顺序，不当作通过与否的阈值。
    - `graph.ok: false` → 状态文件记 `[图谱不可用: <error>]`，用其他几项完成验收，不阻断。`graph.skipped: true` 是 `--integration`（或 `--no-graph`）跳过的，不是不可用。
 6. **复杂度**（`complexity`，crapper 只算圈复杂度、不跑测试）：只看这次改动碰到的函数，圈复杂度 ≥ 10 的分两类。依据：crapper 的 CRAP = CC² × (1 − 覆盖率)³ + CC，覆盖率 100% 时 CRAP 就是 CC，所以 CC ≥ 10 的函数测试写得再全也到不了编码规范要的"CRAP 10 以下"。
@@ -439,7 +455,7 @@ verify 命令在脚本里跑，不会触发审批；但测试多的命令（比�
 7. **读 diff**：先看 `diff_stat` 全貌，再用 `git -C <WT_PATH> diff <BASE_SHA> -- <文件>` 读 `graph.untested`、`complexity.over` 里的函数和核心改动的 diff 本身。
 8. **层次与简洁**：读 diff 时按根治三问看：改在产生问题的那一层了吗？新增的分支、特例、兜底、回落、兼容字段、名单、阈值，每一处能不能删掉或换成现有链路，写得出依据吗（现有调用方、数据）？答不上就不通过：发回 worker，或按"编排者模式"里 rollup 的写法交用户定。报告里的已知限制和目标冲突的（比如目标覆盖 10 种语言、判定只覆盖中英），也算答不上。
 9. **客观核对**：只核对下面这些能对上证据的；"最小改动""先定数据结构"这类靠判断的原则写在编码规范里给 worker 照做，不当验收门槛。编码规范的文件见第 2 节 `drover playbook` 输出的 `coding_rules`：包默认的 `flow/coding-rules.md` 开着时（`default_coding_rules.enabled`）排第一，按整份核对（`default_coding_rules.sections` 只说明任务书带了哪几节，没带的那节照样核）；团队 profile、个人覆盖的排在后面，冲突时按后面的和仓库自己的规范（`AGENTS.md` / `CLAUDE.md`）。
-   - **改 bug 的**：报告的 verification 里有回归测试"改之前失败、改之后通过"的命令和结果。
+   - **改 bug 的**：回归测试"改之前失败、改之后通过"要有记录：`worker_runs.red_then_green` 里有这条命令（通过那次在现在的代码上），或报告引用的两条流水号在 `worker_runs` 里对得上；只有一句自述、流水里没有的发回补。
    - **测试测的是行为**：像使用者那样调用代码、检查使用者看得到的结果；每个函数都返回空时还能通过的就是假测试（编码规范通用原则的"测行为，不测实现"）。
    - **没有只为躲崩溃的兜底**：第 8 项已经查过，不重复。
    - **没留死代码和注释掉的代码**。
@@ -497,15 +513,15 @@ PARTIAL / FAILED 时先读报告和屏幕（`herdr agent read <name> --source re
 
 复审是可选的，默认不做，用户在需求里写了 `--review` 才做。没带 `--review` 时，6.1 验收通过就进第 9 节汇报；用户之后要求复审，再按本节补做。
 
-带 `--review` 时，主 agent 的 DONE 通过第 6.1 节验收（并已 `--save`）后，立刻用一条命令起复审：
+带 `--review` 时，主 agent 的 DONE 通过第 6.1 节验收（`accept --slug --name` 已存 `accept-<agent名>.json`）后，立刻用一条命令起复审：
 
 ```bash
 ~/.drover/bin/drover review --slug <slug> --name <agent名>-rev --pane <主 agent 的 pane_id> --wt <WT_PATH> --base <BASE_SHA> [--focus "<本次改动背景与复审重点，1 到 3 句>"]
 ```
 
-`--tests` 一般不用传：脚本从 `accept.json` 的 verify 结果生成"命令、退出码、耗时、输出最后一行"。accept 时没跑 `--verify` 才手写 `--tests "<验证命令和结果，一行>"`。`accept.json` 里有 verify 失败时脚本拒绝起复审（验收没通过）。
+验收存档按复审者名找：`<agent名>-rev` → `<slug>/accept-<agent名>.json`，没有再用旧的 `<slug>/accept.json`，`--accept-json` 可直接指定。存档的 worktree、HEAD、改动指纹和现在的对不上（验收之后又改过、又提交过，或者是别的条目的）就拒绝，重新 accept 再起；有 verify 失败时也拒绝（验收没通过）。`--tests` 一般不用传：脚本从存档的 verify 结果生成"命令、退出码、耗时、输出最后一行"；accept 时没跑 `--verify` 才手写 `--tests "<验证命令和结果，一行>"`。
 
-脚本按固定模板生成复审 prompt，存到 `<slug>/<agent名>-rev.prompt.md`。模板里包括：全部改动的 diff 命令、取自 `accept.json` 的图谱摘要、code-review-graph 工具用法、"只读沙箱里不要跑测试"、按 High/Medium/Low 输出、最后说明用了哪些图谱工具。然后脚本在主 agent 右侧分屏，以 `-a on-request -s read-only --no-daemon --no-alt-screen -c model_reasoning_effort=xhigh` 启动 codex，立刻把 prompt 发出去，启动弹窗的处理和第 4 节相同。
+脚本按固定模板生成复审 prompt，存到 `<slug>/<agent名>-rev.prompt.md`。模板里包括：全部改动的 diff 命令、取自验收存档的图谱摘要、code-review-graph 工具用法、"只读沙箱里不要跑测试"、按 High/Medium/Low 输出、最后说明用了哪些图谱工具。然后脚本在主 agent 右侧分屏，以 `-a on-request -s read-only --no-daemon --no-alt-screen -c model_reasoning_effort=xhigh` 启动 codex，立刻把 prompt 发出去，启动弹窗的处理和第 4 节相同。
 
 **不要先 `review-start` 再手写 prompt**：实测 codex 起好后空等了 8 分钟才收到 prompt（当时编排者被一个审批弹窗卡住），它自己真正干活只用了 3 分 54 秒。中间任何耽搁都会变成 codex 空等，所以 prompt 要先准备好，和启动一起完成。要写的只有 `--focus` 那一两句。
 
@@ -687,6 +703,7 @@ worktree、workspace 保留到用户说"清理"或"收尾"（下面"任务收尾
    - 收尾完成。汇总全文：~/.drover/<slug>/wrapup.md
    - 改了什么：<1–3 行>
    - 提交：<仓库> <分支> <短 sha>（每个仓库每条分支一行）
+   - 验证：整体检查 <存档路径>：<结果>，覆盖推上去的 <短 sha>（没覆盖的写明差了哪些提交）
    - 数据库：<无（理由）/ 每项一行：仓库 迁移 测试环境 生产>
    - 配置：<无（理由）/ 每项一行：位置 配置项 动作 环境 已改/待改>
    - 上线：<顺序和前后要做的，1–3 行；没有写"无，随常规发布">

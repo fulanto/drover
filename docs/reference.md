@@ -19,20 +19,20 @@
 | `history` | 按仓库列出历史派发记录（结论、未决、踩坑），`--grep` 摘出相关行 | **你**、编排者 |
 | `playbook` | 读团队 profile 和个人覆盖目录的规则：`general.md` 和每个 `--repo` 的 `repos/<仓库名>.md`，按层拼好；`--text` 只打印正文。配置了 profile 但目录不存在时报错 | **你**（看生效的规则）、编排者 |
 | `preflight` | 检查是否在 Herdr 里、herdr server 是否在跑、常用工具装没装 | **你**（排障）、编排者 |
-| `accept-summary` | 从验收存档重新打印摘要（含测试计数），可附失败输出 | **你**（想看验收细节时）、编排者 |
-| `heavy` | 经调度执行构建 / 测试命令，输出原样透传，退出码同被执行的命令。按"机器还剩多少、这条要多少"决定马上跑还是排队：容量从本机硬件值起步（Apple 芯片的性能核数，其他机器的逻辑核数），之后按真实命令的表现自动校准（同时跑明显变慢就降、接近容量还几乎不变慢就加，config 可固定），需求按这条命令自己最近几次的实测（CPU 时间 ÷ 墙钟）算，它没跑过就看同类命令（同一命令形状）、再看同程序的；放行按实时 CPU（设计底线：CPU 空着不能干等）：整机实测没满、heavy 自己实测的占用加上这条不超过容量的 1.2 倍就跑，真满了才排队；没跑过的先按 1 核，历史上 10 秒内跑完的小命令不排队，排头等太久时后来的只放能在它开跑前跑完的，内存严重紧张时只放单独一条。排队时打印这条要多少、整机实测忙多少、heavy 占多少 / 容量、在跑的是谁；`--status` 看全机调度状态。细节和来由见[目录布局](#目录布局)的 `locks/heavy/`。只执行构建 / 测试工具（跳过开头的 `env` 和 `VAR=值` 之后，程序名得是 mvn、gradle、npm、bun、vitest、tsc、python、node、pytest、make、go、cargo 这类），别的命令不执行、退出码 2：全局白名单 `Bash(~/.drover/bin/drover heavy:*)` 放行了它（本机所有会话都有，包括 worker；整个 CLI 的放行只在主工作台），它不能变成放行任意命令的口子。任务书里写成字面的 `~/.drover/bin/drover heavy -- <命令>`，worker 跑时命中白名单、不弹框 | worker（测试、lint、类型检查、构建一律经它）、编排者；你手动跑也可以用 |
+| `accept-summary` | 从验收存档重新打印摘要（含测试计数、证据逐条的结论、worker 的 heavy 流水），可附失败输出 | **你**（想看验收细节时）、编排者 |
+| `heavy` | 经调度执行构建 / 测试命令，输出原样透传，退出码同被执行的命令。按"机器还剩多少、这条要多少"决定马上跑还是排队：容量从本机硬件值起步（Apple 芯片的性能核数，其他机器的逻辑核数），之后按真实命令的表现自动校准（同时跑明显变慢就降、接近容量还几乎不变慢就加，config 可固定），需求按这条命令自己最近几次的实测（CPU 时间 ÷ 墙钟）算，它没跑过就看同类命令（同一命令形状）、再看同程序的；放行按实时 CPU（设计底线：CPU 空着不能干等）：整机实测没满、heavy 自己实测的占用加上这条不超过容量的 1.2 倍就跑，真满了才排队；没跑过的先按 1 核，历史上 10 秒内跑完的小命令不排队，排头等太久时后来的只放能在它开跑前跑完的，内存严重紧张时只放单独一条。排队时打印这条要多少、整机实测忙多少、heavy 占多少 / 容量、在跑的是谁；`--status` 看全机调度状态。细节和来由见[目录布局](#目录布局)的 `locks/heavy/`。只执行构建 / 测试工具（跳过开头的 `env` 和 `VAR=值` 之后，程序名得是 mvn、gradle、npm、bun、vitest、tsc、python、node、pytest、make、go、cargo 这类），别的命令不执行、退出码 2：全局白名单 `Bash(~/.drover/bin/drover heavy:*)` 放行了它（本机所有会话都有，包括 worker；整个 CLI 的放行只在主工作台），它不能变成放行任意命令的口子。任务书里写成字面的 `~/.drover/bin/drover heavy -- <命令>`，worker 跑时命中白名单、不弹框。在分支是 `task/<slug>…` 的 worktree 里跑时记流水：输出改经管道原样转发（stdout / stderr 分开，子进程看到的不是终端，和 accept 截输出跑时一样），跑完往 `<slug>/heavy-runs.jsonl` 追加一行（worktree、命令、退出码、汇总行、跑之前和跑完的改动指纹），stderr 打"流水 #N"给 worker 报告引用；别的地方照旧继承终端、不记 | worker（测试、lint、类型检查、构建一律经它）、编排者；你手动跑也可以用 |
 | `orch-start` | 为一个任务起编排者：在 herdr 的 `orch` workspace 里开一个 tab，启动 claude 或 codex，发开场 prompt。启动弹窗和 `agent-start` 一样自动处理（包括 Claude Code 对 `--add-dir` 加进来的状态目录弹的 "Adding a new directory" 信任框），处理完再发开场 prompt。`--model <完整模型 ID>` / `--effort` 是这个任务的默认：编排者用它起，记进 `orch.json`、写进开场 prompt，之后同宿主的 `agent-start`、`review`、子编排者不传就继承（换编排者 `resume` 时沿用前任记的）；不传时和以前一样用 config | 主会话（上层编排者起子编排者也用它） |
 | `prompt` | 把文件（或 `--text` 短消息）发给某个 agent，看到它开工（working）就返回（正常 1 秒内，最多等 30 秒），之后交给 `watch`；发给编排者成功后记一个 `answered.json`（看板靠它分出"已转答复，等它接着做"：rollup 从那时起内容没变才算），时间线记一条转答复（内容以"收尾"开头的再记一条收尾请求）；发给顶层编排者时它的 rollup 在主会话上次读之后又改过的，照发、返回里多一个 `warning` | 主会话（转达）、编排者 |
 | `wt` | 建或复用 worktree。新建前先 fetch 源仓库主检出的上游，主检出干净且落后时快进（只快进，不硬覆盖），从远端最新起（主检出有改动、分叉时不动它，改从上游起并在 `warnings` 里报出；上游在远端已删当作没有上游；主检出不在远端默认分支上时提示一句；`--no-sync` 不同步）；复制 `.claude/settings.local.json`、`.env*`（源仓库没跟踪的，或在新 worktree 里被 gitignore 的），以及被 gitignore 的仓库规范文件（`CLAUDE.md` 等），以及仓库根目录 `.worktreeinclude`（Claude Code 的约定，gitignore 语法）匹配到的被忽略文件（如 Java 仓库的本地配置、本机测试页；在新 worktree 里不被忽略的不复制，列在 `worktreeinclude_skipped`）。多轮任务的新一轮（`--slug`，不传按分支名 `task/<slug>…` 归属；任务在这个仓库有推送记录时）：不传 `--base` 从上一轮推的远端分支起（推过两条以上要显式 `--base`）；建之前核实起点含上一轮推的提交（同分支看祖先，换分支按补丁内容比），不含就 `ok: false`、不建，列出缺的提交和两种做法；`--carry "<理由>"` 带上缺的提交照常建（理由记进 `carry.jsonl`）。推到别处的推送（remote 之后换过地址，按记录里的 `remote_url` 比主机 + 路径认，同一个仓库的 ssh / https / scp 写法算同一个）不拿来定起点、不核实、不进 `--carry`，列在 `round_check.other_remote`、进 `warnings`；全推到了别处时 `round_check.status` 是 `other_remote`，起点照第一轮。缺的提交来自没记地址的旧记录时，报错多一段：换过地址就别 `--carry`，给记录补上 `remote_url`（`no_remote_url` 给出记录所在的文件）。没有推送记录时起点和以前一样 | 编排者 |
 | `deps` | 在 worktree 里独立安装依赖（不软链源仓库） | 编排者 |
 | `agent-start` | 在 pane 里启动 claude / codex worker，自动处理启动弹窗：新目录的信任弹窗、Claude Code 对 `--add-dir` 加进来的目录弹的 "Adding a new directory" 信任框（光标默认在 "No, exit"，移到 "Yes, add it" 再确认）、codex 的升级提示。模型和 effort：`--model` / `--effort` > 任务 `orch.json` 记的（宿主和编排者相同才继承）> config > 内置默认（claude `opus[1m]` + xhigh；codex xhigh、不传模型）；claude 传 `--model`，codex 传 `-m` | 编排者 |
-| `brief` | 按模板生成任务书（必填完成证据），可先摸底，`--send` 生成后立刻发出（和 `prompt` 一样看到开工就返回）。模板里限了篇幅：摸底只写结论和证据位置，"和代码不符""需要决策"两部分写全、其余 100 行左右；报告每条 verification 一行、尽量 60 行内，worker 在对话里只回复报告路径和 status | 编排者 |
-| `accept` | 验收：标记新文件、建图、改动分析、diff 概览、crapper 查这次改动碰到的函数的圈复杂度、重跑验证命令（认得出 vitest / pytest / mvn 的输出时，退出码 0 却一个测试都没跑也判不通过；每条给 通过 / 失败 / 跳过 三个数）；`--verify-baseline` 和基线比失败条目（基线上只重跑失败的文件；解析不全、提前停了、基线不可信都按失败），`--integration` 是集成检查（不建图、不跑 crapper，dryer 扫全仓、只留碰到改动的重复），`--no-graph` 只是不建图。建图、dryer 和验证命令都经 heavy 调度；多条验证默认同时交给调度（能同时跑的同时跑，结果按传入顺序），前后有依赖的加 `--serial` 逐条跑 | 编排者 |
+| `brief` | 按模板生成任务书（必填完成证据），可先摸底，`--send` 生成后立刻发出（和 `prompt` 一样看到开工就返回）。`--evidence-cmd` 紧跟在它所属的 `--evidence` 后面，给这条证据配验收时重跑的命令，证据清单写进 `<slug>/<agent>.evidence.json`；状态文件拿锁追加（几个同时跑不丢段）；同一个 agent 再生成时上一轮的任务书、报告、摸底挪成 `.rN`。模板里限了篇幅：摸底只写结论和证据位置，"和代码不符""需要决策"两部分写全、其余 100 行左右；报告每条 verification 一行（命令 → 汇总行 → heavy 流水号）、尽量 60 行内，worker 在对话里只回复报告路径和 status | 编排者 |
+| `accept` | 验收：标记新文件、建图、改动分析、diff 概览、crapper 查这次改动碰到的函数的圈复杂度、重跑验证命令（认得出 vitest / pytest / mvn 的输出时，退出码 0 却一个测试都没跑也判不通过；每条给 通过 / 失败 / 跳过 三个数）；`--verify-baseline` 和基线比失败条目（基线上只重跑失败的文件；解析不全、提前停了、基线不可信都按失败），`--integration` 是集成检查（不建图、不跑 crapper，dryer 扫全仓、只留碰到改动的重复），`--no-graph` 只是不建图。建图、dryer 和验证命令都经 heavy 调度；多条验证默认同时交给调度（能同时跑的同时跑，结果按传入顺序），前后有依赖的加 `--serial` 逐条跑。`--slug --name <agent>`：带命令的证据自动当 verify 跑，`evidence` 给每条证据的结论和"证据 N 条 / 有命令 M 条 / 通过 K 条 / 只能看自述 X 条"，默认存 `<slug>/accept-<agent>.json`。结果里另有 `worker_runs`（这个 worktree 的 heavy 流水：在现在的代码上通过过的、先失败后通过的）和改动指纹（review 核对用） | 编排者 |
 | `integrate` | 集成 worktree：从最新上游建（或复用），依次 cherry-pick 条目分支，装依赖。新建时和 `wt` 一样核实起点含上一轮推的提交（`--from` 的条目分支里已有的不算缺），`--carry` 同 `wt`；重建集成 worktree 不丢推送记录 | 编排者 |
 | `push` | 集成 worktree 推送：上游有新提交就 rebase 并报告（这次不推），否则推送并 `ls-remote` 核对；每次推上去都记进任务的 `pushes.jsonl`（有没有集成状态都记；记下 remote 名和推送时的地址 `remote_url`，返回里也有），定不了任务就不推、提示加 `--slug` | 编排者 |
 | `wrapup` | 收尾汇总的事实收集，不改仓库和任务记录：每个仓库每条分支的推送记录（`pushes.jsonl` 和旧任务的 `integrate-*.json`，patch 模式的也在）和远端核对（最后一次推到的是 remote 换地址之前的仓库时不核对，写明两个地址）、推送范围里的迁移 / 配置 / 部署 / 依赖文件和新增配置键线索、整体检查结果、待清理的 worktree 和分支（子编排者的一起收）；`--draft <文件>` 生成 wrapup.md 骨架（只写这一个文件，写成了在时间线记一条收尾汇总） | 编排者 |
 | `cleanup` | 用户说"清理"或"收尾"时清任务的 worktree 和分支：`--slug` 全部（含没有 worktree 的同类本地分支），`--wt` 只清指定的。逐个核实没有进行中的 git 操作、里面的 agent 不在 working / blocked、已提交的和没提交的改动都在这个任务推过的远端分支（的历史）里（先 fetch；推上去之后又被后来的轮次改过也算，内容在远端历史里就丢不了；集成时手工解过冲突、推上去的树里上下文变了的，按文件三方合并判"已包含"，冲突块先按行核、两边都改过的行再按词核；比 worktree 现有内容还旧的推送不拿来核对，三方合并的起点是没核实过的内容开始之前，所以撤回以前推过的改动、推上去之后又删掉的行、我们删掉 / 换掉而远端还留着的行都不算在远端；可执行位变化算改动；有内嵌 git 仓库（子目录自己有 `.git`）核实不了、不删，`--probe` 也不存不删），全过才 `herdr worktree remove`（有没提交改动的加 `--force`；workspace 没开用 `git worktree remove`）再删本地分支，核实不过的不动、列原因。`--target <远端>/<分支>` 给推送没落盘的老任务补核对分支；`--probe`（配 `--wt`）探测 worktree 先把本地独有的提交和改动存成 patch 到任务目录再删；`--dry-run` 只列结论。主检出永远不动 | 编排者 |
-| `review` | 复审一条命令：按模板生成 prompt、分屏启动只读 codex、立刻发出。`--model` 指定 codex 的模型（`-m`），不传时用任务 `orch.json` 记的（编排者是 codex 才有，effort 也一样继承），再不传用 `~/.codex/config.toml` 的 | 编排者（带 `--review` 时） |
+| `review` | 复审一条命令：按模板生成 prompt、分屏启动只读 codex、立刻发出。`--model` 指定 codex 的模型（`-m`），不传时用任务 `orch.json` 记的（编排者是 codex 才有，effort 也一样继承），再不传用 `~/.codex/config.toml` 的。验收存档按复审者名找（`<agent>-rev` → `<slug>/accept-<agent>.json`，没有再用旧的 `accept.json`；`--accept-json` 可指定），worktree、HEAD、改动指纹和现在的对不上就拒绝 | 编排者（带 `--review` 时） |
 | `collect` | 复审结束后存档输出原文、关闭复审 pane | 编排者 |
 | `review-start` | （底层）只分屏启动只读 codex，不发 prompt；一般用 `review` | 很少用 |
 
@@ -49,7 +49,7 @@
 ~/.drover/bin/drover watch --once orch-order-filter              # 只看一眼
 ~/.drover/bin/drover history --repo order-service --grep 分页
 ~/.drover/bin/drover playbook --repo order-service --text        # 这个仓库现在生效的团队规则和 playbook
-~/.drover/bin/drover accept-summary ~/.drover/<slug>/accept.json --tail 2000
+~/.drover/bin/drover accept-summary ~/.drover/<slug>/accept-<agent>.json --tail 2000
 ~/.drover/bin/drover heavy -- npm test
 ~/.drover/bin/drover heavy --status                              # 全机的构建 / 测试调度：容量、在跑的各占多少、排队的在等什么
 ~/.drover/bin/drover oncall status                               # 飞书 oncall 的状态
@@ -155,9 +155,14 @@ drover/
 │   ├── deps-<仓库>.json              # 依赖安装结果
 │   ├── <agent>.task.md              # 编排者写的任务段（背景 / 要做的 / 不做 / 线索）
 │   ├── <agent>.prompt.md            # brief 生成、实际发给 worker 的完整任务书
+│   ├── <agent>.evidence.json        # brief 写的证据清单：每条完成证据和验收重跑它的命令（--evidence-cmd），accept --name 读
 │   ├── <agent>.survey.md            # 摸底结果（走摸底的条目才有）
 │   ├── <agent>.md                   # worker 的报告（=== DISPATCH RESULT === 块）
-│   ├── accept.json                  # 验收存档（accept --save）
+│   ├── <agent>.prompt.rN.md         # 同一个 agent 再 brief 时挪走的上一轮任务书（报告、摸底同样是 <agent>.rN.md、<agent>.survey.rN.md）
+│   ├── evidence/<agent>/            # 证据产物：截图、录屏、接口响应、能重跑的检查脚本（worker 放，报告列路径）
+│   ├── heavy-runs.jsonl             # heavy 流水：条目 worktree 里经 heavy 跑的每条命令一行（worktree、命令、退出码、汇总行、改动指纹）
+│   ├── accept-<agent>.json          # 条目验收存档（accept --slug --name 的默认路径；review 按 <agent>-rev 找它）
+│   ├── accept.json                  # 旧文档的条目验收存档路径（几个条目会互相覆盖，review 找不到 accept-<agent>.json 时才用）
 │   ├── <agent>-rev.prompt.md        # 复审的 prompt（带 --review 时）
 │   ├── <agent>-rev.result.md        # 复审输出原文
 │   ├── integrate-<仓库>.json         # 集成状态：base、已 cherry-pick 的提交、rebase 记录（旧任务的推送记录也在这里）

@@ -2149,7 +2149,7 @@ footer.end { margin-top: 64px; font-size: 13px; color: var(--muted); display: fl
     <h2>“做完了”？拿证据来</h2>
   </header>
   <div class="prose">
-    <p><strong>完成证据</strong>在派发时就定好：编排者给 <code>brief</code> 传 <code>--evidence</code>（必填、可重复），每条写成“跑什么命令、看到什么结果算通过”。写不出来，说明任务还没拆清楚。worker 的报告里 verification 要逐条对应；worker 只要求相关测试、类型检查和 lint，全量测试留到集成时。</p>
+    <p><strong>完成证据</strong>在派发时就定好：编排者给 <code>brief</code> 传 <code>--evidence</code>（必填、可重复），每条写成“跑什么命令、看到什么结果算通过”；能写成命令的跟一条 <code>--evidence-cmd</code>，存进证据清单，<code>accept --slug --name</code> 原样重跑，摘要给出“证据 N 条 / 有命令 M 条 / 通过 K 条 / 只能看自述 X 条”。写不出来，说明任务还没拆清楚。worker 的报告里 verification 要逐条对应，每条引用 <code>heavy</code> 记的流水号；改了行为的条目至少一条证据落在真实入口上，全量测试留到集成时。</p>
     <p>验收不看 worker 的自述，看 worktree 里的实际改动和脚本重跑的结果。<code>accept</code> 依次做这些事：</p>
   </div>
   <ol class="pipe" aria-label="accept 的步骤">

@@ -1297,9 +1297,12 @@ CARRY_FILE = "carry.jsonl"  # wt --carry 带上上一轮提交的记录：理由
 def read_jsonl(path: Path) -> list:
     """一行一个 JSON 对象的文件；没有文件是 []，坏行跳过。"""
     try:
-        text = path.read_text()
+        return jsonl_rows(path.read_text())
     except OSError:
         return []
+
+
+def jsonl_rows(text: str) -> list:
     out = []
     for line in text.splitlines():
         with contextlib.suppress(ValueError):
@@ -1313,6 +1316,28 @@ def append_jsonl(path: Path, obj: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as fh:
         fh.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
+@contextlib.contextmanager
+def locked_append(path: Path, *, best_effort: bool = False):
+    """拿着 flock(path) 读-追加：yield (现有内容, 要追加的片段列表)，退出时把片段接到文件末尾。只追加、不整份重写：几个进程同时
+    写，谁也盖不掉谁，也读不到别人写了一半的（以前状态文件是整份读出、拼上、整份写回，几个 brief 同时跑实测 240 次丢 75 段、
+    7 次连原有内容都冲掉，还读到过半个汉字）。状态文件、上层状态文件、时间线、heavy 流水共用。文件只追加、不替换，所以直接锁它。
+    best_effort：写不了（目录只读）不影响调用方（时间线、流水这类统计记录）。"""
+    chunks: list = []
+    with flock_file(path, None):
+        try:
+            text = path.read_text()
+        except OSError:
+            text = ""
+        yield text, chunks
+        if chunks:
+            try:
+                with open(path, "a") as fh:
+                    fh.write("".join(chunks))
+            except OSError:
+                if not best_effort:
+                    raise
 
 
 def task_slugs() -> list:
@@ -2638,11 +2663,10 @@ def cmd_orch_start(a: argparse.Namespace) -> dict:
         (slug_dir / "parent.json").write_text(json.dumps(
             {"parent": parent, "name": a.name, "tab_id": tab_id, "pane_id": pane_id, "started": stamp},
             ensure_ascii=False, indent=2))
-        parent_state = STATE_HOME / parent / "dispatch.md"
-        text = parent_state.read_text()
-        parent_state.write_text(text + ("" if text.endswith("\n") else "\n")
-                                + f"- {stamp} 子编排者 {a.name}（任务 {a.slug}，tab {tab_id}，pane {pane_id}），"
-                                  f"rollup：{rollup}\n")
+        with locked_append(STATE_HOME / parent / "dispatch.md") as (text, chunks):
+            chunks.append(("" if not text or text.endswith("\n") else "\n")
+                          + f"- {stamp} 子编排者 {a.name}（任务 {a.slug}，tab {tab_id}，pane {pane_id}），"
+                            f"rollup：{rollup}\n")
         result["parent"] = parent
     # 时间线：派发（start）；--args 第一个词是 resume 时是换编排者（routing.md"需要换编排者"、意外退出都这样起），老任务没有派发
     # 那条就按 request.md / rollup.md 的修改时间补一条估计的。
@@ -2873,14 +2897,12 @@ def timeline_event(event: str, at: float, source: str, **fields: Any) -> dict:
 
 @contextlib.contextmanager
 def timeline_session(d: Path):
-    """拿着 flock(timeline.jsonl) 读-比-追加：yield (已有的事件, 要追加的列表)，退出时把列表里的追加上去。文件只追加、不替换，
-    所以直接锁它（agent-state.json 是 os.replace 换的，锁不住）。写不了（目录只读）不影响调用方。"""
+    """拿着 flock(timeline.jsonl) 读-比-追加（locked_append）：yield (已有的事件, 要追加的列表)，退出时把列表里的追加上去
+    （agent-state.json 是 os.replace 换的，锁不住，不走这里）。写不了（目录只读）不影响调用方。"""
     new: list = []
-    with flock_file(d / TIMELINE_FILE, None):
-        yield timeline_read(d), new
-        if new:
-            with contextlib.suppress(OSError), open(d / TIMELINE_FILE, "a") as fh:
-                fh.write("".join(json.dumps(e, ensure_ascii=False) + "\n" for e in new))
+    with locked_append(d / TIMELINE_FILE, best_effort=True) as (text, chunks):
+        yield jsonl_rows(text), new
+        chunks.extend(json.dumps(e, ensure_ascii=False) + "\n" for e in new)
 
 
 def timeline_note(d: Path, event: str, source: str, **fields: Any) -> None:
@@ -3782,7 +3804,7 @@ def build_brief(a: argparse.Namespace, worktrees: list, task: str, evidence: lis
         parts.append(SURVEY_SECTION.format(survey_path=slug_dir / f"{a.name}.survey.md"))
     parts.append("## 任务\n" + task)
     parts.append("## 完成证据（逐条做到；报告的 verification 逐条对应，写出命令和实际结果）\n"
-                 + "\n".join(f"{i}. {e}" for i, e in enumerate(evidence, 1)))
+                 + "\n".join(evidence_lines(evidence)))
 
     wt_lines = ["## 工作目录（只在这些 worktree 内改动）"]
     for w in worktrees:
@@ -3841,6 +3863,11 @@ def build_brief(a: argparse.Namespace, worktrees: list, task: str, evidence: lis
                  "不拿推断交差。识别类结果（OCR、识图、转写）你自己的核对只算初步，写明未经用户确认。")
     rules.append("- 做完必须自证：逐条完成上面\"完成证据\"里的检查，把命令和实际结果写进报告的 verification。"
                  "某一条做不到就写明原因，status 不能标 DONE。")
+    # 证据产物的位置（dispatch.md 第 2 节"完成证据"的真实入口一档）：界面类改动以前没有放截图、录屏的地方，
+    # 一条命令证明不了的检查也只能留在自述里。脚本留着，验收用 accept --verify 原样重跑。
+    rules.append(f"- 证据产物放 `{slug_dir / 'evidence' / a.name}/`：改了界面或交互的，在跑起来的应用里走一遍改动的流程，"
+                 "截图 / 录屏 / 接口响应存进去；一条命令证明不了的检查写成能重跑的脚本（退出码表示通过与否）也放这里。"
+                 "报告列出路径，脚本写出能直接重跑的命令（绝对路径），验收会原样重跑。")
     rules.append("- 遇到需要决策的问题：能从任务上下文推断的自己定并记录假设；确实无法推断的写进报告 open_questions 并把 status 标为 NEED_INPUT，不要瞎猜关键需求。")
     parts.append("\n".join(rules))
     for source, body in playbook_coding_rules(warnings, [w["wt"] for w in worktrees]):
@@ -3865,8 +3892,9 @@ def build_brief(a: argparse.Namespace, worktrees: list, task: str, evidence: lis
         f"  - <相对路径>（{repo_label}）",
         "root_cause: <修 bug 或改设计时一句：问题产生在哪一层、为什么（附证据位置）、改在哪一层；新增的特例 / 兜底 / 回落逐个列出并说明为什么必要；"
         "其他任务写 n/a>",
-        "verification: <按\"完成证据\"逐条写，每条一行：命令加结果汇总行（如 `Tests run: 218, Failures: 0`、`164 passed`）；"
-        "修 bug 的写明回归测试改之前失败、改之后通过（命令和结果）；做不到的写原因>",
+        "verification: <按\"完成证据\"逐条写，每条一行：命令 → 结果汇总行（如 `Tests run: 218, Failures: 0`、`164 passed`）"
+        "→ 流水号（经 heavy 跑完时 stderr 打的\"流水 #N\"，编排者按它核对你跑过什么）；"
+        "修 bug 的写明回归测试改之前失败、改之后通过的两条流水号；不经 heavy 的（真实入口脚本、截图）写证据路径；做不到的写原因>",
         "assumptions: <自行决定的点>",
         "open_questions: <需要用户回答的问题，没有写 none>",
         "=== END ===",
@@ -3876,22 +3904,89 @@ def build_brief(a: argparse.Namespace, worktrees: list, task: str, evidence: lis
     return "\n\n".join(parts) + "\n"
 
 
-def append_brief_record(a: argparse.Namespace, prompt_file: Path, evidence: list) -> dict:
-    """把完成证据和是否摸底追加到状态文件，6.1 验收逐条核对；重复生成时追加新段，以最后一段为准。"""
+def evidence_entry(value: str) -> tuple:
+    return ("text", value)
+
+
+def evidence_cmd_entry(value: str) -> tuple:
+    return ("cmd", value)
+
+
+def evidence_items(entries: list) -> list:
+    """--evidence / --evidence-cmd 按命令行顺序收在同一个列表里（argparse 共用 dest，元素是 ("text" | "cmd", 值)）：命令挂在
+    它前面最近的那条证据下，一条证据可以配几条命令。返回 [{n, text, commands}]。空白的证据照旧丢掉；配了命令的不能空白。"""
+    items: list = []
+    for kind, value in entries:
+        value = value.strip()
+        if kind == "text":
+            items.append({"text": value, "commands": []})
+            continue
+        if not items:
+            raise DroverError(f"--evidence-cmd {value!r} 要写在它所属的那条 --evidence 后面（命令挂在前面最近的一条证据下）")
+        try:
+            argv = shlex.split(value)
+        except ValueError as exc:
+            raise DroverError(f"--evidence-cmd 拆不开：{value!r}（{exc}）。验收按 shlex 拆、不经 shell，引号要配对")
+        if not argv:
+            raise DroverError("--evidence-cmd 是空的")
+        items[-1]["commands"].append(value)
+    if any(it["commands"] and not it["text"] for it in items):
+        raise DroverError("配了 --evidence-cmd 的那条 --evidence 是空白的：写清用什么命令或操作、看到什么结果算通过")
+    return [{"n": i, **it} for i, it in enumerate((it for it in items if it["text"]), 1)]
+
+
+def evidence_lines(items: list, indent: str = "") -> list:
+    """完成证据编号列出，带命令的下面一行列命令（任务书、状态文件的 brief 段共用）。"""
+    lines = []
+    for it in items:
+        lines.append(f"{indent}{it['n']}. {it['text']}")
+        if it["commands"]:
+            lines.append(f"{indent}   验收会重跑：" + "、".join(f"`{c}`" for c in it["commands"]))
+    return lines
+
+
+def rotate_round(slug_dir: Path, name: str) -> list:
+    """同一个 agent 再生成任务书（返工、换范围）：上一轮的任务书、报告、摸底挪成 <name>.prompt.rN.md、<name>.rN.md、
+    <name>.survey.rN.md（N 取三样都没占用的最小轮次号），新一轮不盖掉它们，第二轮还没写报告时也不会把上一轮的报告当成这一轮的。
+    返回挪到的路径。"""
+    files = [(f"{name}.prompt", ".md"), (name, ".md"), (f"{name}.survey", ".md")]
+    present = [(stem, ext) for stem, ext in files if (slug_dir / f"{stem}{ext}").exists()]
+    if not present:
+        return []
+    n = 1
+    while any((slug_dir / f"{stem}.r{n}{ext}").exists() for stem, ext in files):
+        n += 1
+    moved = []
+    for stem, ext in present:
+        dest = slug_dir / f"{stem}.r{n}{ext}"
+        os.replace(slug_dir / f"{stem}{ext}", dest)
+        moved.append(str(dest))
+    return moved
+
+
+def append_brief_record(a: argparse.Namespace, prompt_file: Path, evidence: list, evidence_file: Path,
+                        moved: list) -> dict:
+    """把完成证据和是否摸底追加到状态文件，6.1 验收逐条核对；重复生成时追加新段，以最后一段为准。拿锁追加（locked_append）。"""
     state = STATE_HOME / a.slug / "dispatch.md"
-    existed = state.exists()
     stamp = time.strftime("%m-%d %H:%M")
     lines = [f"## brief：{a.name}（{stamp}，{a.kind}，摸底：{'是' if a.survey else '否'}）",
              f"- prompt：{prompt_file}",
              "- 完成证据（6.1 验收逐条核对）："]
-    lines += [f"  {i}. {e}" for i, e in enumerate(evidence, 1)]
+    lines += evidence_lines(evidence, "  ")
+    lines.append(f"- 证据清单：{evidence_file}（accept --slug {a.slug} --name {a.name} 自动重跑带命令的）")
+    if moved:
+        lines.append(f"- 上一轮的文件挪到：{'、'.join(moved)}")
     if a.survey:
         lines.append(f"- 摸底结论：待处理（读 {STATE_HOME / a.slug / (a.name + '.survey.md')} 后写明："
                      "我直接改掉的事实偏差、交给用户决定的问题和用户的答复）")
-    text = state.read_text() if existed else f"# dispatch: {a.slug}\n"
-    sep = "" if text.endswith("\n\n") else ("\n" if text.endswith("\n") else "\n\n")
-    state.write_text(text + sep + "\n".join(lines) + "\n")
-    return {"state_file": str(state), "state_file_created": not existed}
+    with locked_append(state) as (text, chunks):
+        created = not text
+        if created:
+            text = f"# dispatch: {a.slug}\n"
+            chunks.append(text)
+        sep = "" if text.endswith("\n\n") else ("\n" if text.endswith("\n") else "\n\n")
+        chunks.append(sep + "\n".join(lines) + "\n")
+    return {"state_file": str(state), "state_file_created": created}
 
 
 def brief_kind(a: argparse.Namespace, warnings: list) -> tuple[str, str]:
@@ -3917,7 +4012,7 @@ def brief_kind(a: argparse.Namespace, warnings: list) -> tuple[str, str]:
 def cmd_brief(a: argparse.Namespace) -> dict:
     check_slug(a.slug)
     check_agent_name(a.name)
-    evidence = [e.strip() for e in a.evidence if e.strip()]
+    evidence = evidence_items(a.evidence)
     if not evidence:
         raise DroverError("完成证据必填：每条写\"用什么命令或操作、看到什么结果算通过\"。写不出来说明任务还没拆清楚，回第 2 节。")
     if not a.goal.strip():
@@ -3934,21 +4029,31 @@ def cmd_brief(a: argparse.Namespace) -> dict:
     a.kind, kind_source = brief_kind(a, warnings)
     worktrees = brief_worktrees(a)
     prompt = build_brief(a, worktrees, task, evidence, warnings)
-    prompt_file = STATE_HOME / a.slug / f"{a.name}.prompt.md"
+    slug_dir = STATE_HOME / a.slug
+    prompt_file = slug_dir / f"{a.name}.prompt.md"
+    # 证据清单（机器读）：accept --slug --name 按它把带命令的证据当 verify 跑；命令在主 worktree（--wt）里跑。
+    evidence_file = slug_dir / f"{a.name}.evidence.json"
     result = {"ok": True, "dry_run": a.dry_run, "kind": a.kind, "kind_source": kind_source, "survey": a.survey,
-              "prompt_file": str(prompt_file), "chars": len(prompt),
-              "worktrees": worktrees, "evidence": evidence, "warnings": warnings}
+              "prompt_file": str(prompt_file), "chars": len(prompt), "worktrees": worktrees,
+              "evidence": [it["text"] for it in evidence], "evidence_file": str(evidence_file), "warnings": warnings}
     if a.survey:
-        result["survey_file"] = str(STATE_HOME / a.slug / f"{a.name}.survey.md")
+        result["survey_file"] = str(slug_dir / f"{a.name}.survey.md")
     if a.dry_run:
         result["prompt"] = prompt
-        result["planned"] = [f"写 {prompt_file}", f"追加完成证据到 {STATE_HOME / a.slug / 'dispatch.md'}"]
+        result["planned"] = [f"上一轮的任务书 / 报告 / 摸底（有的话）挪成 {a.name}.prompt.rN.md / {a.name}.rN.md / "
+                             f"{a.name}.survey.rN.md", f"写 {prompt_file}", f"写 {evidence_file}",
+                             f"追加完成证据到 {slug_dir / 'dispatch.md'}"]
         if a.send:
             result["planned"].append(prompt_plan(a.name, f"<{prompt_file}>"))
         return result
-    prompt_file.parent.mkdir(parents=True, exist_ok=True)
+    slug_dir.mkdir(parents=True, exist_ok=True)
+    moved = rotate_round(slug_dir, a.name)
     prompt_file.write_text(prompt)
-    result.update(append_brief_record(a, prompt_file, evidence))
+    write_json_atomic(evidence_file, {"slug": a.slug, "agent": a.name, "worktree": worktrees[0]["wt"],
+                                      "base": worktrees[0]["base"], "prompt_file": str(prompt_file),
+                                      "written_at": time.strftime("%Y-%m-%d %H:%M:%S"), "items": evidence})
+    result["previous_round"] = moved
+    result.update(append_brief_record(a, prompt_file, evidence, evidence_file, moved))
     if a.send:
         sent = send_prompt(a.name, prompt, PROMPT_TIMEOUT_MS)
         result["sent"] = sent
@@ -6803,11 +6908,12 @@ def heavy_report_cpu(ticket: dict, cores: float, at: float) -> None:
 
 
 def heavy_run(argv: list, cwd: str, *, lock: bool = True, timeout: Optional[float] = None,
-              env: Optional[dict] = None, capture: bool = True, notify=None) -> dict:
+              env: Optional[dict] = None, capture: bool = True, tee: bool = False, notify=None) -> dict:
     """经调度执行一条命令（lock=False 不进调度）：排到放行再跑，跑完记实测、退票。返回 run_measured 的结果，排过队的
-    带 lock_waited_seconds。状态目录不可写（沙箱）时不排队直接跑、不记实测，带 unscheduled。notify(文字) 收排队提示。"""
+    带 lock_waited_seconds。状态目录不可写（沙箱）时不排队直接跑、不记实测，带 unscheduled。notify(文字) 收排队提示。
+    tee 见 run_measured。"""
     if not lock:
-        return run_measured(argv, cwd, timeout=timeout, env=env, capture=capture)
+        return run_measured(argv, cwd, timeout=timeout, env=env, capture=capture, tee=tee)
     capacity, _ = heavy_capacity()
     try:
         HEAVY_DIR.mkdir(parents=True, exist_ok=True)
@@ -6815,7 +6921,7 @@ def heavy_run(argv: list, cwd: str, *, lock: bool = True, timeout: Optional[floa
     except OSError:
         if notify:
             notify(f"调度目录 {HEAVY_DIR} 不可写（沙箱？），不排队直接执行")
-        res = run_measured(argv, cwd, timeout=timeout, env=env, capture=capture)
+        res = run_measured(argv, cwd, timeout=timeout, env=env, capture=capture, tee=tee)
         res["unscheduled"] = True
         return res
     try:
@@ -6824,7 +6930,7 @@ def heavy_run(argv: list, cwd: str, *, lock: bool = True, timeout: Optional[floa
             return {"exit_code": None, "output": "", "seconds": 0.0, "error": "已中断，没有执行"}
         if waited and notify:
             notify(f"等了 {waited} 秒，开始执行")
-        res = run_measured(argv, cwd, timeout=timeout, env=env, capture=capture,
+        res = run_measured(argv, cwd, timeout=timeout, env=env, capture=capture, tee=tee,
                            on_cpu=lambda cores, at: heavy_report_cpu(ticket, cores, at))
         if waited:
             res["lock_waited_seconds"] = waited
@@ -6988,6 +7094,51 @@ def read_all(stream, buf: bytearray) -> None:
             buf.extend(chunk)
 
 
+# heavy 记流水时只留输出的最后这么多字节算汇总行（全量测试的输出可能几 MB，不全攒在内存里）。
+TEE_TAIL_BYTES = 64 * 1024
+
+
+def tee_tail(stream, dst, buf: bytearray, lock: threading.Lock) -> None:
+    """边读边原样写到 dst（heavy 自己的 stdout / stderr，二进制、立刻 flush），buf 里只留最后 TEE_TAIL_BYTES 字节。
+    dst 写不了（调用方关了输出）就只读不转发，照样读完：不然子进程写满管道会卡住。"""
+    forward = True
+    with contextlib.suppress(OSError, ValueError):
+        while True:
+            chunk = stream.read1(65536)
+            if not chunk:
+                return
+            if forward:
+                try:
+                    dst.write(chunk)
+                    dst.flush()
+                except (OSError, ValueError):
+                    forward = False
+            with lock:
+                buf.extend(chunk)
+                del buf[:-TEE_TAIL_BYTES]
+
+
+def output_readers(proc: subprocess.Popen, capture: bool, tee: bool, output: bytearray) -> list:
+    """启动收输出的线程，返回 [(线程, 它读的管道)]：capture 一条（stdout、stderr 已合并）；tee 两条，各自转发到 heavy 的
+    stdout / stderr、共用 output 留尾部；都不是（继承终端）没有。"""
+    if capture:
+        jobs = [(read_all, proc.stdout, (output,))]
+    elif tee:
+        lock = threading.Lock()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        jobs = [(tee_tail, proc.stdout, (sys.stdout.buffer, output, lock)),
+                (tee_tail, proc.stderr, (sys.stderr.buffer, output, lock))]
+    else:
+        return []
+    readers = []
+    for target, stream, rest in jobs:
+        thread = threading.Thread(target=target, args=(stream, *rest), daemon=True)
+        thread.start()
+        readers.append((thread, stream))
+    return readers
+
+
 def tree_cpu_rate(old: dict, new: dict, seconds: float) -> float:
     """两次采样之间进程树占了几核：old / new 是 {pid: 累计 CPU 秒}。两次都在的按差值；新出现的按它的全部（这段时间里起来的）；
     中间退出的、pid 被复用的（累计值变小）算不上（偏少，最多差一个采样间隔里它们烧的）。"""
@@ -7039,7 +7190,7 @@ def reap_interrupted(proc: subprocess.Popen) -> None:
 
 
 def run_measured(argv: list, cwd: str, *, timeout: Optional[float] = None, env: Optional[dict] = None,
-                 capture: bool = True, on_cpu=None) -> dict:
+                 capture: bool = True, tee: bool = False, on_cpu=None) -> dict:
     """执行一条命令（不经 shell）并量它的占用，返回 {exit_code, output, seconds, cpu_seconds, mem_mb, timed_out?, error?}。
     - cpu_seconds：user+sys，含已回收的子孙进程。os.wait4 取的是这个子进程自己的 rusage（RUSAGE_CHILDREN 是整个进程的，
       accept 几条同时跑会混在一起）；实测孙进程烧的 0.6 秒 CPU 算进来了。
@@ -7048,6 +7199,8 @@ def run_measured(argv: list, cwd: str, *, timeout: Optional[float] = None, env: 
     - on_cpu：跑的过程中收进程树的实测核数（sample_tree），heavy 拿它更新票里的占用。
     - capture：stdout、stderr 合并进 output，stdin 是 /dev/null；否则继承调用方的终端（heavy 原样透传）。子进程留在调用方的
       进程组里：终端的 Ctrl-C 直接到它，读 stdin 也不会被 SIGTTIN 停住；heavy / accept 被中断时由 heavy_on_signal 转发。
+    - tee（capture 为 False 时）：stdout、stderr 各走一条管道，原样转发到调用方自己的 stdout / stderr（stdin 照旧继承），
+      output 只留最后 TEE_TAIL_BYTES 字节（heavy 记流水要汇总行）。子进程看到的不是终端，和 accept 截输出跑时一样。
     - 超时杀整棵进程树（以前 subprocess.run 只杀直接子进程，vitest 的 worker 孙进程会留下来接着占机器），exit_code 为 None。
     - 找不到命令、没有执行权限：error 写原因，找不到时 missing 为 true；相对路径（./.venv/bin/python）相对 cwd 解析。"""
     res: dict = {"exit_code": None, "output": ""}
@@ -7055,19 +7208,18 @@ def run_measured(argv: list, cwd: str, *, timeout: Optional[float] = None, env: 
     if HEAVY_STOP.is_set():
         res.update(error="已中断，没有执行", seconds=0.0)
         return res
+    tee = tee and not capture
     try:
         proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL if capture else None,
-                                stdout=subprocess.PIPE if capture else None,
-                                stderr=subprocess.STDOUT if capture else None)
+                                stdout=subprocess.PIPE if capture or tee else None,
+                                stderr=subprocess.STDOUT if capture else (subprocess.PIPE if tee else None))
     except OSError as exc:
         res.update(error=f"无法执行：{exc}", missing=isinstance(exc, FileNotFoundError),
                    seconds=round(time.time() - started, 1))
         return res
     HEAVY_CHILDREN[proc.pid] = proc
     output = bytearray()
-    reader = threading.Thread(target=read_all, args=(proc.stdout, output), daemon=True) if capture else None
-    if reader:
-        reader.start()
+    readers = output_readers(proc, capture, tee, output)
     stop, peak = threading.Event(), [0]
     threading.Thread(target=sample_tree, args=(proc.pid, stop, peak, on_cpu), daemon=True).start()
     timer = None
@@ -7087,10 +7239,11 @@ def run_measured(argv: list, cwd: str, *, timeout: Optional[float] = None, env: 
         if timer:
             timer.cancel()
         HEAVY_CHILDREN.pop(proc.pid, None)
-    if reader:
+    for reader, stream in readers:
         reader.join(10)  # 留着输出管道的孙进程（后台服务）不该让这里一直等下去
         if not reader.is_alive():
-            proc.stdout.close()
+            stream.close()
+    if readers:
         res["output"] = bytes(output).decode(errors="replace")
     single_mb = usage.ru_maxrss / ((1 << 20) if sys.platform == "darwin" else 1024)
     res.update(seconds=round(time.time() - started, 1), cpu_seconds=round(usage.ru_utime + usage.ru_stime, 2),
@@ -7837,6 +7990,9 @@ def verify_with_duplicates(wt: str, jobs: list, a: argparse.Namespace, changed: 
 def cmd_accept(a: argparse.Namespace) -> dict:
     heavy_install_signals()  # 被中断时把在跑的建图 / 验证命令的进程树一起结束
     wt = str(Path(a.wt).resolve())
+    evidence = accept_evidence(a, wt)
+    # 标记新文件之前的改动指纹：和 worker 的 heavy 流水比（git add -N 会改 git status、git diff HEAD，指纹跟着变）。
+    marked_from = worktree_fingerprint(wt)
     status_lines = git_out(wt, "status", "--porcelain").splitlines()
     newly_marked = [line[3:] for line in status_lines if line.startswith("?? ")]
     p = git(wt, "add", "-N", ".")
@@ -7906,17 +8062,84 @@ def cmd_accept(a: argparse.Namespace) -> dict:
         result["complexity"] = complexity_check(wt, a.base, changed)
     # 最后才重跑验证命令：测试可能生成缓存等文件，不能让它们混进上面的状态和 diff。
     # 任一条失败 ok 仍为 true（脚本本身没出错），由 verify_failed 表示验收不通过。
-    jobs = [(cmd, None) for cmd in a.verify] + [(cmd, a.base) for cmd in a.verify_baseline]
-    result["verify"], duplicates = verify_with_duplicates(wt, jobs, a, changed)
+    result["verify"], duplicates = verify_with_duplicates(wt, accept_jobs(a, evidence), a, changed)
     if a.integration:
         result["duplicates"] = duplicates
     result["verify_failed"] = any(not v["ok"] for v in result["verify"])
-    if a.save:
+    if evidence is not None:
+        result.update(slug=a.slug, agent=a.name, evidence=evidence_report(evidence, result["verify"]))
+    result["worker_runs"] = worker_runs(wt, marked_from)
+    # 验收结束时（验证命令跑完）的指纹：review 拿它比，验收之后又改过（没提交时 HEAD 不变）就不用这份存档起复审。
+    result["fingerprint_before_mark"] = marked_from or None
+    result["fingerprint"] = worktree_fingerprint(wt) or None
+    save = a.save or (str(STATE_HOME / a.slug / f"accept-{a.name}.json") if a.name else None)
+    if save:
         # review 子命令从这里取图谱摘要和验证结果，编排者不必再手抄一遍。
-        result["saved_to"] = save_json(a.save, result)
+        result["saved_to"] = save_json(save, result)
     if a.brief:
         return accept_brief(result)
     return result
+
+
+def accept_evidence(a: argparse.Namespace, wt: str) -> Optional[dict]:
+    """accept --slug --name：读 brief 留的证据清单 <slug>/<name>.evidence.json，返回 {file, items}。不带 --name（老写法）返回
+    None，不读；清单不在（旧版 brief 生成的任务书）items 是 None；清单是别的 worktree 的报错（agent 名或 --wt 写错了）。"""
+    if not a.name:
+        return None
+    check_slug(a.slug)
+    check_agent_name(a.name)
+    path = STATE_HOME / a.slug / f"{a.name}.evidence.json"
+    try:
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        return {"file": str(path), "items": None}
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DroverError(f"读不了证据清单 {path}：{exc}")
+    owner = os.path.realpath(data.get("worktree") or "")
+    if owner != wt:
+        raise DroverError(f"{path} 是 worktree {owner} 的证据清单，不是 {wt}：检查 --name 和 --wt 是不是同一个条目")
+    return {"file": str(path), "items": data.get("items") or []}
+
+
+def command_key(command: str) -> str:
+    """比较两条命令是不是同一条：按 shlex 规范化（多余空格、引号写法不同算同一条）；拆不开的按原文。"""
+    try:
+        return shlex.join(shlex.split(command))
+    except ValueError:
+        return command.strip()
+
+
+def accept_jobs(a: argparse.Namespace, evidence: Optional[dict]) -> list:
+    """要跑的 verify，[(命令, 基线或 None)]：证据命令在前（按证据顺序），再是 --verify；同一条只跑一次。证据命令也写在
+    --verify-baseline 里的只按基线那条跑。--verify 和 --verify-baseline 之间照旧（同一条命令两边各跑一次）。"""
+    on_base = {command_key(c) for c in a.verify_baseline}
+    from_evidence = [c for it in (evidence or {}).get("items") or [] for c in it["commands"]
+                     if command_key(c) not in on_base]
+    plain, seen = [], set()
+    for cmd in from_evidence + a.verify:
+        if command_key(cmd) not in seen:
+            seen.add(command_key(cmd))
+            plain.append(cmd)
+    return [(cmd, None) for cmd in plain] + [(cmd, a.base) for cmd in a.verify_baseline]
+
+
+def evidence_report(evidence: dict, verify: list) -> dict:
+    """证据逐条的结论：命令全部通过算"通过"，有一条没过算"失败"，没有命令算"只能看自述"；summary 是四个数（rollup 的验证行
+    照它写）。每条命令的结果用 brief_verify 的摘要（含测试计数）。"""
+    if evidence["items"] is None:
+        return {"file": evidence["file"], "items": None,
+                "summary": "没有证据清单（旧版 brief 生成的任务书）：只跑了 --verify，完成证据照状态文件的 brief 段人工核对"}
+    by_cmd = {command_key(v.get("command", "")): v for v in verify}
+    items = []
+    for it in evidence["items"]:
+        runs = [brief_verify(by_cmd.get(command_key(c)) or {"command": c, "ok": False, "error": "没跑"})
+                for c in it["commands"]]
+        status = "只能看自述" if not runs else ("通过" if all(r["ok"] for r in runs) else "失败")
+        items.append({"n": it["n"], "text": it["text"][:80], "status": status, "commands": runs})
+    with_cmd = sum(1 for it in items if it["commands"])
+    passed = sum(1 for it in items if it["status"] == "通过")
+    return {"file": evidence["file"], "items": items,
+            "summary": f"证据 {len(items)} 条 / 有命令 {with_cmd} 条 / 通过 {passed} 条 / 只能看自述 {len(items) - with_cmd} 条"}
 
 
 def brief_verify(v: dict) -> dict:
@@ -7983,6 +8206,10 @@ def accept_brief(result: dict) -> dict:
     for key, brief in (("complexity", brief_complexity), ("duplicates", brief_duplicates)):
         if key in result:
             out[key] = brief(result[key])
+    # 证据逐条的结论（accept --name）和 worker 的 heavy 流水，本来就是摘要的大小，原样带上。
+    for key in ("evidence", "worker_runs"):
+        if key in result:
+            out[key] = result[key]
     return out
 
 
@@ -8043,6 +8270,38 @@ def tests_from_verify(verify: list) -> str:
     return "；".join(parts)
 
 
+def review_archive(a: argparse.Namespace, slug_dir: Path) -> Path:
+    """复审用哪份验收存档：--accept-json → <slug>/accept-<主 agent>.json（复审者名去掉 -rev；accept --name 的默认存档）→
+    <slug>/accept.json（旧文档写的路径，再认一个版本）。以前默认只读 accept.json，几个条目都存到它时复审拿到的是别人的。"""
+    if a.accept_json:
+        return Path(a.accept_json).expanduser()
+    candidates = ([slug_dir / f"accept-{a.name.removesuffix('-rev')}.json"] if a.name.endswith("-rev") else []) \
+        + [slug_dir / "accept.json"]
+    found = next((p for p in candidates if p.is_file()), None)
+    if found is None:
+        raise DroverError(f"找不到验收结果（找过 {'、'.join(map(str, candidates))}）：先跑 accept --slug {a.slug} "
+                          "--name <主 agent 名>（复审者名约定 <主 agent 名>-rev），或用 --accept-json 指定")
+    return found
+
+
+def check_archive_identity(accepted: dict, path: Path, wt: str) -> list:
+    """存档得是这个 worktree、这份代码的：worktree_path、HEAD、改动指纹（accept 结束时算的；条目的改动没提交，HEAD 不变，
+    只比 HEAD 拦不住"验收之后又改了"）任一对不上就拒绝（指纹这次没取到、git 超时返回空串时不拦）。旧存档缺哪个字段就跳过
+    那一项，返回 warnings。"""
+    redo = "：重新 accept 之后再起复审"
+    saved_wt = accepted.get("worktree_path")
+    if saved_wt and os.path.realpath(saved_wt) != wt:
+        raise DroverError(f"{path} 是 worktree {saved_wt} 的验收结果，不是 {wt}" + redo)
+    head = accepted.get("head")
+    if head and head != git_out(wt, "rev-parse", "HEAD"):
+        raise DroverError(f"{path} 验收时 HEAD 是 {head[:12]}，现在不是了（之后又提交过）" + redo)
+    saved_fp = accepted.get("fingerprint")
+    if saved_fp and worktree_fingerprint(wt) not in (saved_fp, ""):
+        raise DroverError(f"{path} 验收之后 worktree 又改过（改动指纹对不上）" + redo)
+    missing = [key for key in ("worktree_path", "head", "fingerprint") if not accepted.get(key)]
+    return [f"{path} 里没有 {'、'.join(missing)}（旧版 accept 存的），这几项没核对"] if missing else []
+
+
 def cmd_review(a: argparse.Namespace) -> dict:
     """复审一条命令到位：按模板生成 prompt → 分屏启动只读 codex → 立刻发出 prompt。
 
@@ -8051,17 +8310,18 @@ def cmd_review(a: argparse.Namespace) -> dict:
     check_agent_name(a.name)
     check_slug(a.slug)
     slug_dir = STATE_HOME / a.slug
-    accept_path =Path(a.accept_json).expanduser() if a.accept_json else slug_dir / "accept.json"
+    accept_path = review_archive(a, slug_dir)
     if not accept_path.is_file():
         raise DroverError(f"找不到验收结果 {accept_path}：先跑 accept --save {accept_path}")
     accepted = json.loads(accept_path.read_text())
+    warnings = check_archive_identity(accepted, accept_path, str(Path(a.wt).resolve()))
     if accepted.get("verify_failed"):
         raise DroverError(f"{accept_path} 里有 verify 失败，验收没通过，不起复审：先让主 agent 修好，再重新 accept",
                             verify=[{k: v.get(k) for k in ("command", "exit_code", "summary_line", "error")}
                                     for v in accepted.get("verify", []) if not v.get("ok")])
     tests = a.tests or tests_from_verify(accepted.get("verify"))
     if not tests:
-        raise DroverError("缺测试结果：accept.json 里没有 verify（accept 时加 --verify），也没传 --tests")
+        raise DroverError(f"缺测试结果：{accept_path} 里没有 verify（accept 时加 --verify），也没传 --tests")
     graph = accepted.get("graph") or {}
     if graph.get("ok"):
         graph_text = graph.get("brief")
@@ -8080,13 +8340,16 @@ def cmd_review(a: argparse.Namespace) -> dict:
     prompt_file = slug_dir / f"{a.name}.prompt.md"
     prompt_file.write_text(prompt)
     if a.dry_run:
-        return {"ok": True, "dry_run": True, "prompt_file": str(prompt_file), "prompt": prompt,
+        return {"ok": True, "dry_run": True, "accept_json": str(accept_path), "warnings": warnings,
+                "prompt_file": str(prompt_file), "prompt": prompt,
                 "planned": [f"herdr pane split {a.pane} --direction right --cwd {a.wt} --no-focus",
                             f"herdr agent start {a.name} --kind codex ... -s read-only",
                             prompt_plan(a.name, f"<{prompt_file}>")]}
 
     started_at = time.strftime("%H:%M:%S")
     result = spawn_reviewer(a.pane, a.wt, a.name, *task_model("codex", a.model, None, a.slug))
+    result["accept_json"] = str(accept_path)
+    result["warnings"] = warnings
     result["prompt_file"] = str(prompt_file)
     result["started_at"] = started_at
     if not result.get("ok"):
@@ -8346,7 +8609,12 @@ def cmd_heavy(a: argparse.Namespace) -> int:
         print(f"[drover heavy] {message}", file=sys.stderr, flush=True)
 
     heavy_install_signals()
-    res = heavy_run(run_argv, cwd, env=env, capture=False, notify=notify)
+    top = heavy_repo(cwd)[3]
+    log, branch = run_log_for(top) if top else (None, None)
+    if log is None:
+        res = heavy_run(run_argv, cwd, env=env, capture=False, notify=notify)
+    else:
+        res = heavy_logged_run(run_argv, cwd, env, notify, log, top, branch)
     if res.get("missing"):
         print(f"[drover heavy] 找不到命令 {run_argv[0]}", file=sys.stderr)
         return 127
@@ -8354,6 +8622,116 @@ def cmd_heavy(a: argparse.Namespace) -> int:
         print(f"[drover heavy] {res.get('error') or '没有执行'}", file=sys.stderr)
         return 126
     return res["exit_code"]
+
+
+# heavy 流水：worker 的测试、lint、类型检查一律经 heavy（任务书的约束），heavy 在条目 worktree 里每跑完一条就记一行：在哪个
+# worktree、什么命令、退出码、汇总行、当时的改动指纹。以前 worker 跑过什么只有报告里的自述（报告又不许贴输出），"改之前失败"
+# 只有一句话；heavy 只按命令形状留调度用的耗时，不分 worktree、不记代码。accept 按 worktree 列出流水（worker_runs）。
+HEAVY_RUNS_FILE = "heavy-runs.jsonl"
+
+
+def run_log_for(top: str) -> tuple:
+    """worktree（git 顶层）的流水记在哪：(~/.drover/<slug>/heavy-runs.jsonl 或 None, 分支)。分支 task/<slug>…（第 3 节的条目分支、
+    第 9.1 节的集成分支）按 task_owner 归任务；别的分支名、detached、任务目录不在、git 出错都返回 None，不记。"""
+    try:
+        branch = current_branch(top)
+    except DroverError:
+        return None, None
+    slug = task_owner(branch, task_slugs()) if branch else None
+    return (STATE_HOME / slug / HEAVY_RUNS_FILE if slug else None), branch
+
+
+def run_output_summary(output: str) -> dict:
+    """流水里的汇总：最后一行非空行和测试计数（同 accept 的 verify）。测试计数只在这一处取，集成时换成 test_tally（多一个 tests）。"""
+    output = ANSI_RE.sub("", output)
+    last = [line.strip() for line in output.splitlines() if line.strip()]
+    return {"summary_line": last[-1][:300] if last else "", "counts": test_counts(output)}
+
+
+def heavy_logged_run(argv: list, cwd: str, env: Optional[dict], notify, log: Path, top: str, branch: str) -> dict:
+    """在条目 worktree 里跑一条并记流水：跑之前、跑完各算一次改动指纹（跑的过程中代码变了的，accept 不算"现在的代码上通过过"），
+    输出经 tee 原样转发、留尾部取汇总（run_output_summary）。被中断、没执行起来的不记。
+    记上了往 stderr 打"流水 #N"（文件里的第几行），worker 报告按它引用。"""
+    before = worktree_fingerprint(top)
+    started = time.time()
+    res = heavy_run(argv, cwd, env=env, capture=False, tee=True, notify=notify)
+    if not isinstance(res.get("exit_code"), int):
+        return res
+    after = worktree_fingerprint(top)
+    row = {"at": round(time.time(), 3), "started": round(started, 3), "worktree": top, "branch": branch,
+           "cwd": os.path.relpath(os.path.realpath(cwd), top), "command": heavy_shape(argv, cwd)["exact"],
+           "exit_code": res["exit_code"], "seconds": res.get("seconds"),
+           **run_output_summary(res.get("output", "")), "fingerprint": before or None}
+    if after != before:
+        row["fingerprint_after"] = after or None
+    try:
+        with locked_append(log) as (text, chunks):
+            n = len(text.splitlines()) + 1
+            chunks.append(json.dumps(row, ensure_ascii=False) + "\n")
+        notify(f"流水 #{n}：{log}（退出码 {res['exit_code']}）")
+    except OSError as exc:
+        notify(f"流水没记上（{exc}）")
+    return res
+
+
+def run_log_rows(log: Path, wt: str) -> list:
+    """流水里这个 worktree 的行，带流水号（文件里的第几行，就是 heavy 打的 #N）：[(N, 行)]。"""
+    try:
+        lines = log.read_text().splitlines()
+    except OSError:
+        return []
+    rows = []
+    for n, line in enumerate(lines, 1):
+        with contextlib.suppress(ValueError):
+            row = json.loads(line)
+            if isinstance(row, dict) and row.get("worktree") == wt:
+                rows.append((n, row))
+    return rows
+
+
+def worker_runs(wt: str, fingerprint: Optional[str]) -> dict:
+    """accept 顺带列的 heavy 流水：这个 worktree 跑过几条；在现在的代码上通过过的命令（跑之前、跑完的指纹都等于 accept 标记新文件
+    之前算的指纹）；同一条命令先失败后通过的（red_then_green）。只列事实，不参与判定。"""
+    log, branch = run_log_for(wt)
+    if log is None:
+        return {"runs": 0, "note": f"没有流水：分支 {branch or '（detached / 读不到）'} 不是 task/<slug>…（或任务目录不在），"
+                                   "heavy 只给条目 worktree 记流水"}
+    rows = run_log_rows(log, wt)
+    if not rows:
+        return {"file": str(log), "runs": 0, "note": "这个 worktree 没有 heavy 流水：worker 没经 heavy 跑过验证"}
+
+    def current(row: dict) -> bool:
+        return bool(fingerprint) and row.get("fingerprint") == fingerprint and "fingerprint_after" not in row
+
+    passed: dict = {}
+    for n, row in rows:
+        if row.get("exit_code") == 0 and current(row):
+            passed[row.get("command")] = (n, row)  # 同一条命令留最后一次
+    return {"file": str(log), "runs": len(rows),
+            "passed_on_current": [f"#{n} {cmd} → {row.get('summary_line') or '（没有输出）'}"
+                                  for cmd, (n, row) in passed.items()],
+            "red_then_green": red_then_green(rows, current)}
+
+
+def red_then_green(rows: list, current) -> list:
+    """同一条命令先失败、之后通过的（回归测试"改之前失败、改之后通过"的记录）：第一次失败，和它之后的一次通过（优先在现在的
+    代码上的）。两次的指纹相同说明是同一份代码先挂后过，写明可能不稳定。"""
+    by_cmd: dict = {}
+    for n, row in rows:
+        by_cmd.setdefault(row.get("command"), []).append((n, row))
+    out = []
+    for cmd, runs in by_cmd.items():
+        fail = next(((n, r) for n, r in runs if r.get("exit_code") != 0), None)
+        passes = [(n, r) for n, r in runs if fail and n > fail[0] and r.get("exit_code") == 0]
+        if not passes:
+            continue
+        n_ok, ok = next((p for p in reversed(passes) if current(p[1])), passes[-1])
+        notes = ["现在的代码" if current(ok) else "不是现在的代码"]
+        if fail[1].get("fingerprint") and fail[1].get("fingerprint") == ok.get("fingerprint"):
+            notes.append("失败那次也是同一份代码，可能不稳定")
+        out.append(f"{cmd}：#{fail[0]} 失败（{fail[1].get('summary_line') or '没有输出'}）→ "
+                   f"#{n_ok} 通过（{ok.get('summary_line') or '没有输出'}，{'；'.join(notes)}）")
+    return out
 
 
 def worktree_of_branch(repo: str, branch: str) -> Optional[str]:
@@ -11123,8 +11501,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "### 线索（需核实）（可选），### 摸底时要写清（--survey 时必填）")
     p.add_argument("--goal", required=True,
                    help="用户的目标，必填：状态文件开头\"目标：\"那段（dispatch.md 第 1.1 节的复述），放在任务书最前面")
-    p.add_argument("--evidence", action="append", default=[], required=True,
+    # --evidence 和 --evidence-cmd 共用一个列表、按命令行顺序收（evidence_items 把命令挂到前面最近的那条证据下）。
+    p.add_argument("--evidence", action="append", default=[], required=True, type=evidence_entry,
                    help="完成证据，必填、可重复：用什么命令或操作、看到什么结果算通过")
+    p.add_argument("--evidence-cmd", dest="evidence", action="append", type=evidence_cmd_entry,
+                   help="紧跟在它所属的 --evidence 后面、可重复：验收时原样重跑的命令（在 --wt 里跑，shlex 拆分、不经 shell）。"
+                        "存进 <slug>/<name>.evidence.json，accept --slug --name 自动把它们当 verify 跑；"
+                        "没有命令的证据算\"只能看自述\"")
     p.add_argument("--commit-allowed", action="store_true", help="用户要求提交时才加：允许在当前分支 commit")
     p.add_argument("--survey", action="store_true",
                    help="第一步只读代码摸底（核实任务书里的事实、盘点范围、列出待决策问题），写到 <slug>/<name>.survey.md 后停下")
@@ -11253,7 +11636,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "改动行的重复对，进 duplicates。不带时是条目验收：crapper 只算复杂度，这次改动碰到的函数里圈复杂度 ≥ "
                         f"{COMPLEXITY_THRESHOLD} 的进 complexity。两个工具没装、出错都只报\"测不了\"，不挡验收；config 的 "
                         "quality_tools 是 false 时都不跑")
-    p.add_argument("--save", help="把结果另存为 JSON（review 从 ~/.drover/<slug>/accept.json 取图谱摘要和验证结果）")
+    p.add_argument("--save", help="把结果另存为 JSON（review 从这里取图谱摘要和验证结果）。带 --name 时默认存 "
+                                  "~/.drover/<slug>/accept-<name>.json，给了 --save 以它为准")
+    p.add_argument("--slug", help="任务 slug，和 --name 一起给")
+    p.add_argument("--name", help="条目验收的 agent 名（要配 --slug）：读 brief 留的 <slug>/<name>.evidence.json，带命令的证据"
+                                  "当 verify 跑（排在 --verify 前面，同一条只跑一次），结果里 evidence 给每条证据的结论和"
+                                  "\"证据 N 条 / 有命令 M 条 / 通过 K 条 / 只能看自述 X 条\"；默认存 <slug>/accept-<name>.json，"
+                                  "review 按复审者名（<name>-rev）找它")
     p.add_argument("--brief", action="store_true",
                    help="只打印摘要（文件数、图谱结论、verify 结果和测试计数）；完整结果看 --save 的文件。建议和 --save 一起用")
     p.add_argument("--no-lock", action="store_true",
@@ -11384,7 +11773,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--base", required=True, help="BASE_SHA")
     p.add_argument("--tests", help="已跑过的验证命令和结果，一行；不传则用 accept.json 里的 verify 结果生成")
     p.add_argument("--focus", help="本次改动背景与复审重点，1 到 3 句；可不传")
-    p.add_argument("--accept-json", help="验收结果文件，默认 ~/.drover/<slug>/accept.json")
+    p.add_argument("--accept-json", help="验收结果文件；不传时按 --name 找：<主 agent 名>-rev → ~/.drover/<slug>/accept-<主 agent 名>.json"
+                                         "（accept --name 的默认存档），找不到再用旧的 ~/.drover/<slug>/accept.json。"
+                                         "存档的 worktree、HEAD、改动指纹和现在的对不上就拒绝（改过之后要重新 accept）")
     p.add_argument("--model", help="复审 codex 的模型（完整模型 ID，传 -m）：不传时用任务 orch.json 记的（编排者是 codex 才有，"
                                    "effort 也一样继承），再不传，用 ~/.codex/config.toml 的默认")
     p.add_argument("--dry-run", action="store_true", help="只生成 prompt 文件并列出要执行的命令")
@@ -11515,6 +11906,8 @@ def usage_problem(a: argparse.Namespace) -> Optional[str]:
         return "heavy --status 只看调度状态，不带要执行的命令"
     if a.command == "cleanup" and a.probe and not a.wt:
         return "cleanup --probe 要配 --wt：探测模式不要求内容在远端，只对写明的探测 / 调研 worktree 用，不对整个任务用"
+    if a.command == "accept" and a.name and not a.slug:
+        return "accept --name 要配 --slug：证据清单和默认存档都在 ~/.drover/<slug>/ 下"
     return None
 
 

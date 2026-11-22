@@ -530,8 +530,9 @@ class BriefTemplateTests(PlaybookTestBase):
                             task=TASK + "\n### 摸底时要写清\n只点影响决策的问题。\n")["prompt"]
         for prompt in (plain, survey):
             protocol = prompt[prompt.index("## 完成协议"):]
-            self.assertIn("每条一行：命令加结果汇总行（如 `Tests run: 218, Failures: 0`、`164 passed`）", protocol)
-            self.assertIn("修 bug 的写明回归测试改之前失败、改之后通过（命令和结果）", protocol)
+            # 每条验证对应一条 heavy 流水（改动项 14）：命令 → 汇总行 → 流水号；回归测试红绿写两条流水号
+            self.assertIn("每条一行：命令 → 结果汇总行（如 `Tests run: 218, Failures: 0`、`164 passed`）→ 流水号", protocol)
+            self.assertIn("修 bug 的写明回归测试改之前失败、改之后通过的两条流水号", protocol)
             self.assertIn("整份报告尽量 60 行以内；verification 不贴命令输出、不点名测试类、不重述摸底", protocol)
             self.assertIn(f"在对话里只回复一行：报告路径和 status（如 `{self.state / 'selftest-playbook' / 'st-agent.md'} "
                           "status: DONE`），不要把报告块再写一遍", protocol)
