@@ -313,6 +313,38 @@ class OncallCliTests(DroverTestCase):
         self.assertIn("刷新", "\n".join(out["hints"]))
         self.assertFalse(out["drover"]["drover_env"]["up_to_date"])
 
+    def test_status_hints_owner_elsewhere(self) -> None:
+        """飞书 oncall 只属于一个 herdr（插件 status 的 owner，按 socket 路径认）。归属的不是这次调用所在的 herdr → 一条提示：
+        归属在哪个 herdr（它没在运行时点明）、这个 herdr 里的主会话收不到飞书消息和按钮、在这个 herdr 里跑 poll 动作切过来；
+        归属就是当前这个、还没有归属记录（socket_path 是 null，current_session 也是 false）、旧版插件没有 owner 字段 → 不提示"""
+        self.write_drover_env()
+        here, other = "/tmp/herdr-here/herdr.sock", "/tmp/herdr-drtest/herdr.sock"
+        switch = f"herdr plugin action invoke poll --plugin {PLUGIN}"
+
+        def hints(owner) -> list:
+            status = contract_status(session={"socket_path": here, "source": "env"})
+            status["poller"] = {"alive": True, "pid": 4242, "socket_path": other, "bound_to_owner": True,
+                                "current_session": False}
+            if owner is not None:
+                status["owner"] = {"since": 1795442264000, "via": "action poll", **owner}
+            self.set_plugin(version="0.7.0", source="github", status=status)
+            out = self.drover_json("oncall", "status")
+            self.assertEqual(out["plugin_status"].get("owner"), status.get("owner"))  # 新字段原样透传
+            return out["hints"]
+
+        for running, stopped in ((True, False), (None, False), (False, True)):
+            with self.subTest(running=running):
+                found = hints({"socket_path": other, "running": running, "current_session": False})
+                self.assertEqual(len(found), 1, found)
+                for word in ("归属另一个 herdr", other, "收不到飞书消息和按钮", switch):
+                    self.assertIn(word, found[0])
+                self.assertEqual("没在运行" in found[0], stopped, found[0])
+        for case, owner in (("归属就是当前会话", {"socket_path": here, "running": True, "current_session": True}),
+                            ("还没有归属记录", {"socket_path": None, "running": None, "current_session": False}),
+                            ("旧版插件没有 owner", None)):
+            with self.subTest(case):
+                self.assertEqual(hints(owner), [])
+
     def test_status_old_plugin_without_script(self) -> None:
         """插件太旧、没有 status 脚本：ok: false，按来源给提示（本地链接 → git pull；GitHub → 重跑 install）"""
         self.set_plugin(version="0.6.6", source="local", status=None)

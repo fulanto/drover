@@ -4262,6 +4262,19 @@ def oncall_status(plugin: dict) -> dict:
     if isinstance(channels, dict) and isinstance(channels.get("telegram"), dict) \
             and channels["telegram"].get("paired") is not True:
         channels.pop("telegram")
+def oncall_owner_hints(status: dict) -> list:
+    """飞书 oncall 归属的不是这次调用所在的 herdr 时的一条提示，否则 []。插件 status 的 owner 是 Oncall 归属的 herdr server
+    （只属于一个，按 socket 路径认）：socket_path 不空、current_session 是 false 才是归属在别处。还没有归属记录时 socket_path 是
+    null（current_session 也是 false，不代表在别处）、旧版插件没有 owner，都不提示。running 是 false 时点明那个 herdr 没在运行
+    （true、说不清的 null 不提）。来由：11-23 飞书送不进主会话那次，插件连的是另一个 herdr，status 只显示收信进程活着、hints 是空的。"""
+    owner = status.get("owner") or {}
+    if not owner.get("socket_path") or owner.get("current_session") is not False:
+        return []
+    stopped = "，它没在运行" if owner.get("running") is False else ""
+    return [f"飞书 oncall 现在归属另一个 herdr（{owner['socket_path']}{stopped}）：这个 herdr 里的主会话收不到飞书消息和按钮，"
+            f"要切过来就在这个 herdr 里跑 herdr plugin action invoke poll --plugin {ONCALL_PLUGIN_ID}"]
+
+
     return {"ok": True, "plugin_status": status, "drover": view, "hints": oncall_hints(plugin, view, status)}
 
 
@@ -4286,6 +4299,7 @@ def action_log(action_id: str, since: float) -> tuple[Optional[dict], bool]:
     since_ms = int(since * 1000) - 2000
     deadline = time.time() + ONCALL_LOG_WAIT
     latest, told = None, False
+        hints += oncall_owner_hints(status)
     while True:
         ok, res = herdr(["plugin", "log", "list", "--plugin", ONCALL_PLUGIN_ID, "--limit", "20"], timeout=30)
         hits = [x for x in (res.get("logs") or [] if ok else []) if isinstance(x, dict) and is_action_log(x, action_id)

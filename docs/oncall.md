@@ -11,11 +11,13 @@
 ```bash
 ~/.drover/bin/drover oncall pair          # 发起配对：输出里的 link 是配对链接；Mac 桌面会弹二维码，没弹就用手机飞书打开 link
 ~/.drover/bin/drover oncall pair --wait   # 同上，再等你扫码确认（最多 5 分钟），配上后自动发一条测试消息
-~/.drover/bin/drover oncall status        # 配上没有（plugin_status.channels.feishu.paired）、插件版本、开关、主会话登记了没有（不打印密钥）
+~/.drover/bin/drover oncall status        # 配上没有（plugin_status.channels.feishu.paired）、归属哪个 herdr（plugin_status.owner）、插件版本、开关、主会话登记了没有（不打印密钥）
 ~/.drover/bin/drover oncall test          # 发一条测试消息
 ```
 
 每扫一次码会在你的飞书里建一个只属于你的机器人；已经配对过的机器再跑 `pair` 只回"已配对"，不会再建。`pair` 要等插件这次的动作跑完才拿得到链接，一般几秒，已配对的机器要先向飞书核对，可能二三十秒（最多等 45 秒，还没跑完就提示你稍后看 `herdr plugin log list`）。
+
+飞书 oncall 同一时间只属于一个 herdr（同一台机器上开了第二个 herdr 会话时，只有一个收得到飞书）。`drover oncall status` 的 `plugin_status.owner` 是它归属的那个：`current_session` 是 `true` 就是你现在这个 herdr；是 `false`、`socket_path` 又不空，就是归属在别处，这个 herdr 里的主会话收不到飞书消息和按钮，`hints` 里会有一条说明。要切到现在这个 herdr，就在它里面跑 `herdr plugin action invoke poll --plugin com.codreamer.herdr.oncall`。
 
 不配飞书也有用：macOS 上的桌面面板按同样的规则提醒（只为主会话弹）。
 

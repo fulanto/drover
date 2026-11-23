@@ -131,11 +131,12 @@ find ~/.claude ~/.codex ~/.drover <主工作台> -maxdepth 3 -name "*.bak-drover
 
 ## 飞书收不到消息
 
-1. `~/.drover/bin/drover oncall status`，按 `hints` 处理：插件在 herdr 里被禁用（`herdr plugin enable com.codreamer.herdr.oncall`）、插件自己的开关关着（`drover oncall on`）、飞书还没配对（`drover oncall pair`）、`drover.env` 不在或过期（重跑 `python3 install.py`）。
-2. `plugin_status.poller.alive` 是 `false`：插件收发飞书的常驻进程没起来。herdr 重启后会自动拉起；也可以手动重启它：`herdr plugin action invoke poll --plugin com.codreamer.herdr.oncall`。
-3. 能收到推送、但飞书里回复没反应：`plugin_status.channels.feishu.replies_supported` 是 `false`，Node 低于 22，升级 Node（`brew install node`），再重启 herdr。
-4. 只收到主会话的、编排者 / worker 的确认框没推：这是设计（[飞书 oncall](oncall.md) 的通知规则），它们卡满 5 / 10 分钟没人批才推。
-5. 插件真实做了什么，看它的日志：`herdr plugin log list --plugin com.codreamer.herdr.oncall --limit 20`。
+1. `~/.drover/bin/drover oncall status`，按 `hints` 处理：插件在 herdr 里被禁用（`herdr plugin enable com.codreamer.herdr.oncall`）、插件自己的开关关着（`drover oncall on`）、飞书还没配对（`drover oncall pair`）、`drover.env` 不在或过期（重跑 `python3 install.py`）、飞书 oncall 归属另一个 herdr（见下一条）。
+2. `hints` 说飞书 oncall 归属另一个 herdr（`plugin_status.owner.current_session` 是 `false`、`owner.socket_path` 不空）：飞书 oncall 同一时间只属于一个 herdr，开过第二个 herdr 会话时它可能留在那边（`owner.running` 是 `false` 说明那个 herdr 已经没在运行了）。这时这个 herdr 里的主会话收不到飞书消息和按钮，`poller.alive` 是 `true` 也一样：收信进程活着，但连的不是这个 herdr。在要用的这个 herdr 里跑 `herdr plugin action invoke poll --plugin com.codreamer.herdr.oncall` 切过来。
+3. `plugin_status.poller.alive` 是 `false`：插件收发飞书的常驻进程没起来。herdr 重启后会自动拉起；也可以手动重启它：`herdr plugin action invoke poll --plugin com.codreamer.herdr.oncall`。
+4. 能收到推送、但飞书里回复没反应：`plugin_status.channels.feishu.replies_supported` 是 `false`，Node 低于 22，升级 Node（`brew install node`），再重启 herdr。
+5. 只收到主会话的、编排者 / worker 的确认框没推：这是设计（[飞书 oncall](oncall.md) 的通知规则），它们卡满 5 / 10 分钟没人批才推。
+6. 插件真实做了什么，看它的日志：`herdr plugin log list --plugin com.codreamer.herdr.oncall --limit 20`。
 
 ## 飞书配对失败
 
@@ -152,6 +153,7 @@ find ~/.claude ~/.codex ~/.drover <主工作台> -maxdepth 3 -name "*.bak-drover
 
 飞书里不引用发的消息回"没找到主会话"，或者 `drover oncall status` 里 `drover.main_agent.registered` 是 `false`：
 
+- 先看 `drover oncall status` 的 `hints`：说飞书 oncall 归属另一个 herdr 的，插件是在那个 herdr 里找主会话，这边登记得再对也找不到，照[飞书收不到消息](#飞书收不到消息)第 2 条切过来。
 - 在主会话里跑一次 `~/.drover/bin/drover main-register`，它会说为什么没登记：`conflict`（另一个 pane 已经登记成 `drover`，比如开了第二个主会话：关掉那个再跑）、`named`（这个会话已经有别的名字）、`orch_workspace`（在编排者的 `orch` workspace 里开的会话，不算主会话）、`not_in_herdr`（不是在 Herdr 的 pane 里开的）。
 - Claude Code：SessionStart hook 在不在，`python3 ~/.drover/pkg/install.py --check` 里"主会话登记 hook"一项；主会话要在主工作台目录本身开（子目录不算）。
 - Codex：没有 hook，主会话在你发第一条消息时按路由规则登记；刚开的 Codex 会话还没说过话时，飞书消息找不到它。
