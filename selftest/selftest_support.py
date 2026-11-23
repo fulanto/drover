@@ -85,6 +85,9 @@ class FakeClock:
     def time(self) -> float:
         return self.now
 
+    def time_ns(self) -> int:
+        return int(self.now * 1_000_000_000)
+
     def sleep(self, seconds: float) -> None:
         self.now += seconds
         self.sleeps += 1
@@ -177,8 +180,10 @@ class DroverTestCase(unittest.TestCase):
         # 自动更新默认关：main-register、watch --main、board 都会触发 tick，自测不能真的在后台起 update。
         # 测 tick 的用例（test_auto_update.py）自己打开，并把后台命令换成假的。
         env["DROVER_AUTO_UPDATE"] = "0"
-        # 闲置 worker 的自动释放也默认关：watch、board、main-register 每一轮都会触发 tick，到点了在后台起 release --idle。
-        # 测它的用例（test_release.py）自己打开。
+        # 后台维护（drover upkeep：给 herdr 同步续命令、闲置 worker 的自动释放）默认关：watch、board、main-register 每一轮都会
+        # 触发 tick，到点了在后台起真进程。测它的用例（test_release.py）自己打开，并把后台命令换成假的。
+        env["DROVER_UPKEEP"] = "0"
+        # 闲置 worker 的自动释放也默认关（upkeep 里那一步、手动的 release --idle）。测它的用例（test_release.py）自己打开。
         env["DROVER_IDLE_RELEASE"] = "0"
         # heavy 放行看的整机实测 CPU 换成这个文件里写的核数（默认 0，机器空着）：自测不能跟着本机真实负载变（别的 worker
         # 在跑全量时整机常年忙 6～9 核）。测"整机满了"的用例用 set_cpu_busy 改它。

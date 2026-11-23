@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import unittest
 
-from selftest_screens import (BASH_DIALOG, IDLE_AFTER_START, TRUST_ADD_DIR, TRUST_ADD_DIR_YES, TRUST_FOLDER_LEGACY,
-                              TRUST_MOVE_DIR)
+from selftest_screens import (BASH_DIALOG, CODEX_UPDATE, IDLE_AFTER_START, TRUST_ADD_DIR, TRUST_ADD_DIR_YES,
+                              TRUST_FOLDER_LEGACY, TRUST_MOVE_DIR)
 from selftest_support import DroverTestCase, patch_clock
 
 # 光标在 "No, exit"：down 移到 "Yes, add it"，接着 enter 进入空闲输入框；直接 enter（选了 No, exit）agent 退出。
@@ -50,15 +50,30 @@ class StartupDialogTests(DroverTestCase):
 
     def test_dialog_table(self) -> None:
         """弹窗表：新信任框认成 trust_add_dir（问句在窄 pane 里折行也认），旧信任框 trust_folder；Bash 确认框、
-        同一组件的 "Moving to a new directory:"（问句一样、标题不同）不认"""
+        同一组件的 "Moving to a new directory:"（问句一样、标题不同）、codex 的升级框不认"""
         def label(screen: str):
             return next((name for pattern, _, name in self.d.STARTUP_DIALOGS if pattern.search(screen)), None)
 
         wrapped = TRUST_ADD_DIR.replace("hasn't worked here before", "hasn't worked\n here before")
         self.assertNotEqual(wrapped, TRUST_ADD_DIR)
         self.assertEqual([label(s) for s in (TRUST_ADD_DIR, TRUST_ADD_DIR_YES, wrapped, TRUST_FOLDER_LEGACY,
-                                             BASH_DIALOG, TRUST_MOVE_DIR)],
-                         ["trust_add_dir", "trust_add_dir", "trust_add_dir", "trust_folder", None, None])
+                                             BASH_DIALOG, TRUST_MOVE_DIR, CODEX_UPDATE)],
+                         ["trust_add_dir", "trust_add_dir", "trust_add_dir", "trust_folder", None, None, None])
+
+    def test_codex_update_check_off(self) -> None:
+        """drover 起 codex 带 -c check_for_update_on_startup=false（worker、编排者；复审和续上用同一份参数，见 test_model、
+        test_release）：有新版本时 codex 不弹升级框。万一还是弹了（以后的 codex 不认这个键），当成认不出的界面交给编排者，
+        不按任何键（升级是全局 npm install -g，由用户决定）"""
+        flag = ["-c", "check_for_update_on_startup=false"]
+        self.starting(cx={"status": "idle", "agent": "codex", "screen": "› Ask Codex to do anything"})
+        self.run_command("agent-start", "--name", "cx", "--kind", "codex", "--slug", "s1", "--pane", "w1:p1")
+        args = self.herdr_state()["agents"]["cx"]["args"]
+        self.assertIn(flag, [args[i:i + 2] for i in range(len(args) - 1)])
+        self.starting(up={"status": "blocked", "agent": "codex", "screen": CODEX_UPDATE})
+        out = self.run_command("agent-start", "--name", "up", "--kind", "codex", "--slug", "s1", "--pane", "w1:p2")
+        self.assertEqual(self.outcome(out), (False, "blocked", []))
+        self.assertIn("不认识的界面", out["error"])
+        self.assertEqual(self.keys_sent("up"), [])
 
     def test_add_dir_trust_agent_start(self) -> None:
         """agent-start：claude 带 --add-dir 起来停在 "Adding a new directory" 信任框（真实样本）→ 先 down 把光标从

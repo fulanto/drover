@@ -39,13 +39,33 @@ herdr integration install claude    # 不是 current 就重装（codex 同理）
 
 重装 hook 后，已经在跑的 agent 重启一下最稳妥。
 
+## herdr 重启后 agent 参数不对
+
+herdr 重启后拉回的编排者、worker 换了模型 / effort、少了附加目录、codex 沙箱变只读，或者续回了 `/clear` 之前的旧会话：herdr 用的是它自己拼的裸续命令（只有会话 ID），没用 drover 报的完整续命令。drover 起的 agent 起好就报，会话变了由后台维护每分钟重报（[herdr 重启后按原参数拉回](reference.md#herdr-重启后按原参数拉回)）。查：
+
+```bash
+~/.drover/bin/drover upkeep                       # 手动同步一次：resume_sync 的 reported 是这次补报的，failed 里有报不上的原因
+herdr integration status                          # claude、codex 要是 current：会话 ID 是这个 hook 报的，没有会话 ID 就没法报
+```
+
+- worker 记录（`~/.drover/<slug>/<agent>.agent.json`）或 `orch.json` 的 `resume_reported_session` 和 `herdr agent get <名>` 的 `agent_session` 一样，才算报过当前会话。
+- 编排者起来以后改了 config 的 `claude_model` / `claude_effort` / `codex_effort`：它报的续命令按新默认补，重启后按新的回来（按设计）。
+- 你在 pane 里自己退出又手动续了同一个会话：herdr 清掉了报过的续命令，drover 看不出来（会话 ID 没变）。用 `drover agent-start --resume` 续，或者等它下一次换会话。
+- claude 起好或 `/clear` 之后还没对过话就重启：`--resume` 一个空会话会报 "No conversation found" 退出（herdr 自己的裸续也一样），`watch` 报 `gone`，按 `gone` 重起。
+- codex 起好以后、发出第一句话之前就重启：herdr 那时还没有它的会话 ID，pane 只回到 shell；用 `drover agent-start --resume`（加上原来的参数）续。
+- 拉回来的 claude 停在 "Adding a new directory" 信任框上（herdr 报 `blocked`）：它问的是 `--add-dir` 加进来的任务状态目录（worker 是 `~/.drover/<slug>`，编排者是 `~/.drover`），这个框的信任只管一个进程，续同一个会话也要重新批。后台维护（`upkeep`）会自动批：只认 drover 起的 claude、只认这个框、只认 drover 给它加的目录，光标移到 "Yes, add it" 再回车，`~/.drover/upkeep.log` 里有一行"upkeep：批了 <名>…"。多久放行：
+  - 重启后最早触发后台维护的是主会话的 SessionStart hook：主会话被 herdr 拉回、会话一开始，hook 跑 `main-register --hook`，它在后台起一次 `upkeep`。前提是主会话是装了 drover hook 的 Claude Code（install.py 装的）、开在主工作台、在 Herdr 里，而且离上一次后台维护满 60 秒（重启前那次一般早就过了）。Codex 主会话没有这个 hook，要等它下一条消息跑看板 / main-register。主会话这条路是读代码确认的，没在真实重启里测过（测试会话里没有主会话）。
+  - 那一次只批到当时已经停在框上的。herdr 按 workspace / tab 的顺序每隔 100 毫秒拉起一个 agent（herdr 配置 `session.startup_per_agent_delay_ms`，默认 100），实测一个 claude worker 拉回后约 4.6 秒停到框上，后台维护起来后约 2 秒批完、回到 idle。比主会话晚停到框上的，要等下一次后台维护：满 60 秒以后，而且得有 `watch`、看板或 `main-register` 在跑（重启后通常是你给主会话发下一条消息、它重新挂上 `watch --main` 或跑看板的时候）。
+  - 等不及就手动跑一次 `~/.drover/bin/drover upkeep`。自己批也行：读屏确认是这个框，按 ↓ 移到 "Yes, add it" 再回车；直接回车或按 Esc 会让 claude 退出（退出了就用 `agent-start --resume` 加原来的参数续）。
+- 主会话（你自己起的）drover 不管，参数按你起的时候的。
+
 ## codex 编排者 / 主会话连不上 Herdr
 
 报 `Operation not permitted`：跑在 `workspace-write` 沙箱里了，见[Codex 注意事项](usage.md#codex-注意事项)。Codex 编排者（主会话是 Codex 时默认就是，或者写了 `--orch codex`）由 `orch-start` 起，会自动带 `danger-full-access`；主会话要你自己用 `codex -s danger-full-access` 启动。`python3 install.py --check` 也会提示 `sandbox_mode`。
 
 ## 启动卡在信任 / MCP 弹窗
 
-- worker 在新 worktree 里启动时的信任弹窗、Claude Code 对 `--add-dir` 加进来的目录（任务状态目录）弹的 "Adding a new directory" 信任框、codex 的升级提示，`agent-start` 和 `orch-start` 会自动处理（信任弹窗会把光标移到"Yes"再确认：Claude Code 的默认选项是"No, exit"，直接回车 agent 就退出了）。
+- worker 在新 worktree 里启动时的信任弹窗、Claude Code 对 `--add-dir` 加进来的目录（任务状态目录）弹的 "Adding a new directory" 信任框，`agent-start` 和 `orch-start` 会自动处理（信任弹窗会把光标移到"Yes"再确认：Claude Code 的默认选项是"No, exit"，直接回车 agent 就退出了）。codex 的升级提示不会弹：drover 起 codex 都带 `-c check_for_update_on_startup=false`；要是还弹了（新版 codex 不认这个键），agent 停在 `blocked`，按 Esc 跳过，升级你自己决定。
 - 其他弹窗（比如 MCP server 的批准）会让 agent 停在 `blocked`：worker 的由编排者看屏幕后处理，编排者的由主会话处理，破坏性的才问你。
 - 编排者的工作目录就是主工作台：**先在主工作台里手动开一次 claude / codex，把信任和 MCP 弹窗点掉**，之后起编排者就不会卡在这里。
 - 实在卡住了：`herdr agent focus <名字>` 过去手动选。

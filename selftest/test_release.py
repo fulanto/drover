@@ -1,5 +1,5 @@
-"""释放空闲的 worker：drover release（手动）、release --idle（闲置扫描）和它的 tick、prompt / brief --send 自动续上、
-watch 的 released、agent-start 记的 worker 记录。
+"""释放空闲的 worker：drover release（手动）、release --idle（闲置扫描）和后台维护（upkeep）的 tick、prompt / brief --send
+自动续上、watch 的 released、agent-start 记的 worker 记录；给 herdr 报续命令（起好就报、续上再报、upkeep 同步会话的变化）。
 
 herdr 是假的（selftest_fakes）。worker 背后是用例自己起的真进程组（组长加一个子进程，像 agent 和它的 MCP 子进程；经一个
 立刻退出的 launcher 起，父进程是 launchd：被杀以后马上被回收，不留僵尸——僵尸还算"进程组活着"）。假 herdr 里的 agent 记着
@@ -22,7 +22,7 @@ import threading
 import time
 import unittest
 
-from selftest_screens import BASH_NAMED, IDLE_AFTER_START
+from selftest_screens import BASH_NAMED, IDLE_AFTER_START, TRUST_ADD_DIR, TRUST_ADD_DIR_YES, TRUST_MOVE_DIR
 from selftest_support import DROVER, DroverTestCase, FakeClock, events, run_cli, wait_for
 
 MINUTE = 60
@@ -175,6 +175,14 @@ class ReleaseCase(DroverTestCase):
         self.addCleanup(fh.close)
         return fh
 
+    def write_orch(self, slug: str, **meta) -> dict:
+        """这版之前的 orch-start 写的 orch.json（没有报过的会话 ID）。"""
+        full = {"slug": slug, "default_kind": "claude", "parent": None, "model": None, "effort": None,
+                "started": "11-22 10:00", **meta}
+        (self.state / slug).mkdir(exist_ok=True)
+        (self.state / slug / "orch.json").write_text(json.dumps(full))
+        return full
+
 
 # ---------------------------------------------------------------- agent-start 记的 worker 记录
 
@@ -182,7 +190,7 @@ class ReleaseCase(DroverTestCase):
 class WorkerRecordTests(ReleaseCase):
     def test_agent_start_writes_record(self) -> None:
         """agent-start 起好以后写 <slug>/<名>.agent.json：宿主、补完默认值的 model / effort、--add-dir、pane、herdr 报的
-        工作目录和会话 ID、state running；返回里带 record 路径"""
+        工作目录和会话 ID、state running、报给 herdr 续命令时用的会话 ID；返回里带 record 路径"""
         extra = self.tmp / "other-wt"
         spec = self.starting("w1")
         out = self.cli("agent-start", "--name", "w1", "--kind", "claude", "--slug", "s1", "--pane", "w1:p1",
@@ -192,7 +200,7 @@ class WorkerRecordTests(ReleaseCase):
         self.assertGreater(rec.pop("started_at"), 0)
         self.assertEqual(rec, {"name": "w1", "slug": "s1", "kind": "claude", "model": "sonnet", "effort": "xhigh",
                                "add_dirs": [str(extra)], "pane_id": "w1:p1", "cwd": spec["cwd"],
-                               "session_id": "sess-1", "state": "running"})
+                               "session_id": "sess-1", "state": "running", "resume_reported_session": "sess-1"})
 
     def test_stuck_start_still_recorded(self) -> None:
         """卡在不认识的启动弹窗上（ok 是 false，agent 还活着）也写记录：编排者处理完它照常干活，之后要能被释放"""
@@ -649,16 +657,17 @@ class IdleScanTests(IdleCase):
         self.assertEqual(self.scan(after=1)["idle_minutes"], {})
 
     def test_configured_minutes_and_off(self) -> None:
-        """worker_idle_release_minutes 改 N；0 是关，环境变量 DROVER_IDLE_RELEASE=0 也是关：扫描什么都不做、tick 不起进程"""
+        """worker_idle_release_minutes 改 N；0 是关，环境变量 DROVER_IDLE_RELEASE=0 也是关：扫描什么都不做（后台维护的 tick
+        照样起，见 UpkeepTickTests：续命令同步不看这两个）"""
         spec = self.start_worker("w1")
         self.d.CONFIG["worker_idle_release_minutes"] = 3
         self.scan()
         self.assertEqual(self.scan(after=2)["released"], [])
         self.d.CONFIG["worker_idle_release_minutes"] = 0
-        self.assertEqual((self.scan(after=60).get("off"), self.d.idle_release_tick()), (True, "off"))
+        self.assertTrue(self.scan(after=60).get("off"))
         self.d.CONFIG["worker_idle_release_minutes"] = 3
         os.environ["DROVER_IDLE_RELEASE"] = "0"
-        self.assertEqual((self.scan(after=60).get("off"), self.d.idle_release_tick()), (True, "off"))
+        self.assertTrue(self.scan(after=60).get("off"))
         self.assertTrue(group_alive(spec["pgid"]))
         os.environ["DROVER_IDLE_RELEASE"] = "1"
         self.assertEqual(self.released_names(self.scan()), ["w1"])
@@ -738,62 +747,77 @@ class IdleScanTests(IdleCase):
         self.assertTrue(group_alive(spec["pgid"]))
 
 
-class IdleTickTests(IdleCase):
+class UpkeepTickTests(IdleCase):
     def setUp(self) -> None:
         super().setUp()
+        os.environ["DROVER_UPKEEP"] = "1"
         self.marker = self.tmp / "scan-ran.json"
         fake = self.tmp / "fake_scan.py"
         fake.write_text(FAKE_SCAN)
-        self.d.IDLE_RELEASE_ARGV = [sys.executable, str(fake), str(self.marker)]
-        self.log = self.state / "idle-release.log"
+        self.d.UPKEEP_ARGV = [sys.executable, str(fake), str(self.marker)]
+        self.log = self.state / "upkeep.log"
 
     def wait_scan(self) -> dict:
-        self.assertTrue(wait_for(self.marker.exists, timeout=15), "后台扫描没跑起来")
+        self.assertTrue(wait_for(self.marker.exists, timeout=15), "后台维护没跑起来")
         info = json.loads(self.marker.read_text())
         self.marker.unlink()
         return info
 
-    def test_tick_spawns_scan_once_a_minute(self) -> None:
-        """tick 到点了在后台起扫描（新会话，不等它）、输出进 idle-release.log；一分钟里再调不起；满一分钟再起"""
-        self.assertEqual(self.d.idle_release_tick(), "started")
+    def test_tick_spawns_upkeep_once_a_minute(self) -> None:
+        """tick 到点了在后台起 upkeep（新会话，不等它）、输出进 upkeep.log、上次起的时间记在 locks/upkeep-tick.json；
+        一分钟里再调不起；满一分钟再起"""
+        self.assertEqual(self.d.upkeep_tick(), "started")
         self.assertNotEqual(self.wait_scan()["sid"], os.getsid(0))
         self.assertTrue(wait_for(lambda: "fake scan ran" in self.log.read_text(), timeout=5))
+        self.assertTrue((self.state / "locks" / "upkeep-tick.json").exists())
         self.clock.sleep(59)
-        self.assertEqual(self.d.idle_release_tick(), "not_due")
+        self.assertEqual(self.d.upkeep_tick(), "not_due")
         self.clock.sleep(2)
-        self.assertEqual(self.d.idle_release_tick(), "started")
+        self.assertEqual(self.d.upkeep_tick(), "started")
         self.wait_scan()
 
+    def test_tick_ignores_idle_release_switch(self) -> None:
+        """续命令同步不看闲置释放开没开：worker_idle_release_minutes 是 0、DROVER_IDLE_RELEASE=0 时 tick 照样起 upkeep；
+        只有 DROVER_UPKEEP=0 关掉整个后台维护"""
+        self.d.CONFIG["worker_idle_release_minutes"] = 0
+        os.environ["DROVER_IDLE_RELEASE"] = "0"
+        self.assertEqual(self.d.upkeep_tick(), "started")
+        self.wait_scan()
+        self.clock.sleep(61)
+        os.environ["DROVER_UPKEEP"] = "0"
+        self.assertEqual(self.d.upkeep_tick(), "off")
+        self.assertFalse(wait_for(self.marker.exists, timeout=0.5))
+
     def test_log_is_capped(self) -> None:
-        """后台扫描的日志超过上限，下次起扫描时先清空（不会无限长）"""
+        """后台维护的日志超过上限，下次起它时先清空（不会无限长）"""
         self.log.write_text("x" * (self.d.BACKGROUND_LOG_MAX + 1))
-        self.assertEqual(self.d.idle_release_tick(), "started")
+        self.assertEqual(self.d.upkeep_tick(), "started")
         self.wait_scan()
         self.assertTrue(wait_for(lambda: "fake scan ran" in self.log.read_text(), timeout=5))
         self.assertLess(self.log.stat().st_size, 1000)
 
     def test_tick_callers(self) -> None:
-        """源码里调 idle_release_tick() 的：普通 watch 的每一轮，加上调自动更新 tick 的那四处（watch --main、board 文本 /
+        """源码里调 upkeep_tick() 的：普通 watch 的每一轮，加上调自动更新 tick 的那四处（watch --main、board 文本 /
         --json / --live、main-register）"""
         callers, current = set(), None
         for line in DROVER.read_text().splitlines():
             m = re.match(r"def (\w+)\(", line)
             if m:
                 current = m.group(1)
-            elif "idle_release_tick()" in line and not line.lstrip().startswith("#"):
+            elif "upkeep_tick()" in line and not line.lstrip().startswith("#"):
                 callers.add(current)
         self.assertEqual(callers, {"cmd_watch", "main_session_seen", "watch_main", "board_live", "cmd_board"})
 
 
 class IdleEndToEndTests(ReleaseCase):
     def test_watch_tick_runs_real_scan(self) -> None:
-        """整条路（真进程）：普通 watch 的 tick → 后台起这份 drover 的 release --idle → 第一遍记下开始空闲的时间，
+        """整条路（真进程）：普通 watch 的 tick → 后台起这份 drover 的 upkeep → 第一遍记下开始空闲的时间，
         下一次 tick 的那一遍把空闲满了的放掉（release_reason idle）；之后 watch 显示 released"""
         spec = self.start_worker("w1")
         config = json.loads((self.state / "config.json").read_text())
         (self.state / "config.json").write_text(json.dumps({**config, "worker_idle_release_minutes": 0.001}))
-        env = {"DROVER_IDLE_RELEASE": "1"}
-        idle_file, tick_file = self.state / "idle-release.json", self.state / "locks" / "idle-release-tick.json"
+        env = {"DROVER_IDLE_RELEASE": "1", "DROVER_UPKEEP": "1"}
+        idle_file, tick_file = self.state / "idle-release.json", self.state / "locks" / "upkeep-tick.json"
         self.drover("watch", "--once", "w1", env=env)
         self.assertTrue(wait_for(idle_file.exists, timeout=20), "第一遍扫描没记下候选")
         self.assertIn("w1", json.loads(idle_file.read_text())["agents"])
@@ -889,6 +913,305 @@ class WatchTests(ReleaseCase):
         few, many = self.watch_calls(names[:2]), self.watch_calls(names)
         self.assertEqual(few, {"agent list": 10, "pane list": 10})
         self.assertEqual(many, few)
+
+
+# ---------------------------------------------------------------- 给 herdr 报续命令（herdr 重启后按原参数拉回）
+
+
+class ResumeReportTests(ReleaseCase):
+    def reports(self) -> list:
+        """假 herdr 收到的每一次 pane report-agent-session（收没收都记）。"""
+        return self.herdr_state().get("resume_reports", [])
+
+    def stored(self, name: str = "w1"):
+        """herdr 现在为这个 agent 存着的续命令（假 herdr 收下的；agent 不在了是 None）。"""
+        return (self.herdr_state()["agents"].get(name) or {}).get("resume_argv")
+
+    def launched(self, name: str = "w1") -> list:
+        """herdr agent start 最近一次交给宿主的参数（-- 后面的）。"""
+        return self.herdr_state()["agents"][name]["args"]
+
+    def agent_start(self, name: str, kind: str = "claude", pane: str = "w1:p1", *args: str) -> dict:
+        return self.cli("agent-start", "--name", name, "--kind", kind, "--slug", "s1", "--pane", pane, *args)
+
+    def upkeep(self) -> dict:
+        return self.cli("upkeep")
+
+    def test_start_reports_launch_args_and_session(self) -> None:
+        """agent-start 起好就把续命令报给 herdr：起它用的参数加上续 herdr 报的会话（claude <参数> --resume <id>），source /
+        agent 是 herdr:claude / claude，seq 是纳秒时间戳（调用前后的 time_ns 之间）；herdr 收下了，返回和 worker 记录里都记着"""
+        self.starting("w1")
+        before = self.clock.time_ns()
+        out = self.agent_start("w1", "claude", "w1:p1", "--model", "sonnet")
+        after = self.clock.time_ns()
+        want = ["claude", *self.launched(), "--resume", "sess-1"]
+        self.assertIn("sonnet", want)
+        self.assertEqual(out["herdr_resume"], {"reported": True, "session_id": "sess-1", "argv": want})
+        [report] = self.reports()
+        self.assertEqual({k: report[k] for k in ("pane", "source", "agent", "session", "argv", "applied")},
+                         {"pane": "w1:p1", "source": "herdr:claude", "agent": "claude", "session": "sess-1",
+                          "argv": want, "applied": True})
+        self.assertTrue(before <= report["seq"] <= after, (before, report["seq"], after))
+        self.assertEqual(self.stored(), want)
+        self.assertEqual(self.record()["resume_reported_session"], "sess-1")
+
+    def test_resume_flag_reports_again(self) -> None:
+        """worker 自己退出了（herdr 随进程清掉了续命令），agent-start --resume 在原 pane 续上：起好再报一次，续命令就是这次
+        起它的那条（--resume 不重复）"""
+        spec = self.start_worker("w1")
+        kill_group(spec["pgid"])
+        self.assertTrue(wait_for(lambda: not group_alive(spec["pgid"]), timeout=5))
+        self.starting("w1", session="sess-1")
+        out = self.cli("agent-start", "--name", "w1", "--slug", "s1", "--pane", "w1:p1", "--resume")
+        launched = self.launched()
+        self.assertEqual(launched[-2:], ["--resume", "sess-1"])
+        self.assertEqual(out["herdr_resume"]["argv"], ["claude", *launched])
+        self.assertEqual(self.stored(), ["claude", *launched])
+        self.assertEqual(len(self.reports()), 2)
+        self.assertEqual(self.record()["resume_reported_session"], "sess-1")
+
+    def test_resume_after_release_reports_again(self) -> None:
+        """释放：进程退了 herdr 就清掉续命令，记录里报过的会话 ID 跟着删掉；发话续上以后起好再报（claude 当场就有会话 ID）"""
+        self.released_worker("w1")
+        self.assertNotIn("resume_reported_session", self.record())
+        self.assertNotIn("w1", self.herdr_state()["agents"])
+        self.starting("w1", session="sess-1")
+        out = self.cli("prompt", "--name", "w1", "--text", "接着做")
+        want = ["claude", *self.launched()]
+        self.assertEqual(want[-2:], ["--resume", "sess-1"])
+        self.assertEqual((out["resumed"], out["herdr_resume"]),
+                         (True, {"reported": True, "session_id": "sess-1", "argv": want}))
+        self.assertEqual(self.stored(), want)
+        self.assertEqual(self.record()["resume_reported_session"], "sess-1")
+
+    def test_codex_reported_once_herdr_has_session(self) -> None:
+        """codex 第一轮对话之后 herdr 才有会话 ID：起好时不报（返回里写原因）；后台维护（upkeep）看到 herdr 有了就补报
+        codex resume <id> <参数>（带关升级检查的开关）、记下；会话没变再跑不重报"""
+        self.starting("w1", kind="codex", session="")
+        out = self.agent_start("w1", "codex")
+        self.assertFalse(out["herdr_resume"]["reported"])
+        self.assertIn("会话 ID", out["herdr_resume"]["reason"])
+        self.assertNotIn("resume_reported_session", self.record())
+        self.assertEqual(self.upkeep()["resume_sync"]["reported"], [])
+        self.assertEqual(self.reports(), [])
+        self.set_agent("w1", session="cx-1")
+        sync = self.upkeep()["resume_sync"]
+        want = ["codex", "resume", "cx-1", *self.launched()]
+        self.assertEqual(sync["reported"], [{"name": "w1", "session_id": "cx-1", "argv": want}])
+        self.assertIn("check_for_update_on_startup=false", want)
+        self.assertEqual(self.stored(), want)
+        self.assertEqual(self.record()["resume_reported_session"], "cx-1")
+        self.assertEqual(self.upkeep()["resume_sync"]["reported"], [])
+        self.assertEqual(len(self.reports()), 1)
+
+    def test_changed_session_reported_again(self) -> None:
+        """claude /clear 以后 herdr 的会话换了（herdr 不会跟着改报过的续命令，不重报的话重启会续回旧会话）：upkeep 重报
+        新会话的续命令、改记录；会话没变的不重报"""
+        self.start_worker("w1")
+        self.assertEqual(self.upkeep()["resume_sync"]["reported"], [])
+        self.set_agent("w1", session="sess-2")
+        self.clock.sleep(1)
+        sync = self.upkeep()["resume_sync"]
+        self.assertEqual([(r["name"], r["session_id"]) for r in sync["reported"]], [("w1", "sess-2")])
+        self.assertEqual(self.stored()[-2:], ["--resume", "sess-2"])
+        self.assertEqual(self.record()["resume_reported_session"], "sess-2")
+        self.assertEqual(len(self.reports()), 2)
+
+    def test_sync_runs_with_idle_release_off(self) -> None:
+        """闲置释放关着（worker_idle_release_minutes 是 0，或 DROVER_IDLE_RELEASE=0）时 upkeep 照样同步续命令"""
+        self.starting("w1", kind="codex", session="")
+        self.agent_start("w1", "codex")
+        for minutes, switch in ((0, "1"), (10, "0")):
+            self.d.CONFIG["worker_idle_release_minutes"] = minutes
+            os.environ["DROVER_IDLE_RELEASE"] = switch
+            self.set_agent("w1", session=f"cx-{minutes}")
+            self.clock.sleep(1)
+            out = self.upkeep()
+            self.assertTrue(out["idle_release"].get("off"))
+            self.assertEqual([r["session_id"] for r in out["resume_sync"]["reported"]], [f"cx-{minutes}"])
+
+    def test_report_failure_does_not_fail_start(self) -> None:
+        """报失败不影响启动：herdr 报错（注入 server_unavailable）、续命令不合格（--add-dir 带单引号，herdr 报
+        invalid_resume_argv）时 agent-start 照样 ok、记录照写，herdr_resume 写原因、记录里没有报过的会话 ID；upkeep 下次再试：
+        报得上的补上，报不上的进 failed 写原因"""
+        self.set_state(fail={"pane report-agent-session": {"code": "server_unavailable", "message": "boom"}})
+        self.starting("w1")
+        out = self.agent_start("w1")
+        self.assertEqual((out["ok"], out["herdr_resume"]["reported"]), (True, False))
+        self.assertIn("server_unavailable", out["herdr_resume"]["reason"])
+        self.assertNotIn("resume_reported_session", self.record())
+        self.set_state(fail={})
+        self.starting("w2")
+        out = self.agent_start("w2", "claude", "w1:p2", "--add-dir", str(self.tmp / "it's"))
+        self.assertEqual((out["ok"], out["herdr_resume"]["reported"]), (True, False))
+        self.assertIn("invalid_resume_argv", out["herdr_resume"]["reason"])
+        sync = self.upkeep()["resume_sync"]
+        self.assertEqual(([r["name"] for r in sync["reported"]], [r["name"] for r in sync["failed"]]), (["w1"], ["w2"]))
+        self.assertIn("invalid_resume_argv", sync["failed"][0]["reason"])
+        self.assertEqual(self.record()["resume_reported_session"], "sess-1")
+        self.assertNotIn("resume_reported_session", self.record("w2"))
+
+    def test_orchestrators_reported_by_sync(self) -> None:
+        """编排者（orch.json；这版之前起的也算，没有报过的会话 ID）：herdr 里名字、pane、宿主对得上、有会话 ID 就报，参数按
+        orch.json 和当前 config 重建（同 orch-start）；报上了记进 orch.json，别的字段不动"""
+        self.write_orch("t1", name="orch-t1", kind="claude", pane_id="w9:p2")
+        t2 = self.write_orch("t2", name="orch-t2", kind="codex", pane_id="w9:p3", model="gpt-x", effort="low")
+        self.set_agents(**{"orch-t1": {"status": "idle", "agent": "claude", "pane_id": "w9:p2", "session": "o-1"},
+                           "orch-t2": {"status": "working", "agent": "codex", "pane_id": "w9:p3", "session": "o-2"}})
+        sync = self.upkeep()["resume_sync"]
+        self.assertEqual(sorted(r["name"] for r in sync["reported"]), ["orch-t1", "orch-t2"])
+        self.assertEqual(self.stored("orch-t1"), ["claude", "--model", "opus[1m]", "--effort", "xhigh", "--permission-mode",
+                                                  "acceptEdits", "--name", "orch-t1", "--add-dir", str(self.state),
+                                                  "--resume", "o-1"])
+        self.assertEqual(self.stored("orch-t2"), ["codex", "resume", "o-2", "-s", "danger-full-access", "-a", "on-request",
+                                                  "--no-daemon", "--no-alt-screen", "-c", "check_for_update_on_startup=false",
+                                                  "-m", "gpt-x", "-c", "model_reasoning_effort=low"])
+        self.assertEqual(json.loads((self.state / "t2" / "orch.json").read_text()),
+                         {**t2, "resume_reported_session": "o-2"})
+        self.assertEqual(self.upkeep()["resume_sync"]["reported"], [])
+
+    def test_sync_only_drover_agents_in_their_pane(self) -> None:
+        """只报 drover 起的、herdr 里名字和记录的 pane、宿主都对得上的：pane 对不上的（名字被别的 pane 里的 agent 占了）、
+        没有记录的（自己开的、复审）不报；正在发话 / 释放（锁被拿着）的这一轮跳过（busy），下一轮补上"""
+        for name, pane in (("w1", "w1:p1"), ("w2", "w1:p2")):
+            self.starting(name, kind="codex", session="")
+            self.agent_start(name, "codex", pane)
+        self.set_agent("w1", session="cx-1", pane_id="w7:p7")
+        self.set_agent("w2", session="cx-2")
+        state = self.herdr_state()
+        state["agents"]["mine"] = {"status": "idle", "agent": "claude", "pane_id": "w8:p1", "session": "m-1"}
+        self.set_herdr_state(state)
+        lock = self.hold_lock("agent-w2.lock")
+        sync = self.upkeep()["resume_sync"]
+        self.assertEqual((sync["reported"], sync["busy"]), ([], ["w2"]))
+        lock.close()
+        sync = self.upkeep()["resume_sync"]
+        self.assertEqual(([r["name"] for r in sync["reported"]], sync["busy"]), (["w2"], []))
+        self.assertEqual([r["pane"] for r in self.reports()], ["w1:p2"])
+
+    def test_rewritten_file_not_clobbered(self) -> None:
+        """报的同时 orch.json 被整份重写了（换了编排者）：不把旧的那份连同报过的会话 ID 写回去，新的那份原样留着"""
+        self.write_orch("t1", name="orch-t1", kind="claude", pane_id="w9:p2")
+        self.set_agents(**{"orch-t1": {"status": "idle", "agent": "claude", "pane_id": "w9:p2", "session": "o-1"}})
+        new = {"slug": "t1", "name": "orch-t1b", "kind": "claude", "pane_id": "w9:p7", "started": "11-23 09:00"}
+        real = self.d.report_resume
+
+        def report_while_replaced(*args):
+            (self.state / "t1" / "orch.json").write_text(json.dumps(new))
+            return real(*args)
+
+        self.d.report_resume = report_while_replaced
+        self.upkeep()
+        self.assertEqual(json.loads((self.state / "t1" / "orch.json").read_text()), new)
+
+
+# ---------------------------------------------------------------- herdr 拉回的 claude 停在信任框上：后台维护顺带批
+
+
+def trust_screen(shown: str, yes: bool = False) -> str:
+    """"Adding a new directory" 信任框（真实样本 TRUST_ADD_DIR），问的目录换成 shown（窄 pane 里折了行的写成 "a\\n b"）；
+    yes 是按过一次 down、光标在 "Yes, add it" 的样子。"""
+    return (TRUST_ADD_DIR_YES if yes else TRUST_ADD_DIR).replace(" /Users/me/.drover/demo\n", f" {shown}\n")
+
+
+class TrustDialogTests(ReleaseCase):
+    def blocked_on(self, name: str, *dialogs: str) -> None:
+        """让 agent（herdr 报 blocked）停在一串信任框上，dialogs 是每个框上显示的目录：按 down 光标移到 "Yes, add it"，再按
+        enter 换成下一个框，最后一个批完回到空闲输入框。按别的键（esc、enter 落在 "No, exit"）屏幕不变、不会被当成批过。"""
+        keys: list = []
+        on_keys: dict = {}
+        for i, shown in enumerate(dialogs):
+            keys.append("down")
+            on_keys[" ".join(keys)] = {"screen": trust_screen(shown, yes=True)}
+            keys.append("enter")
+            on_keys[" ".join(keys)] = ({"screen": trust_screen(dialogs[i + 1])} if i + 1 < len(dialogs)
+                                       else {"status": "idle", "screen": IDLE_AFTER_START})
+        self.set_agent(name, status="blocked", screen=trust_screen(dialogs[0]), keys=[], on_keys=on_keys)
+
+    def keys_sent(self, name: str = "w1") -> list:
+        return self.herdr_state()["agents"][name].get("keys", [])
+
+    def trust(self) -> dict:
+        return self.cli("upkeep")["trust_dialogs"]
+
+    def test_approves_dirs_drover_added(self) -> None:
+        """drover 起的 claude worker 被 herdr 拉回、停在信任框上：先问 ~/.drover/<slug>，再问 agent-start --add-dir 给的目录（窄
+        pane 里折了行）→ 逐个 down 移到 "Yes, add it" 再 enter，回到空闲；不发 esc。返回批了的目录，stderr（后台跑时是
+        upkeep.log）写一行"""
+        extra = str(self.tmp / "another-worktree-with-a-long-name")
+        self.start_worker("w1", args=("--add-dir", extra))
+        self.blocked_on("w1", str(self.state / "s1"), extra[:25] + "\n " + extra[25:])
+        code, out, err = run_cli(self.d, "upkeep")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["trust_dialogs"],
+                         {"approved": [{"name": "w1", "pane": "w1:p1", "dirs": [str(self.state / "s1"), extra]}], "busy": []})
+        self.assertEqual(self.keys_sent(), ["down", "enter", "down", "enter"])
+        self.assertEqual(self.herdr_state()["agents"]["w1"]["status"], "idle")
+        self.assertIn("批了 w1（pane w1:p1）的 \"Adding a new directory\" 信任框", err)
+
+    def test_orchestrator_only_its_own_dir(self) -> None:
+        """编排者（orch.json 对得上名字、pane、宿主）停在问 ~/.drover 的框上照样批；问 ~/.drover/<slug> 的不碰（那不是编排者
+        --add-dir 加的）"""
+        self.write_orch("t1", name="orch-t1", kind="claude", pane_id="w9:p2")
+        self.write_orch("t2", name="orch-t2", kind="claude", pane_id="w9:p3")
+        self.set_agents(**{name: {"agent": "claude", "pane_id": pane, "session": f"o-{name}"}
+                           for name, pane in (("orch-t1", "w9:p2"), ("orch-t2", "w9:p3"))})
+        self.blocked_on("orch-t1", str(self.state))
+        self.blocked_on("orch-t2", str(self.state / "t2"))
+        self.assertEqual(self.trust(), {"approved": [{"name": "orch-t1", "pane": "w9:p2", "dirs": [str(self.state)]}],
+                                        "busy": []})
+        self.assertEqual((self.keys_sent("orch-t1"), self.keys_sent("orch-t2")), (["down", "enter"], []))
+
+    def test_leaves_everything_else_alone(self) -> None:
+        """不碰（不按任何键）：问的目录不是 drover 给它加的（/etc）、不是这个框（Bash 确认框、标题是 "Moving to a new directory:"
+        的同类框）、不是 drover 起的 agent（没有记录）、codex（屏幕上就算有这个框的字）、herdr 没报 blocked 的"""
+        for i, kind in enumerate(("claude", "claude", "claude", "codex", "claude"), 1):
+            self.start_worker(f"w{i}", f"w1:p{i}", kind=kind)
+        self.blocked_on("w1", "/etc")
+        self.set_agent("w2", status="blocked", screen=BASH_NAMED, keys=[])
+        self.set_agent("w3", status="blocked", screen=TRUST_MOVE_DIR, keys=[])
+        self.blocked_on("w4", str(self.state / "s1"))
+        self.blocked_on("w5", str(self.state / "s1"))
+        self.set_agent("w5", status="idle")
+        state = self.herdr_state()
+        state["agents"]["mine"] = {"status": "blocked", "agent": "claude", "pane_id": "w8:p1",
+                                   "screen": trust_screen(str(self.state / "s1"))}
+        self.set_herdr_state(state)
+        self.assertEqual(self.trust(), {"approved": [], "busy": []})
+        self.assertEqual({name: self.keys_sent(name) for name in ("w1", "w2", "w3", "w4", "w5", "mine")},
+                         dict.fromkeys(("w1", "w2", "w3", "w4", "w5", "mine"), []))
+
+    def test_busy_agent_skipped(self) -> None:
+        """正在给它发话、释放、起它（锁被拿着）：这一轮跳过、不按键（busy）；锁放开后下一轮批"""
+        self.start_worker("w1")
+        self.blocked_on("w1", str(self.state / "s1"))
+        lock = self.hold_lock("agent-w1.lock")
+        self.assertEqual(self.trust(), {"approved": [], "busy": ["w1"]})
+        self.assertEqual(self.keys_sent(), [])
+        lock.close()
+        self.assertEqual([a["name"] for a in self.trust()["approved"]], ["w1"])
+
+    def test_agent_start_holds_the_lock(self) -> None:
+        """agent-start 起 agent 期间拿着这个名字的锁：后台维护这时拿不到，不和 start_agent 抢着在同一个框上按键（--resume 在原
+        pane 续上时旧记录对得上）；锁被别人拿着时 agent-start 等不到就报错、不起"""
+        seen = []
+        real = self.d.start_agent
+
+        def start_and_probe(*args):
+            with self.d.agent_lock("w1", 0) as got:
+                seen.append(got)
+            return real(*args)
+
+        self.d.start_agent = start_and_probe
+        self.starting("w1")
+        self.cli("agent-start", "--name", "w1", "--kind", "claude", "--slug", "s1", "--pane", "w1:p1")
+        self.assertEqual(seen, [False])
+        self.d.AGENT_LOCK_WAIT = 0.3
+        self.hold_lock("agent-w2.lock")
+        self.starting("w2")
+        out = self.cli("agent-start", "--name", "w2", "--kind", "claude", "--slug", "s1", "--pane", "w1:p2", rc=1)
+        self.assertIn("正在被发话、释放或续上", out["error"])
+        self.assertEqual(self.calls("agent", "start", "w2"), [])
 
 
 if __name__ == "__main__":

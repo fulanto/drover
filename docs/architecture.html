@@ -2213,7 +2213,7 @@ footer.end { margin-top: 64px; font-size: 13px; color: var(--muted); display: fl
         <tr><td>长命令</td><td>Bash 的 <code>run_in_background</code>，完成会通知</td><td>exec_command 启动、write_stdin 轮询，不用 sleep 干等</td></tr>
         <tr><td>沙箱和权限</td><td>acceptEdits + 白名单前缀；cd+git 拦截 hook 兜住没法加白名单的 <code>cd … &amp;&amp; git …</code>；git 联网用不经沙箱的 Bash</td><td>主会话和编排者要 danger-full-access（workspace-write 连不上 herdr 的 unix socket，也写不了 <code>~/.drover</code>）；worker 仍是 workspace-write</td></tr>
         <tr><td>只读搜索子代理</td><td>Explore</td><td>spawn_agent；没有就自己 <code>rg</code> / <code>git grep</code></td></tr>
-        <tr><td>当 worker 时</td><td><code>--permission-mode acceptEdits</code>，effort 默认 xhigh</td><td><code>-a on-request -s workspace-write --no-daemon --no-alt-screen</code>，effort 默认 xhigh（不传会继承你 codex config 里的默认 effort，配的是 ultra 就想得太久）</td></tr>
+        <tr><td>当 worker 时</td><td><code>--permission-mode acceptEdits</code>，effort 默认 xhigh</td><td><code>-a on-request -s workspace-write --no-daemon --no-alt-screen -c check_for_update_on_startup=false</code>，effort 默认 xhigh（不传会继承你 codex config 里的默认 effort，配的是 ultra 就想得太久）</td></tr>
       </tbody>
     </table>
   </div>

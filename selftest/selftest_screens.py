@@ -327,3 +327,18 @@ IDLE_AFTER_START = f"""{RULE_154}
 ❯
 {RULE_154}
   ⏵⏵ accept edits on (shift+tab to cycle)"""
+# codex 0.170.0 有新版本时启动（新起、续上都一样）弹的升级框：真实样本，herdr pane read --source visible 抓的（pane 约 73 列，
+# 链接和安装命令折了行）。drover 起 codex 时带 -c check_for_update_on_startup=false，不再弹它。
+CODEX_UPDATE = """
+  Update available · 0.170.0 → 0.171.0
+  Release notes:
+  https://github.com/openai/codex/releases
+  /latest
+
+› 1. Update now (runs `npm install -g
+     @openai/codex`)
+  2. Skip
+  3. Skip until next version
+
+  enter continue · esc skip
+"""

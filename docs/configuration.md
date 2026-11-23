@@ -25,7 +25,7 @@
 | `auto_update` | [自动更新](auto-update.md)。`false` 时这台机器不自动更新（手动 `drover update` 照常）；环境变量 `DROVER_AUTO_UPDATE=0` 也能关。install 没有对应参数，手动编辑 | 没有这个键 = 开 |
 | `quality_tools` | [验收工具](quality-tools.md) crapper、dryer。`false` 时 install 不装、`--check` 不查，验收时两步都不跑（已经装的不卸）；环境变量 `DROVER_QUALITY_TOOLS=0` 也能关。install 没有对应参数，手动编辑 | 没有这个键 = 开 |
 | `auto_update_minutes` | 自动更新多久查一次（分钟），离上次尝试满这么久才查 | 30 |
-| `worker_idle_release_minutes` | worker 连续空闲多少分钟就自动释放：退出它的 agent 进程（连同 MCP 子进程）腾出内存，pane、worktree、分支都留着，之后给它发话会自动续上（[release](reference.md#release)）。`0` 关掉自动释放（手动 `drover release` 照常）；环境变量 `DROVER_IDLE_RELEASE=0` 也能关。只管 `agent-start` 起的 worker，编排者、复审、主会话不受影响。install 没有对应参数，手动编辑 | 10 |
+| `worker_idle_release_minutes` | worker 连续空闲多少分钟就自动释放：退出它的 agent 进程（连同 MCP 子进程）腾出内存，pane、worktree、分支都留着，之后给它发话会自动续上（[release](reference.md#release)）。`0` 关掉自动释放（手动 `drover release` 照常；后台维护照样每分钟给 herdr 同步续命令，见 [herdr 重启后按原参数拉回](reference.md#herdr-重启后按原参数拉回)）；环境变量 `DROVER_IDLE_RELEASE=0` 也能关。只管 `agent-start` 起的 worker，编排者、复审、主会话不受影响。install 没有对应参数，手动编辑 | 10 |
 | `update_channel` | 更新通道（[自动更新](auto-update.md)）：`release` 只装发布的版本（上游历史上最新的 `vX.Y.Z` tag），`main` 跟上游最新（开发 drover 用）。手动 `update` 和自动更新都按它；写了别的值时 `update` 报错、什么都不改。install 没有对应参数，手动编辑 | `release` |
 | `heavy_cpu_capacity` | heavy 调度的 CPU 容量（核）：几条构建 / 测试合计占用不超过它就同时跑。默认从硬件值起步、按真实命令的表现自动校准（[目录布局](reference.md#目录布局) `locks/heavy/`），一般不用写；写了就固定用它、不再校准（比如机器还要留给别的重活，或者 Linux 容器里 CPU 配额比看到的核数少） | 不写：Apple 芯片从性能核数（`hw.perflevel0.logicalcpu`）、其他从逻辑核数起步，之后自动校准，不超过逻辑核数 |
 | `heavy_calib_slow` / `heavy_calib_fast` / `heavy_calib_down` / `heavy_calib_up` | 容量校准的阈值：同时跑的命令比同一条命令单独跑慢到 `slow` 倍算明显变慢、快于 `fast` 倍算几乎不变慢；连续 `down` 个明显变慢降一核，连续 `up` 个几乎不变慢（负载接近容量时）加一核。`fast` 也是单独跑基准的抖动界线：同一条命令几次单独跑最慢 ÷ 最快超过它，不拿它当基准（同时跑的变慢和它自己的抖动分不开） | 1.5 / 1.2 / 2 / 3 |
@@ -38,7 +38,7 @@
 
 **改了配置要不要重装？**
 
-- 只改 `repo_dirs`：不用重装。drover CLI 每次执行都会重新读配置，下一条命令就生效。可以直接编辑文件，也可以 `python3 install.py --repo-dir <目录> [--repo-dir <目录>]...`：只改这个键，改之前先备份。`auto_update`、`auto_update_minutes`、`update_channel`、`worker_idle_release_minutes`、`heavy_*` 同样下一条命令就生效（已经在跑的 `watch --main`、`board --live`、在排队的 `heavy` 用的是启动时读到的配置，重开后才认）。`claude_model`、`claude_effort`、`codex_effort` 从下一个起的编排者、worker、复审开始用，已经起来的不变；所有任务都跟着换，只想换一个任务的用派发时的 `--model` / `--effort`（任务 `orch.json` 记的优先于 config）。
+- 只改 `repo_dirs`：不用重装。drover CLI 每次执行都会重新读配置，下一条命令就生效。可以直接编辑文件，也可以 `python3 install.py --repo-dir <目录> [--repo-dir <目录>]...`：只改这个键，改之前先备份。`auto_update`、`auto_update_minutes`、`update_channel`、`worker_idle_release_minutes`、`heavy_*` 同样下一条命令就生效（已经在跑的 `watch --main`、`board --live`、在排队的 `heavy` 用的是启动时读到的配置，重开后才认）。`claude_model`、`claude_effort`、`codex_effort` 从下一个起的编排者、worker、复审开始用，已经起来的不变（例外：编排者报给 herdr 的续命令按报的时候的 config 补默认值，起来以后改了，herdr 重启后它按新默认回来，见 [herdr 重启后按原参数拉回](reference.md#herdr-重启后按原参数拉回)）；所有任务都跟着换，只想换一个任务的用派发时的 `--model` / `--effort`（任务 `orch.json` 记的优先于 config）。
 - 改 `profile` / `playbook_dirs` / `default_coding_rules`：也不用重装，下一条命令就生效（已经发出去的任务书不变）。`python3 install.py --profile <名字|目录>` 只改 `profile` 这个键（改之前先备份，解析不到目录时直接报错、不写），`--profile none` 去掉它。
 - 改 `workspace`：要重跑 `python3 install.py --workspace <新目录>`。路由区块、`CLAUDE.md` 和 `.claude/settings.local.json` 都写在主工作台里，新目录里要有这些；以后也在新目录里开主会话。
   - 只传 `--workspace` 时 `repo_dirs` 保持原样，仓库目录也要变就一起传 `--repo-dir`。

@@ -16,7 +16,7 @@ import time
 import unittest
 from typing import Optional
 
-from selftest_screens import CODEX_QUOTE_WORKING, QUOTE_NAMED, SUBAGENT_DIALOG
+from selftest_screens import CODEX_QUOTE_WORKING, IDLE_AFTER_START, QUOTE_NAMED, SUBAGENT_DIALOG
 from selftest_support import DROVER, DroverTestCase, rollup_digest
 
 # 写完 rollup 还挂着 Monitor 的编排者（herdr 报 done，屏幕修正成 waiting-background(1)）
@@ -184,6 +184,36 @@ class OrchStartTests(DroverTestCase):
                       (self.state / "t6" / "dispatch.md").read_text())
 
     # ---- 宿主：不给 --kind 时跟主会话走（主会话是 Codex 时，派出的编排者和 worker 仍是 Claude Code）
+
+    def test_orch_start_reports_resume_command(self) -> None:
+        """orch-start 起好就把续命令报给 herdr（编排者的启动参数 + --resume <herdr 报的会话 ID>，herdr 重启后按它拉回），
+        记进 orch.json 的 resume_reported_session；codex 编排者第一轮之前 herdr 没有会话 ID：不报、返回里写原因（后台维护补报），
+        orch.json 里是 null。子编排者走同一条路"""
+        self.install_entries()
+        state = self.herdr_state()
+        state["workspaces"] = [{"label": "orch", "workspace_id": "w9"}]
+        state["starting"] = {"orch-t1": {"status": "idle", "agent": "claude", "screen": IDLE_AFTER_START},
+                             "orch-t2": {"status": "idle", "agent": "codex", "screen": "› Ask Codex to do anything"}}
+        self.set_herdr_state(state)
+
+        def orch_start(slug: str, kind: str) -> dict:
+            p = self.drover_in_process("orch-start", "--slug", slug, "--name", f"orch-{slug}", "--kind", kind,
+                                       "--request-file", str(self.request))
+            return json.loads(p.stdout)
+
+        out = orch_start("t1", "claude")
+        agents = self.herdr_state()["agents"]
+        want = ["claude", *agents["orch-t1"]["args"], "--resume", "fake-session-orch-t1"]
+        self.assertIn(f"--add-dir {self.state}", " ".join(want))
+        self.assertEqual(out["herdr_resume"], {"reported": True, "session_id": "fake-session-orch-t1", "argv": want})
+        self.assertEqual(agents["orch-t1"]["resume_argv"], want)
+        meta = json.loads((self.state / "t1" / "orch.json").read_text())
+        self.assertEqual((meta["name"], meta["resume_reported_session"]), ("orch-t1", "fake-session-orch-t1"))
+        out = orch_start("t2", "codex")
+        self.assertEqual((out["ok"], out["herdr_resume"]["reported"]), (True, False))
+        self.assertIn("会话 ID", out["herdr_resume"]["reason"])
+        self.assertIsNone(json.loads((self.state / "t2" / "orch.json").read_text())["resume_reported_session"])
+        self.assertEqual([r["pane"] for r in self.herdr_state()["resume_reports"]], [agents["orch-t1"]["pane_id"]])
 
     def test_kind_follows_caller(self) -> None:
         """不给 --kind：编排者跟调用方（主会话，HERDR_PANE_ID 那个 pane）里的 agent 走，claude、codex 各一次；

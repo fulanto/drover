@@ -119,7 +119,7 @@ class ModelFlagTests(DroverTestCase):
                        lambda a: a[:4], lambda m, e: ["--model", m, "--effort", e],
                        ("sonnet", "medium"), ("opus[1m]", "xhigh")),
             "codex": (dict(codex_effort="medium"), GPT, "low", ("o3", "high"),
-                      lambda a: a[a.index("-c") - 2:] if "-m" in a else a[-2:],
+                      lambda a: a[a.index("-m"):] if "-m" in a else a[-2:],
                       lambda m, e: [*(["-m", m] if m else []), "-c", f"model_reasoning_effort={e}"],
                       (None, "medium"), (None, "xhigh")),
         }
@@ -184,19 +184,20 @@ class ModelFlagTests(DroverTestCase):
         self.assertEqual((self.orch_meta("t1")["name"], self.orch_meta("t1")["model"]), ("orch-t1b", FABLE))
 
     def test_without_model_launch_args_unchanged(self) -> None:
-        """没人给 --model（任务 orch.json 没有 model / effort，或是旧版写的没这两个键）：四种启动参数和改之前一字不差，
-        开场 prompt 里没有模型那句"""
+        """没人给 --model（任务 orch.json 没有 model / effort，或是旧版写的没这两个键）：四种启动参数和改之前一字不差（codex 的
+        三种都带 -c check_for_update_on_startup=false：起 codex 不弹升级框），开场 prompt 里没有模型那句"""
         s1, heavy = str(self.state / "s1"), str(self.state / "locks" / "heavy")
+        no_update = ["-c", "check_for_update_on_startup=false"]
         want = {
             "agent claude": ["--model", "opus[1m]", "--effort", "xhigh", "--permission-mode", "acceptEdits",
                              "--name", "worker-s1", "--add-dir", s1],
-            "agent codex": ["-a", "on-request", "-s", "workspace-write", "--no-daemon", "--no-alt-screen",
+            "agent codex": ["-a", "on-request", "-s", "workspace-write", "--no-daemon", "--no-alt-screen", *no_update,
                             "--add-dir", s1, "--add-dir", heavy, "-c", "model_reasoning_effort=xhigh"],
             "orch claude": ["--model", "opus[1m]", "--effort", "xhigh", "--permission-mode", "acceptEdits",
                             "--name", "orch-t1", "--add-dir", str(self.state)],
-            "orch codex": ["-s", "danger-full-access", "-a", "on-request", "--no-daemon", "--no-alt-screen",
+            "orch codex": ["-s", "danger-full-access", "-a", "on-request", "--no-daemon", "--no-alt-screen", *no_update,
                            "-c", "model_reasoning_effort=xhigh"],
-            "review": ["-a", "on-request", "-s", "read-only", "--no-daemon", "--no-alt-screen",
+            "review": ["-a", "on-request", "-s", "read-only", "--no-daemon", "--no-alt-screen", *no_update,
                        "-c", "model_reasoning_effort=xhigh"],
         }
 

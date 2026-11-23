@@ -25,6 +25,12 @@
     session（agent_session.value，没有就不输出）, present（False = herdr 里还没有这个 agent）, pending（每次 agent get
     之前先弹出一项 update 进记录，模拟 /clear 后 herdr 过一会儿才换 session、清名字）, cwd / foreground_cwd（设了才输出）}。
     agent list 同时列出它们，agent get <pane 或名字> 查得到，agent rename <pane> <名字> 改 name（名字被别的 agent 占着时报错）
+  - pane report-agent-session <pane> --source S --agent K --agent-session-id ID --seq N -- <续命令>（drover 报续命令用），同真的
+    herdr 0.9.5（src/app/api/panes.rs:1599-1700、src/agent_resume.rs:58-89）：续命令不合格（空、超过 64 个参数或 8KiB、带单引号
+    或控制字符、第一个不是裸命令名）报 invalid_resume_argv；pane 里没有 agent 报 resume_not_accepted；seq 不比这个 agent 上次
+    收的大、报的会话不是它现在的会话（agent_session）、source 不是 herdr:<它的宿主> 时静默丢掉、照样成功。收下的记进这个 agent
+    的 resume_argv（agent 退出、被重新 start 时跟着没了，同真的 herdr 清掉续命令）；每次调用（收没收）都记进
+    state["resume_reports"]（pane、source、agent、session、seq、argv、applied）。成功时 stdout 为空（同真的）
   - pane get / split / run / close（board --pane / --tab 用）：pane get <id> 返回 state["panes"][id] 的 pane_id、tab_id、
     workspace_id、scroll.viewport_rows（rows，默认 50），不在 panes 里报 pane_not_found；pane split --pane <id> 在同一个 tab
     里加一个没有 agent 的 pane（present: False，id 是 <workspace>:p<序号>）；pane run <id> <命令> 记进 state["pane_runs"]
@@ -81,6 +87,7 @@ GITCONFIG = """[user]
 FAKE_HERDR = r'''#!{python}
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -385,6 +392,49 @@ if cmd == ["pane", "process-info"]:
                              "foreground_processes": [{"pid": 1, "argv0": "-zsh", "name": "zsh"}]},
             "type": "pane_process_info"})
     fail("pane_not_found", "pane not found")
+
+
+def resume_argv_problem(argv):
+    if not argv:
+        return "must not be empty"
+    if len(argv) > 64:
+        return "allows at most 64 arguments"
+    if sum(len(x) for x in argv) > 8192:
+        return "allows at most 8192 bytes"
+    if any(ord(c) < 32 or ord(c) == 127 for x in argv for c in x):
+        return "must not contain control characters"
+    if any("'" in x for x in argv):
+        return "must not contain apostrophes"
+    if not re.fullmatch(r"[A-Za-z0-9_.][A-Za-z0-9_.-]*", argv[0]):
+        return "must start with a plain command name, not a path"
+    return None
+
+
+if cmd == ["pane", "report-agent-session"]:
+    pane = args[2] if len(args) > 2 else ""
+    argv = args[args.index("--") + 1:] if "--" in args else None
+    problem = resume_argv_problem(argv) if argv is not None else None
+    if problem:
+        fail("invalid_resume_argv", "resume_argv " + problem)
+    owner = next((n for n, a in agents.items() if a.get("pane_id") == pane), None)
+    if owner is None:
+        fail("resume_not_accepted", "resume_argv requires the reporter to hold the pane; "
+                                    "report its state with pane.report_agent first")
+    a = agents[owner]
+    seq = int(opt("--seq", "0"))
+    newer = seq > a.get("report_seq", -1)
+    current = agent_view(owner, a).get("agent_session", {}).get("value")
+    kind = a.get("agent", "claude")
+    applied = (newer and opt("--agent-session-id") == current and (opt("--source"), opt("--agent")) == ("herdr:" + kind, kind))
+    if newer:
+        a["report_seq"] = seq
+    if applied and argv is not None:
+        a["resume_argv"] = argv
+    state.setdefault("resume_reports", []).append({
+        "pane": pane, "source": opt("--source"), "agent": opt("--agent"), "session": opt("--agent-session-id"),
+        "seq": seq, "argv": argv, "applied": applied})
+    save()
+    sys.exit(0)
 
 
 def pane_view(pane_id):
