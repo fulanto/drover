@@ -19,9 +19,11 @@ JSON 对象，字段 ok 表示是否成功；失败时 error 字段说明原因�
                 闲置释放开着时跑一遍闲置扫描
   orch-start    为一个任务起编排者（orchestrator）：在 orch workspace 里新开 tab，启动 claude 或 codex（--kind，不给时跟调用方的宿主），
                 发出编排者开场 prompt；orch.json 记下主会话的宿主（default_kind），任务里的 worker 默认用它；
-                --model / --effort 也记进 orch.json 当任务默认，同宿主的 worker、复审、子编排者不传时继承；起好就把续命令报给 herdr
+                --model / --effort 也记进 orch.json 当任务默认，同宿主的 worker、复审、子编排者不传时继承；orch.json 在起 agent 之前
+                写、起不来恢复原样（名字被后来的任务复用时，活着的同名 agent 算最新那份的）；起好就把续命令报给 herdr
   orch-status   列出编排者的 herdr 状态和 rollup 状态行（主会话一条命令看全部；Codex 主会话每轮开头查一次）；
-                按屏幕修正的状态放 screen_status，卡在确认框上的列进 blocked；needs_attention 只算主会话还没读过的 rollup
+                按屏幕修正的状态放 screen_status，卡在确认框上的列进 blocked；needs_attention 只算主会话还没读过的 rollup；
+                同名的几份 orch.json 里只有最新那份算活着，更早的是 gone
   brief         按模板生成任务 prompt（必填完成证据，写进状态文件）；--survey 先让 agent 摸底；--send 生成后立刻发出
   prompt        从文件（或 --text 短消息）读取 prompt 发给 agent（避免命令行里出现超长字符串）；发给编排者时记 answered.json
   watch         轮询 agent 状态，状态变化时输出一行带时间的 EVENT（给 Monitor 用）；同一状态 herdr 序号变了或弹框换了也重报，
@@ -3434,6 +3436,81 @@ def orch_agent_args(kind: str, slug: str, model: Optional[str], effort: Optional
     return [*CODEX_ORCH_ARGS, *codex_model_args(model, effort)]
 
 
+def orch_start_lock(slug: str) -> Path:
+    """orch-start 起这个任务的编排者时拿的锁：从写 orch.json 到 start_agent 返回（start_orch_agent）。
+    用 flock：orch-start 被杀了自动放开，不会留下一份永远"正在起"的记录。"""
+    return STATE_HOME / "locks" / f"orch-start-{slug}.lock"
+
+
+def file_snapshot(path: Path) -> Optional[tuple]:
+    """path 现在的 (内容, 访问时间 ns, 修改时间 ns)，给 restore_file 用；没有这个文件是 None。"""
+    try:
+        st = path.stat()
+        return path.read_bytes(), st.st_atime_ns, st.st_mtime_ns
+    except OSError:
+        return None
+
+
+def restore_file(path: Path, snapshot: Optional[tuple]) -> None:
+    """把 path 恢复成 file_snapshot 那时的样子：那时没有就删掉；有就把内容一字不差写回去（原子写），修改时间也还原——
+    同名的 orch.json 按修改时间取最新（orch_records），不还原的话，没起来的这次会把别的任务后来复用的名字抢回来。"""
+    if snapshot is None:
+        path.unlink(missing_ok=True)
+        return
+    data, atime, mtime = snapshot
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_bytes(data)
+    os.utime(tmp, ns=(atime, mtime))
+    os.replace(tmp, path)
+
+
+def retired_names(previous: dict, name: str) -> list:
+    """这个任务换下来的编排者名（orch.json 的 retired_names）。previous 是换之前的 orch.json（没有是 {}），name 是这次起的编排者：
+    前任的名字接在它记着的更早的名字后面（X → Y → Z 累积），去掉和 name 相同的（同名再起不记；换回用过的名字时它是现任）。
+    换下的名字仍归这个任务（orch_records）：换编排者时新的起好才关旧 tab（routing.md），旧编排者这段时间还活着，它的名字不能
+    落回更早的同名任务。"""
+    names = [*(previous.get("retired_names") or []), previous.get("name")]
+    return list(dict.fromkeys(n for n in names if n and n != name))
+
+
+def start_orch_agent(meta_file: Path, agent_args: list, record: dict) -> dict:
+    """写下编排者的记录 record（orch.json 的内容）、起它（start_agent），返回 start_agent 的结果加 herdr_resume（report_resume）。
+    记录在起 agent 之前写：名字可以被后来的任务复用，herdr 里叫这个名字的活 agent 算这个名字最新的那份记录的（orch_records）。
+    起好才写的话，新 agent 出现在 herdr 里到写下记录的那几秒（处理启动弹窗、等会话开始）它被算给同名的旧任务：11-23 新任务的
+    orch-oncall 刚起，watch --main 就报了两周前同名旧任务的 rollup:完成。反过来，记录写了、agent 还没出现的那一小段会被看成
+    编排者退出了（watch --main 报 gone，主会话去起替换的），所以从写记录到起好拿着 orch_start_lock：这一段 orch_records 不列它。
+    没起来就恢复原样（restore_file）：start_agent 抛错（herdr 报错、名字被活着的 agent 占着），或者起来又退出了（status 是
+    gone）——留着记录的话 watch --main 会报 gone，可这次的失败调用方已经从返回里看到了。被打断（Ctrl-C）不恢复：agent 可能已经
+    起来了，记录留着它才算这个任务的。卡在不认识的启动界面上、ok 是 false 的也留着（同 agent-start）：它活着，处理完照常用。
+    起好把报给 herdr 的会话 ID 补进记录：claude 起好时就有；codex 发出第一句话才有，这时不报，后台维护补报。"""
+    with flock_file(orch_start_lock(record["slug"]), None):
+        before = file_snapshot(meta_file)
+        write_json_atomic(meta_file, record)
+        try:
+            result = start_agent(record["name"], record["kind"], record["pane_id"], agent_args, False)
+        except Exception:
+            restore_file(meta_file, before)
+            raise
+        result["herdr_resume"] = report_resume(record["pane_id"], record["kind"], agent_args, result.get("session_id"))
+        if result.get("status") == "gone":
+            restore_file(meta_file, before)
+        else:
+            write_json_atomic(meta_file, {**record, RESUME_REPORT_KEY: result["herdr_resume"].get("session_id")})
+    return result
+
+
+def timeline_orch_start(slug_dir: Path, name: str, kind: str, parent: Optional[str], resume: bool) -> None:
+    """orch-start 记时间线：派发（start）；resume（--args 第一个词是 resume）时是换编排者（replace；routing.md"需要换编排者"、
+    意外退出都这样起），老任务没有派发那条就按 request.md / rollup.md 的修改时间补一条估计的。"""
+    with timeline_session(slug_dir) as (events, new):
+        if resume:
+            if last_event(events, "start") is None:
+                new.append(timeline_event("start", request_time(slug_dir) or time.time(), "orch-start", estimated=True))
+            new.append(timeline_event("replace", time.time(), "orch-start", name=name, kind=kind))
+        else:
+            new.append(timeline_event("start", time.time(), "orch-start", name=name, kind=kind, parent=parent))
+
+
 def cmd_orch_start(a: argparse.Namespace) -> dict:
     if ORCH_CWD is None:  # 编排者的工作目录就是主工作台，没配置就起不了
         raise DroverError(NO_WORKSPACE_ERROR, config_file=str(CONFIG_FILE))
@@ -3497,21 +3574,22 @@ def cmd_orch_start(a: argparse.Namespace) -> dict:
             raise DroverError("herdr tab create 返回里缺 root_pane.pane_id", result=res)
 
     slug_dir.mkdir(parents=True, exist_ok=True)
-    result = start_agent(a.name, kind, pane_id, agent_args, False)
-    # 起好就把续命令报给 herdr：claude 起好时就有会话 ID；codex 发出第一句话才有、起来又退出了的也没有，这两种不报，后台维护补报。
-    result["herdr_resume"] = report_resume(pane_id, kind, agent_args, result.get("session_id"))
-    result.update({"workspace_id": ws_id, "tab_id": tab_id, "rollup_file": str(rollup), **kinds})
     stamp = time.strftime("%m-%d %H:%M")
     # orch-status 和 watch 靠它把编排者名、宿主和任务对上（resume 换人时覆盖成新的）；
     # default_kind 给 agent-start / brief（没写 --kind 的 worker 用主会话的宿主）和子编排者的 orch-start 用；
     # model / effort 是任务默认（没指定是 null），同宿主的 agent-start、review、子编排者和换上的编排者不传时继承（task_model）；
-    # resume_reported_session 是报给 herdr 的续命令用的会话 ID（没报是 null），后台维护拿它和 herdr 现在的会话比、会改它，
-    # 所以整份原子写（write_json_atomic），后台不会读到半截。
-    write_json_atomic(slug_dir / "orch.json", {
+    # resume_reported_session 是报给 herdr 的续命令用的会话 ID（没报是 null，起好由 start_orch_agent 补上），后台维护拿它和
+    # herdr 现在的会话比、会改它，所以整份原子写（write_json_atomic），后台不会读到半截；
+    # retired_names 是这个任务换下来的编排者名（retired_names）。
+    meta_file = slug_dir / "orch.json"
+    result = start_orch_agent(meta_file, agent_args, {
         "slug": a.slug, "name": a.name, "kind": kind, "default_kind": default_kind, "parent": parent,
         "model": model, "effort": effort,
         "workspace_id": ws_id, "tab_id": tab_id, "pane_id": pane_id, "started": stamp,
-        RESUME_REPORT_KEY: result["herdr_resume"].get("session_id")})
+        "retired_names": retired_names(read_json_dict(meta_file), a.name), RESUME_REPORT_KEY: None})
+    result.update({"workspace_id": ws_id, "tab_id": tab_id, "rollup_file": str(rollup), **kinds})
+    if result.get("status") == "gone":  # 起来又退出了：记录已经恢复原样（start_orch_agent），不往上层登记、不记时间线
+        return result
     if parent:
         # 关系记两边：子任务目录里的 parent.json（resume、history 用），上层状态文件里追加一行（上层追踪用）。
         (slug_dir / "parent.json").write_text(json.dumps(
@@ -3522,15 +3600,7 @@ def cmd_orch_start(a: argparse.Namespace) -> dict:
                           + f"- {stamp} 子编排者 {a.name}（任务 {a.slug}，tab {tab_id}，pane {pane_id}），"
                             f"rollup：{rollup}\n")
         result["parent"] = parent
-    # 时间线：派发（start）；--args 第一个词是 resume 时是换编排者（routing.md"需要换编排者"、意外退出都这样起），老任务没有派发
-    # 那条就按 request.md / rollup.md 的修改时间补一条估计的。
-    with timeline_session(slug_dir) as (events, new):
-        if (a.args or "").split()[:1] == ["resume"]:
-            if last_event(events, "start") is None:
-                new.append(timeline_event("start", request_time(slug_dir) or time.time(), "orch-start", estimated=True))
-            new.append(timeline_event("replace", time.time(), "orch-start", name=a.name, kind=kind))
-        else:
-            new.append(timeline_event("start", time.time(), "orch-start", name=a.name, kind=kind, parent=parent))
+    timeline_orch_start(slug_dir, a.name, kind, parent, (a.args or "").split()[:1] == ["resume"])
     if SLUG_RISKY_WORDS.search(a.slug):
         result["warning"] = ("slug 里有 import / include：编排者用 jq 读 <slug>/ 下的结果文件会被判成加载模块、弹强制审批。"
                              "下次换个词；这次编排者读验收结果用 drover accept-summary")
@@ -3885,28 +3955,28 @@ def cmd_orch_status(a: argparse.Namespace) -> dict:
     或者屏幕修正成 blocked：后台子 agent 的确认框会被 herdr 报成 working）列进顶层 blocked（slug、name），没有就不出这个键。
     读屏失败按原值；codex 编排者 working 时不读（screen_override 只在 Claude Code 上认 working 时的弹框）。
     每行带 rollup_summary、unread、answered_after_rollup（见 rollup_flags）；needs_attention 只算
-    未读的（主会话用 drover rollup 读过就不算），以前只看状态，--all 会列出几十个早就转达过的"完成"。"""
+    未读的（主会话用 drover rollup 读过就不算），以前只看状态，--all 会列出几十个早就转达过的"完成"。
+    编排者名被后来的任务复用时，活着的同名 agent 只算最新那份 orch.json 的，更早的同名任务是 gone（orch_records；以前只按名字
+    对，新任务的编排者活着，同名的旧任务就一直显示 working）；orch-start 正在起的那一份不列。"""
     ok, res = herdr(["agent", "list"], timeout=30)
     if not ok:
         raise DroverError("herdr agent list 失败", error=res)
     alive = {x.get("name"): x for x in res.get("agents", []) if x.get("name")}
     rows, seen, attention = [], set(), []
-    for meta_file in sorted(STATE_HOME.glob("*/orch.json")):
-        try:
-            meta = json.loads(meta_file.read_text())
-        except (OSError, json.JSONDecodeError):
-            continue
+    for rec in orch_records():
+        meta, d = rec["meta"], rec["dir"]
         name = meta.get("name")
         seen.add(name)
-        agent = alive.get(name)
+        # 同名的几份 orch.json（名字被后来的任务复用）里，活着的 agent 只算最新那份的，更早的是已经退出的（orch_records）
+        agent = alive.get(name) if rec["latest"] else None
         if meta.get("parent") and not a.with_sub:
             continue
         if agent is None and not a.all:
             continue
         status = agent.get("agent_status") if agent else "gone"
-        roll = read_rollup(meta_file.parent / "rollup.md")
-        unread, answered_at = rollup_flags(meta_file.parent, roll)
-        row = {"slug": meta.get("slug") or meta_file.parent.name, "name": name, "kind": meta.get("kind"),
+        roll = read_rollup(d / "rollup.md")
+        unread, answered_at = rollup_flags(d, roll)
+        row = {"slug": meta.get("slug") or d.name, "name": name, "kind": meta.get("kind"),
                "parent": meta.get("parent"), "agent_status": status, **rollup_header(roll),
                "unread": unread, "answered_after_rollup": answered_at is not None}
         fixed = corrected_status(name, status, (agent or {}).get("agent") or meta.get("kind"))
@@ -3914,7 +3984,7 @@ def cmd_orch_status(a: argparse.Namespace) -> dict:
             row["screen_status"] = fixed
         rows.append(row)
         # unread 已经按前缀要求状态要处理；收尾完关掉的（编排者已退出、完成、主会话读过这一版）不算。
-        if unread and status in ("done", "idle", "gone") and not closed_after_done(meta_file.parent, roll, status):
+        if unread and status in ("done", "idle", "gone") and not closed_after_done(d, roll, status):
             attention.append(row["slug"])
     # 活着、名字是 orch- 开头、却没有对应 orch.json 的（不是 orch-start 起的，或 orch.json 被删了）：照样列出来，
     # slug 要自己对（tab 标签就是 slug）。
@@ -4192,6 +4262,19 @@ def main_agent_view() -> dict:
     return {"registered": True, "pane_id": found.get("pane_id"), "agent": found.get("agent")}
 
 
+def oncall_owner_hints(status: dict) -> list:
+    """飞书 oncall 归属的不是这次调用所在的 herdr 时的一条提示，否则 []。插件 status 的 owner 是 Oncall 归属的 herdr server
+    （只属于一个，按 socket 路径认）：socket_path 不空、current_session 是 false 才是归属在别处。还没有归属记录时 socket_path 是
+    null（current_session 也是 false，不代表在别处）、旧版插件没有 owner，都不提示。running 是 false 时点明那个 herdr 没在运行
+    （true、说不清的 null 不提）。来由：11-23 飞书送不进主会话那次，插件连的是另一个 herdr，status 只显示收信进程活着、hints 是空的。"""
+    owner = status.get("owner") or {}
+    if not owner.get("socket_path") or owner.get("current_session") is not False:
+        return []
+    stopped = "，它没在运行" if owner.get("running") is False else ""
+    return [f"飞书 oncall 现在归属另一个 herdr（{owner['socket_path']}{stopped}）：这个 herdr 里的主会话收不到飞书消息和按钮，"
+            f"要切过来就在这个 herdr 里跑 herdr plugin action invoke poll --plugin {ONCALL_PLUGIN_ID}"]
+
+
 def oncall_hints(plugin: dict, view: dict, status: Optional[dict]) -> list:
     hints = []
     source = (plugin.get("source") or {}).get("kind")
@@ -4216,6 +4299,7 @@ def oncall_hints(plugin: dict, view: dict, status: Optional[dict]) -> list:
             hints.append("飞书还没配对：drover oncall pair（Mac 桌面会弹二维码；没弹就用飞书打开它给的链接）")
         elif feishu.get("replies_supported") is False:
             hints.append("Node 低于 22：能收到推送，但飞书里的回复送不回来，升级 Node 到 22+")
+        hints += oncall_owner_hints(status)
     return hints
 
 
@@ -4262,19 +4346,6 @@ def oncall_status(plugin: dict) -> dict:
     if isinstance(channels, dict) and isinstance(channels.get("telegram"), dict) \
             and channels["telegram"].get("paired") is not True:
         channels.pop("telegram")
-def oncall_owner_hints(status: dict) -> list:
-    """飞书 oncall 归属的不是这次调用所在的 herdr 时的一条提示，否则 []。插件 status 的 owner 是 Oncall 归属的 herdr server
-    （只属于一个，按 socket 路径认）：socket_path 不空、current_session 是 false 才是归属在别处。还没有归属记录时 socket_path 是
-    null（current_session 也是 false，不代表在别处）、旧版插件没有 owner，都不提示。running 是 false 时点明那个 herdr 没在运行
-    （true、说不清的 null 不提）。来由：11-23 飞书送不进主会话那次，插件连的是另一个 herdr，status 只显示收信进程活着、hints 是空的。"""
-    owner = status.get("owner") or {}
-    if not owner.get("socket_path") or owner.get("current_session") is not False:
-        return []
-    stopped = "，它没在运行" if owner.get("running") is False else ""
-    return [f"飞书 oncall 现在归属另一个 herdr（{owner['socket_path']}{stopped}）：这个 herdr 里的主会话收不到飞书消息和按钮，"
-            f"要切过来就在这个 herdr 里跑 herdr plugin action invoke poll --plugin {ONCALL_PLUGIN_ID}"]
-
-
     return {"ok": True, "plugin_status": status, "drover": view, "hints": oncall_hints(plugin, view, status)}
 
 
@@ -4299,7 +4370,6 @@ def action_log(action_id: str, since: float) -> tuple[Optional[dict], bool]:
     since_ms = int(since * 1000) - 2000
     deadline = time.time() + ONCALL_LOG_WAIT
     latest, told = None, False
-        hints += oncall_owner_hints(status)
     while True:
         ok, res = herdr(["plugin", "log", "list", "--plugin", ONCALL_PLUGIN_ID, "--limit", "20"], timeout=30)
         hits = [x for x in (res.get("logs") or [] if ok else []) if isinstance(x, dict) and is_action_log(x, action_id)
@@ -5170,23 +5240,46 @@ rollup 的已读看 {MAIN_SEEN_FILE}：重挂之后只报没报过的（和到�
 --main --until-event 时启动那一轮的输出也算事件：输出了就退出（退出码 0）。"""
 
 
-def latest_orch_metas() -> dict:
-    """编排者名 → 它最新的一份 orch.json：{"meta", "dir"}。按 STATE_HOME/*/orch.json 的 name 找，多条（名字被后来的任务复用）
-    取文件修改时间最新的（started 没有年份，只在修改时间相同时排先后）。"""
-    best: dict = {}
-    for meta_file in STATE_HOME.glob("*/orch.json"):
+def orch_meta_files() -> list:
+    """STATE_HOME/*/orch.json 里读得出来的（内容是对象的）每一份，按任务目录排序：{"meta", "dir", "key", "names"}。key 排新旧用：
+    （文件修改时间, started）；names 是这份记录占着的编排者名：现在的 name 加上换下来的 retired_names。"""
+    found = []
+    for meta_file in sorted(STATE_HOME.glob("*/orch.json")):
         try:
             meta = json.loads(meta_file.read_text())
             mtime = meta_file.stat().st_mtime
         except (OSError, ValueError):
             continue
-        name = meta.get("name") if isinstance(meta, dict) else None
-        if not name:
-            continue
-        key = (mtime, str(meta.get("started") or ""))
-        if name not in best or key > best[name][0]:
-            best[name] = (key, {"meta": meta, "dir": meta_file.parent})
-    return {n: task for n, (_, task) in best.items()}
+        if isinstance(meta, dict):
+            names = [n for n in (meta.get("name"), *(meta.get("retired_names") or [])) if n]
+            found.append({"meta": meta, "dir": meta_file.parent, "key": (mtime, str(meta.get("started") or "")),
+                          "names": names})
+    return found
+
+
+def orch_records() -> list:
+    """每一份 orch.json（orch_meta_files），按任务目录排序：{"meta", "dir", "latest"}。
+    latest：它是这个编排者名最新的一份——herdr 里叫这个名字的活 agent 是为它起的。名字可以被后来的任务复用，更早的同名记录的
+    编排者就是已经不在了（gone）。最新按文件修改时间（started 没有年份，只在修改时间相同时排先后）。
+    一份记录占着的名字是它现在的 name 加上换下来的 retired_names：换下的名字只参与"这个名字最新的记录是谁"，不拿去对活
+    agent（latest 只看现在的 name），之后有更新的任务再用它就归那个任务。
+    orch-start 正在起的那一份（拿着 orch_start_lock）不在结果里，但名字照样归它：这一段里这个名字在不在 herdr 里都说明不了
+    什么，算给同名的旧记录、算成退出了都是错的（见 start_orch_agent）。
+    认人只按名字、不按 pane / terminal：pane 挪进别的 workspace 后 herdr 给它新 pane ID（terminal 不变），herdr 重启后 pane ID
+    不变、terminal_id 每次都换（herdr-resume-params 的实测）；两种情况都跟着 agent 走的只有名字。"""
+    found = orch_meta_files()
+    newest: dict = {}
+    for rec in found:
+        for name in rec["names"]:
+            if name not in newest or rec["key"] > newest[name]["key"]:
+                newest[name] = rec
+    return [{"meta": r["meta"], "dir": r["dir"], "latest": newest.get(r["meta"].get("name")) is r}
+            for r in found if not flock_held(orch_start_lock(r["dir"].name))]
+
+
+def latest_orch_metas() -> dict:
+    """编排者名 → 它最新的一份 orch.json：{"meta", "dir"}（orch_records 里 latest 的那些；名字被后来的任务复用时取最新的）。"""
+    return {r["meta"]["name"]: {"meta": r["meta"], "dir": r["dir"]} for r in orch_records() if r["latest"]}
 
 
 def orch_rollups(names) -> dict:
@@ -7084,8 +7177,8 @@ def cmd_rollup(a: argparse.Namespace) -> int:
     if a.name:
         found = latest_orch_metas().get(a.name)
         if found is None:
-            raise DroverError(f"找不到编排者 {a.name}：{STATE_HOME} 下没有 name 是它的 orch.json（名字写错了，或者不是 "
-                              "orch-start 起的编排者；可以改用 --slug）")
+            raise DroverError(f"找不到编排者 {a.name}：{STATE_HOME} 下没有哪个任务现在的编排者叫这个名字（名字写错了、是换下来的旧"
+                              "编排者、orch-start 还在起它，或者不是 orch-start 起的编排者；可以改用 --slug）")
         d = found["dir"]
     else:
         check_slug(a.slug)
@@ -12898,6 +12991,21 @@ def flock_wait(fh, wait: Optional[float], on_wait) -> bool:
             if deadline is not None and time.time() >= deadline:
                 return False
             time.sleep(0.1)
+
+
+def flock_held(path: Path) -> bool:
+    """path 这把锁（flock_file）现在有人拿着。只看不占：用共享锁试一下就放，几个进程同时看不会互相挡住、误判成有人拿着；
+    没有这个文件（没人拿过）、打不开都算没人拿。"""
+    try:
+        fh = open(path)
+    except OSError:
+        return False
+    with fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+    return False
 
 
 def change_auto_record(change) -> dict:

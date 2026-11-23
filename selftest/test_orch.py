@@ -14,6 +14,7 @@ import os
 import re
 import time
 import unittest
+from pathlib import Path
 from typing import Optional
 
 from selftest_screens import CODEX_QUOTE_WORKING, IDLE_AFTER_START, QUOTE_NAMED, SUBAGENT_DIALOG
@@ -449,6 +450,256 @@ class OrchStatusTests(DroverTestCase):
                          [("t1", "working", None), ("t2", "done", None)])
         self.assertEqual(out["needs_attention"], ["t2"])
         self.assertEqual(len([c for c in self.herdr_calls() if c[:2] == ["agent", "read"]]), 2)  # 确实去读了
+
+
+class NameReuseTests(DroverTestCase):
+    """编排者名被后来的任务复用（11-23 实际发生：新任务的 orch-oncall 刚起，watch --main 就报了两周前同名旧任务的 rollup:完成，
+    orch-status --all 里旧任务也显示 working）。herdr 里叫这个名字的活 agent 只属于这个名字最新的那份 orch.json；新任务的记录在
+    新 agent 出现在 herdr 里之前就写好；orch-start 还没返回的这一段，它既不算旧任务的、也不算退出了。"""
+
+    NAME = "orch-x"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.request = self.tmp / "request.md"
+        self.request.write_text("# 请求\n\n用户原话：测试\n")
+        command = self.home / ".claude" / "commands" / "drover.md"
+        command.parent.mkdir(parents=True)
+        command.write_text("---\nname: drover\n---\n")
+        state = self.herdr_state()
+        state["workspaces"] = [{"label": "orch", "workspace_id": "w9"}]
+        self.set_herdr_state(state)
+
+    def old_task(self, status: str = "完成") -> Path:
+        """两周前的旧任务 old-task：编排者也叫 NAME、早就退出了，rollup 写了 status、主会话没读过，没有时间线（事故里那个旧任务
+        就是这样：编排者不在时算收尾完关掉的，不盯）。"""
+        d = self.state / "old-task"
+        d.mkdir()
+        (d / "orch.json").write_text(json.dumps(
+            {"slug": "old-task", "name": self.NAME, "kind": "claude", "parent": None, "workspace_id": "w75",
+             "tab_id": "w75:t7", "pane_id": "w75:p7", "started": "11-08 14:47"}, ensure_ascii=False, indent=2))
+        (d / "rollup.md").write_text(f"# old-task\n状态：{status}\n\n## 结论\n- 两周前做完的\n")
+        old = time.time() - 14 * 86400
+        for path in d.iterdir():
+            os.utime(path, (old, old))
+        return d
+
+    def will_start(self, name: Optional[str] = None) -> None:
+        """假 herdr：下一次 agent start <name>（默认 NAME）起得来（停在空闲输入框）。"""
+        state = self.herdr_state()
+        state["starting"] = {name or self.NAME: {"status": "idle", "agent": "claude", "screen": IDLE_AFTER_START}}
+        self.set_herdr_state(state)
+
+    def orch_start(self, slug: str, *extra: str, name: Optional[str] = None, at_agent_start=None) -> dict:
+        """在进程里跑 orch-start --name <name>（默认 NAME；假 herdr、假时钟），返回它的输出。at_agent_start(when)：herdr agent
+        start 调用之前（"before"：agent 还没出现在 herdr 里）、返回之后（"after"：agent 已经在 herdr 里，orch-start 还没返回）各调一次。"""
+        def setup(d) -> None:
+            real = d.herdr
+
+            def herdr(args, **kw):
+                if at_agent_start is None or args[:2] != ["agent", "start"]:
+                    return real(args, **kw)
+                at_agent_start("before")
+                result = real(args, **kw)
+                at_agent_start("after")
+                return result
+
+            d.herdr = herdr
+
+        p = self.drover_in_process("orch-start", "--slug", slug, "--name", name or self.NAME, "--kind", "claude",
+                                   "--request-file", str(self.request), *extra, rc=None, setup=setup)
+        return json.loads(p.stdout)
+
+    def main_watch(self) -> list:
+        """watch --main 跑 1 秒假时间（0.2 秒一轮），返回 EVENT 列表；什么都不用报时只有 EVENT timeout。"""
+        rc, evs, _ = self.watch("--main", "--until-event", "--interval", "0.2", "--timeout", "1")
+        self.assertEqual(rc, 0, evs)
+        return evs
+
+    def record(self, slug: str) -> dict:
+        """这个任务的 orch.json，没有是 {}。"""
+        meta = self.state / slug / "orch.json"
+        return json.loads(meta.read_text()) if meta.exists() else {}
+
+    def recorded_name(self, slug: str) -> Optional[str]:
+        return self.record(slug).get("name")
+
+    def owner(self, name: Optional[str] = None) -> Optional[Path]:
+        """<name>（默认 NAME）现在算哪个任务的（watch --main、看板、rollup --name 都按它找），没有是 None。"""
+        found = self.load_drover().latest_orch_metas().get(name or self.NAME)
+        return found["dir"] if found else None
+
+    def statuses(self) -> dict:
+        """orch-status --all：任务 → (编排者名, herdr 里的状态)。"""
+        return {r["slug"]: (r["name"], r["agent_status"])
+                for r in self.drover_json("orch-status", "--all")["orchestrators"]}
+
+    def task_with_live_orch(self, slug: str, status: str) -> Path:
+        """现在的任务 <slug>：编排者也叫 NAME（复用了旧任务的名字）、活着停在空闲输入框，rollup 写了 status。"""
+        d = self.state / slug
+        d.mkdir()
+        (d / "orch.json").write_text(json.dumps({"slug": slug, "name": self.NAME, "kind": "claude", "parent": None,
+                                                 "started": "11-23 21:57"}))
+        (d / "rollup.md").write_text(f"# {slug}\n状态：{status}\n\n## 结论\n- 上下文快满了\n")
+        self.set_agents(**{self.NAME: {"status": "done", "screen": IDLE_AFTER_START}})
+        return d
+
+    def close_agent(self, name: str) -> None:
+        """主会话关掉了 <name> 所在的 tab：它不在 herdr 里了。"""
+        state = self.herdr_state()
+        del state["agents"][name]
+        self.set_herdr_state(state)
+
+    def exit_right_after_start(self, when: str) -> None:
+        """agent 起来又退出了：herdr agent start 一返回就把它从假 herdr 里拿掉。"""
+        if when == "after":
+            state = self.herdr_state()
+            del state["agents"][self.NAME]
+            self.set_herdr_state(state)
+
+    def test_new_task_owns_reused_name_before_agent_appears(self) -> None:
+        """旧任务（完成、未读、编排者不在）和新任务重名：新 agent 出现在 herdr 里之前新任务的 orch.json 就写好了；起的过程中
+        （出现之前、出现之后）各跑一轮 watch --main 都不报——不报旧任务的 rollup:完成，也不把还没出现的新编排者报成 gone；
+        起好以后这个名字算新任务的，watch --main 照样不报旧任务，旧任务目录里一个文件都没多"""
+        old = self.old_task()
+        files = sorted(p.name for p in old.iterdir())
+        self.will_start()
+        seen = {}
+
+        def look(when: str) -> None:
+            seen[when] = (self.recorded_name("new-task"), self.main_watch())
+
+        out = self.orch_start("new-task", at_agent_start=look)
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(seen, {"before": (self.NAME, ["EVENT timeout"]), "after": (self.NAME, ["EVENT timeout"])})
+        self.assertEqual(self.owner(), self.state / "new-task")
+        self.assertEqual(self.main_watch(), ["EVENT timeout"])
+        self.assertEqual(sorted(p.name for p in old.iterdir()), files)
+
+    def test_failed_start_leaves_no_record(self) -> None:
+        """起不来（herdr agent start 报错、起来又退出了、名字被活着的 agent 占着）：新任务不留 orch.json（留着的话 watch --main 会报
+        gone、主会话会去起替换的编排者），这个名字还是旧任务的；前两种 herdr agent start 调用时记录已经写了"""
+        old = self.old_task()
+        for n, case in enumerate(("herdr agent start 报错", "起来又退出了", "名字被占着")):
+            with self.subTest(case):
+                slug, seen, hook = f"new-{n}", {}, None
+                state = self.herdr_state()
+                state["fail"] = {"agent start": {"code": "agent_start_failed", "message": "boom"}} if "报错" in case else {}
+                self.set_herdr_state(state)
+                self.set_agents(**({self.NAME: {"status": "working"}} if case == "名字被占着" else {}))
+                if case != "名字被占着":
+                    self.will_start()
+
+                    def hook(when: str, slug: str = slug, seen: dict = seen, case: str = case) -> None:
+                        seen.setdefault(when, self.recorded_name(slug))
+                        if case == "起来又退出了":
+                            self.exit_right_after_start(when)
+
+                out = self.orch_start(slug, at_agent_start=hook)
+                self.assertFalse(out["ok"], out)
+                self.assertFalse((self.state / slug / "orch.json").exists())
+                self.assertEqual(self.owner(), old)
+                if hook:
+                    self.assertEqual(seen["before"], self.NAME)
+                    self.assertEqual(self.main_watch(), ["EVENT timeout"])
+
+    def test_failed_replacement_keeps_previous_record(self) -> None:
+        """换编排者（resume）起不来：这个任务原来的 orch.json 一字不差（刚记进去的 retired_names 跟着整份恢复），修改时间也不变
+        （同名取最新按它排）；herdr agent start 调用时记录已经换成新编排者的、被换下的名字记在 retired_names 里"""
+        meta = self.state / "t1" / "orch.json"
+        meta.parent.mkdir()
+        meta.write_text(json.dumps({"slug": "t1", "name": "orch-t1", "kind": "claude", "default_kind": "claude",
+                                    "parent": None, "model": None, "effort": "max", "workspace_id": "w9", "tab_id": "w9:t1",
+                                    "pane_id": "w9:p1", "started": "11-20 09:00", "resume_reported_session": "s-old"},
+                                   ensure_ascii=False, indent=2) + "\n")
+        hour_ago = time.time_ns() - 3600 * 10**9
+        os.utime(meta, ns=(hour_ago, hour_ago))
+        before = (meta.read_bytes(), meta.stat().st_mtime_ns)
+        for case in ("herdr agent start 报错", "起来又退出了"):
+            with self.subTest(case):
+                seen = {}
+                state = self.herdr_state()
+                state["fail"] = {"agent start": {"code": "agent_start_failed", "message": "boom"}} if "报错" in case else {}
+                self.set_herdr_state(state)
+                self.will_start()
+
+                def hook(when: str, seen: dict = seen, case: str = case) -> None:
+                    seen.setdefault(when, (self.recorded_name("t1"), self.record("t1").get("retired_names")))
+                    if case == "起来又退出了":
+                        self.exit_right_after_start(when)
+
+                out = self.orch_start("t1", "--args", "resume t1", at_agent_start=hook)
+                self.assertFalse(out["ok"], out)
+                self.assertEqual(seen["before"], (self.NAME, ["orch-t1"]))
+                self.assertEqual((meta.read_bytes(), meta.stat().st_mtime_ns), before)
+
+    def test_replaced_name_does_not_fall_back_to_older_task(self) -> None:
+        """换编排者时旧的还活着（路由规则：新的起好才关旧 tab），新的只能换个名字。任务的 orch.json 换成新名字以后，活着的旧名字
+        不落回更早的同名任务：换的过程中、换好以后 watch --main 都不报旧任务的 rollup:完成，orch-status --all 里旧任务是 gone，
+        rollup --name <旧名字> 找不到任务（不去读旧任务的），旧任务目录里一个文件都没多。换下的名字记在新记录的 retired_names 里：
+        连着换（X → Y → Z）累积，同名再起（意外退出后 resume）不记"""
+        old = self.old_task()
+        files = sorted(p.name for p in old.iterdir())
+        self.task_with_live_orch("cur-task", "需要换编排者")
+        self.will_start("orch-y")
+        seen = {}
+
+        def look(when: str) -> None:
+            seen[when] = self.main_watch()
+
+        out = self.orch_start("cur-task", "--args", "resume cur-task", name="orch-y", at_agent_start=look)
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(seen, {"before": ["EVENT timeout"], "after": ["EVENT timeout"]})
+        self.assertEqual((self.recorded_name("cur-task"), self.record("cur-task")["retired_names"]), ("orch-y", [self.NAME]))
+        self.assertEqual(self.statuses(), {"cur-task": ("orch-y", "working"), "old-task": (self.NAME, "gone")})
+        self.assertEqual(self.main_watch(), ["EVENT orch-y rollup:需要换编排者"])
+        self.assertIsNone(self.owner())
+        self.assertIn("找不到编排者", self.main_rollup("--name", self.NAME, rc=1).stdout)
+        self.assertEqual(sorted(p.name for p in old.iterdir()), files)
+        self.will_start("orch-z")
+        self.assertTrue(self.orch_start("cur-task", "--args", "resume cur-task", name="orch-z")["ok"])
+        self.assertEqual(self.record("cur-task")["retired_names"], [self.NAME, "orch-y"])
+        self.close_agent("orch-z")
+        self.will_start("orch-z")
+        self.assertTrue(self.orch_start("cur-task", "--args", "resume cur-task", name="orch-z")["ok"])
+        self.assertEqual((self.recorded_name("cur-task"), self.record("cur-task")["retired_names"]),
+                         ("orch-z", [self.NAME, "orch-y"]))
+        self.assertEqual(self.statuses(), {"cur-task": ("orch-z", "working"), "old-task": (self.NAME, "gone")})
+
+    def test_later_task_takes_over_retired_name(self) -> None:
+        """换下来的名字，旧 tab 关掉以后被新任务再用：名字归新任务（它的记录更新），换过编排者的任务照旧按现在的名字算，
+        更早的同名旧任务还是 gone，watch --main 什么都不报"""
+        self.old_task()
+        self.task_with_live_orch("cur-task", "进行中")
+        self.will_start("orch-y")
+        self.assertTrue(self.orch_start("cur-task", "--args", "resume cur-task", name="orch-y")["ok"])
+        self.close_agent(self.NAME)
+        self.will_start()
+        self.assertTrue(self.orch_start("t-task")["ok"])
+        self.assertEqual((self.owner(), self.owner("orch-y")), (self.state / "t-task", self.state / "cur-task"))
+        self.assertEqual((self.record("cur-task")["retired_names"], self.record("t-task")["retired_names"]), ([self.NAME], []))
+        self.assertEqual(self.statuses(), {"cur-task": ("orch-y", "working"), "old-task": (self.NAME, "gone"),
+                                           "t-task": (self.NAME, "working")})
+        self.assertEqual(self.main_watch(), ["EVENT timeout"])
+
+    def test_orch_status_only_latest_record_alive(self) -> None:
+        """orch-status：同名的两份 orch.json，活着的 agent 只算最新那份的——--all 里旧任务是 gone、新任务是 herdr 报的状态，
+        不带 --all 只列新任务；旧任务有时间线（orch-start 派发的）、完成没读过时进 needs_attention（以前被算成 working、不提）"""
+        old = self.old_task()
+        new = self.state / "new-task"
+        new.mkdir()
+        (new / "orch.json").write_text(json.dumps({"slug": "new-task", "name": self.NAME, "kind": "claude", "parent": None,
+                                                   "started": "11-23 21:57"}))
+        (new / "rollup.md").write_text("# new-task\n状态：进行中\n")
+        self.set_agents(**{self.NAME: {"status": "working"}})
+        full = self.drover_json("orch-status", "--all")
+        self.assertEqual([(r["slug"], r["name"], r["agent_status"]) for r in full["orchestrators"]],
+                         [("new-task", self.NAME, "working"), ("old-task", self.NAME, "gone")])
+        self.assertEqual(set(full), {"ok", "orchestrators", "needs_attention"})
+        self.assertEqual(full["needs_attention"], [])
+        self.assertEqual([r["slug"] for r in self.drover_json("orch-status")["orchestrators"]], ["new-task"])
+        (old / "timeline.jsonl").write_text(json.dumps({"at": time.time() - 14 * 86400, "event": "start"}) + "\n")
+        self.assertEqual(self.drover_json("orch-status", "--all")["needs_attention"], ["old-task"])
 
 
 class WorkerAgentStartTests(DroverTestCase):
