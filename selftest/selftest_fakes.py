@@ -5,8 +5,17 @@
 假 herdr：按同目录的 herdr-state.json 返回 JSON 和屏幕内容，每次调用记进 herdr-calls.log，不连任何 server。
   - agent list / get / read：state["agents"][名字] = {status, cwd, seq（state_change_seq，默认 0）,
     screen | screens（每读一次往后翻一屏）, grow（每读一次多一行输出）, agent（herdr 的 agent 字段 claude / codex，
-    agent list / get 都输出，不设就不输出）, read_fail（agent read 报错退出，模拟读屏失败）, workspace_id / foreground_cwd
-    （设了 agent list 就输出）}
+    agent list / get 都输出，不设就不输出）, read_fail（agent read 报错退出，模拟读屏失败）, pane_id / workspace_id /
+    foreground_cwd / focused（设了 agent list / get 就输出）, session（设了就输出 agent_session，value 是它；
+    session_after: N 时这个 agent 被 agent get 满 N 次才开始输出——模拟 Claude Code 处理完启动弹框、过一会儿会话才开始）}
+  - 背后有真进程组的 agent（release 用）：agent 里设 pgid（用例自己起的进程组）。每次调用先看一遍：进程组没了的 agent
+    当它退出了——从 agents 里删掉（名字清掉），它的 pane_id 进 state["shells"]（pane 回到 shell）。
+    pane process-info --pane P：P 里有带 pgid 的 agent 时 foreground_process_group_id 是它的 pgid、foreground_processes 是
+    它的 procs（不设就是一个 argv0 为宿主名的组长）、shell_pid 是 1；state["pane_procs"][P] = {pgid, procs} 时照它返回（pane 里
+    在跑别的程序）；P 是已知的 pane（panes、shells、某个 agent 的 pane_id）时是回到 shell 的样子（前台进程组等于 shell_pid）；
+    不认识的 P 报 pane_not_found。pane list 不带 --workspace：上面这些已知的 pane
+  - state["fail"]["<前两个词>"] = {code, message}：这条子命令直接报这个错（模拟 herdr 一时连不上、旧版没有这个命令），
+    如 state["fail"]["pane process-info"]
   - worktree list / create / open / remove：create 真的 `git worktree add -b <分支> <路径> <base>`，路径在
     state["worktree_root"] 下；list 带 open_workspace_id（记录里 closed 为真时是 null）；remove --workspace W [--force]
     真的 `git worktree remove [--force]`（有改动不带 --force 会被 git 拒，同真的 herdr），删掉记录、关掉 workspace_id 是 W
@@ -32,9 +41,12 @@
     动作跑完才写输出），state["action_never_finishes"] 为真时一直是 running；
     plugin config-dir ID：建 state["plugin_config_dir"] 并打印它（和真的一样会建目录）
   - 起 agent（agent-start / orch-start 用）：agent start <名> --pane P -- <参数> 把 state["starting"][名] 挪进 agents
-    （记下 pane_id 和 args，starting 里没有就报错）；agent send-keys <名> <键> 把键记进这个 agent 的 keys，按到现在的整串
+    （记下 pane_id 和 args，starting 里没有就报错；--kind claude 的没写 session 时给一个 fake-session-<名>（装了状态 hook 的
+    样子），写 session: "" 就是没有；P 从 state["shells"] 里拿掉；返回里带 agent list 那些字段）；agent send-keys <名> <键> 把键记进这个 agent 的 keys，按到现在的整串
     （空格连起来，如 "down enter"）命中 on_keys 里的键时把对应的值合进 agent（换 screen / status；gone 为真表示 agent 退出了，
-    删掉）；agent wait 直接返回当前状态；agent prompt <名> <文字> 记进 state["prompts"]、agent 变 working；
+    删掉）；agent wait 直接返回当前状态；agent prompt <名> <文字> 记进 state["prompts"]、agent 变 working——agent 里
+    stall_prompts: N 时接下来 N 次不提交：文字记进这个 agent 的 pending_input（留在输入框里的样子）、报
+    agent_prompt_stalled、状态不变，之后 agent send-keys <名> enter 才把它提交（记进 prompts、变 working）；
     tab create 见上面的 tab
   - 其他子命令一律报错退出（误用一眼能看出来）
 假测试工具：按调用名（vitest / tsc / eslint / pytest）打印对应格式的输出，失败条目读当前目录的 fake-<工具>.json，
@@ -107,7 +119,39 @@ def opt(name, default=None):
 agents = state.setdefault("agents", {})
 worktrees = state.setdefault("worktrees", [])
 panes = state.setdefault("panes", {})
+shells = state.setdefault("shells", [])
 cmd = args[:2]
+
+
+def group_alive(pgid):
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+# 背后有真进程组（pgid）的 agent：进程组没了就是 agent 退出了——名字清掉，它的 pane 回到 shell（同真的 herdr）。
+for gone in [n for n, a in agents.items() if a.get("pgid") and not group_alive(a["pgid"])]:
+    shells.append(agents.pop(gone).get("pane_id"))
+    save()
+inject = state.get("fail", {}).get(" ".join(cmd))
+if inject:
+    fail(inject.get("code", "injected"), inject.get("message", "fake herdr: injected failure"))
+
+
+def agent_view(name, a):
+    rec = {"name": name, "agent_status": a.get("status", "unknown"), "cwd": a.get("cwd", ""),
+           "state_change_seq": a.get("seq", 0)}
+    for key in ("agent", "pane_id", "workspace_id", "foreground_cwd", "focused"):
+        if key in a:
+            rec[key] = a[key]
+    if a.get("session") and a.get("gets", 0) >= a.get("session_after", 0):
+        rec["agent_session"] = {"agent": a.get("agent", "claude"), "kind": "id",
+                                "source": "herdr:" + a.get("agent", "claude"), "value": a["session"]}
+    return rec
 
 
 def pane_record(pane_id, p):
@@ -133,10 +177,7 @@ def find_pane(target):
 
 
 if cmd == ["agent", "list"]:
-    ok({"agents": [{"name": n, "agent_status": a.get("status", "unknown"), "cwd": a.get("cwd", ""),
-                    "state_change_seq": a.get("seq", 0), **({"agent": a["agent"]} if "agent" in a else {}),
-                    **{k: a[k] for k in ("pane_id", "workspace_id", "foreground_cwd") if k in a}}
-                   for n, a in agents.items()]
+    ok({"agents": [agent_view(n, a) for n, a in agents.items()]
                   + [pane_record(k, p) for k, p in panes.items() if p.get("present", True)]})
 if cmd == ["agent", "get"] and len(args) >= 3 and args[2] not in agents and find_pane(args[2]):
     key = find_pane(args[2])
@@ -198,9 +239,10 @@ if cmd == ["plugin", "config-dir"]:
 if cmd == ["agent", "get"]:
     if len(args) < 3 or args[2] not in agents:
         fail("agent_not_found", "fake herdr: no such agent")
-    a = agents[args[2]]
-    ok({"agent": {"name": args[2], "agent_status": a.get("status", "unknown"), "state_change_seq": a.get("seq", 0),
-                  **({"agent": a["agent"]} if "agent" in a else {})}})
+    if "session_after" in agents[args[2]]:
+        agents[args[2]]["gets"] = agents[args[2]].get("gets", 0) + 1
+        save()
+    ok({"agent": agent_view(args[2], agents[args[2]])})
 if cmd == ["agent", "read"]:
     if len(args) < 3 or args[2] not in agents:
         fail("agent_not_found", "fake herdr: no such agent")
@@ -222,8 +264,12 @@ if cmd == ["agent", "start"]:
     if spec is None:
         fail("agent_start_failed", "fake herdr: nothing in state.starting for " + name)
     agents[name] = dict(spec, pane_id=opt("--pane"), args=args[args.index("--") + 1:] if "--" in args else [])
+    if opt("--kind") == "claude":  # 装了状态 hook 的 claude 一开始会话 herdr 就有会话 ID；没装的样子：spec 里写 session: ""
+        agents[name].setdefault("session", "fake-session-" + name)
+    if opt("--pane") in shells:
+        shells.remove(opt("--pane"))
     save()
-    ok({"agent": {"name": name, "agent_status": agents[name].get("status", "unknown")}, "type": "agent_started"})
+    ok({"agent": agent_view(name, agents[name]), "type": "agent_started"})
 if cmd in (["agent", "send-keys"], ["agent", "wait"], ["agent", "prompt"]) and (len(args) < 3 or args[2] not in agents):
     fail("agent_not_found", "fake herdr: no such agent")
 if cmd == ["agent", "send-keys"]:
@@ -234,11 +280,20 @@ if cmd == ["agent", "send-keys"]:
         del agents[args[2]]
     elif update:
         a.update(update)
+    if args[3:] == ["enter"] and a.get("pending_input"):  # 输入框里留着没提交的话：回车把它提交了
+        state.setdefault("prompts", []).append([args[2], a.pop("pending_input")])
+        a.update(status="working", seq=a.get("seq", 0) + 1)
     save()
     ok({"type": "ok"})
 if cmd == ["agent", "wait"]:
     ok({"agent": {"name": args[2], "agent_status": agents[args[2]].get("status", "unknown")}})
 if cmd == ["agent", "prompt"]:
+    a = agents[args[2]]
+    if a.get("stall_prompts", 0) > 0:  # 话打进了输入框、回车没提交（Claude Code 会话刚开始时实测有过）
+        a.update(stall_prompts=a["stall_prompts"] - 1, pending_input=args[3])
+        save()
+        fail("agent_prompt_stalled", "agent prompt produced no observed working or blocked state within 5000 ms; "
+                                     "current status is " + a.get("status", "idle"))
     state.setdefault("prompts", []).append([args[2], args[3]])
     agents[args[2]]["status"] = "working"
     save()
@@ -311,8 +366,25 @@ if cmd == ["worktree", "open"]:
         if w["repo"] == repo and w["branch"] == opt("--branch"):
             ok({"workspace": {"workspace_id": w["workspace_id"], "label": w["label"]}, "worktree": w})
     fail("worktree_not_found", "fake herdr: no such worktree")
+if cmd == ["pane", "list"] and opt("--workspace") is None:
+    ok({"panes": [{"pane_id": p} for p in dict.fromkeys(
+        [*panes, *shells, *[a["pane_id"] for a in agents.values() if a.get("pane_id")]])], "type": "pane_list"})
 if cmd == ["pane", "list"]:
     ok({"panes": [{"pane_id": "%s:p1" % opt("--workspace"), "workspace_id": opt("--workspace")}]})
+if cmd == ["pane", "process-info"]:
+    pane = opt("--pane")
+    owner = next((a for a in agents.values() if a.get("pane_id") == pane and a.get("pgid")), None)
+    forced = state.get("pane_procs", {}).get(pane)
+    if forced or owner:
+        group = forced or {"pgid": owner["pgid"], "procs": owner.get("procs") or [
+            {"pid": owner["pgid"], "argv0": owner.get("agent", "claude"), "name": owner.get("agent", "claude")}]}
+        ok({"process_info": {"pane_id": pane, "shell_pid": 1, "foreground_process_group_id": group["pgid"],
+                             "foreground_processes": group["procs"]}, "type": "pane_process_info"})
+    if pane in panes or pane in shells or any(a.get("pane_id") == pane for a in agents.values()):
+        ok({"process_info": {"pane_id": pane, "shell_pid": 1, "foreground_process_group_id": 1,
+                             "foreground_processes": [{"pid": 1, "argv0": "-zsh", "name": "zsh"}]},
+            "type": "pane_process_info"})
+    fail("pane_not_found", "pane not found")
 
 
 def pane_view(pane_id):

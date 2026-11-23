@@ -339,7 +339,8 @@ agent 名：`[a-z][a-z0-9_-]{0,31}`，在 `herdr agent list` 中唯一。用 `<�
 | `rollup:<状态>` | 只有子编排者（有 orch.json 的 agent）才有，单独一行，和它的状态行互不影响（子编排者可能同时是 `waiting-background(1)`：它写完 rollup 还挂着 watch 盯自己的 worker）。它的 rollup.md 状态变了，或者状态是 等你决定 / 完成 / 受阻 / 需要换编排者 时内容变了，就会报：按内容判断（每行去掉首尾空白、删掉空行后比较），原样重写、只改空白空行不报，不看"更新："行。读它的 `rollup.md`，按 sub-orch.md"你是上层时"第 3 步处理；`rollup:进行中` 不用处理。启动时输出的是当前值，内容和你上次读的一样就是已经处理过的，不用再处理 |
 | `done` / `idle` | 走摸底、还没发"开始"的 agent：读 `<slug>/<name>.survey.md`，按 5.1 处理。其他情况读 `~/.drover/<slug>/<name>.md`（完成协议要求 worker 把报告写进这个文件，对话里只回复路径和 status，不再写第二遍）；没有这个文件就 `herdr agent read <name> --source recent-unwrapped --lines 60` 看屏幕，判断是"做完没写文件"还是"没开始"：前者用 `prompt --text "按完成协议把报告写到 <文件>，在对话里只回复路径和 status"` 让它补写文件，后者按 stalled 处理 |
 | `unknown` 持续 > 2 分钟 | read 屏幕：还在跑就继续等；像是崩了或退到 shell 按 `gone` 处理 |
-| `gone`（agent 退出） | `herdr pane read <pane_id> --source recent --lines 80` 看退出原因；用原参数加 `--resume` 重新执行 `agent-start`（claude 续 `--continue`，codex 续 `resume --last`），并 prompt 它接着做；重启失败 2 次报告用户 |
+| `gone`（agent 退出） | `herdr pane read <pane_id> --source recent --lines 80` 看退出原因；用原参数加 `--resume` 重新执行 `agent-start`（按它记下的会话 ID 续；没记下的 claude 续 `--continue`，codex 续 `resume --last`），并 prompt 它接着做；重启失败 2 次报告用户 |
+| `released` | 被释放的 worker（第 9 节"pane 清理"），只在 watch 启动时和 `--once` 显示：不用处理。它在 herdr 里没有名字了，`herdr agent read / send-keys / focus <名>` 会报 agent_not_found：要看它的屏幕用 `herdr pane read <pane_id> --source recent --lines 80`，要它接着做直接 `drover prompt` / `brief --send`（自动在原 pane 续上，返回里 `resumed: true`） |
 | `working-no-output(Nm)` | agent 在 working，但屏幕输出已经 N 分钟没变（计时行、轮换的 Tip 不算），也没在跑命令（默认阈值 5 分钟，之后每 5 分钟报一次，`--quiet-minutes` 可改、0 关闭）。多半是卡在一次模型调用上：实测 Codex worker 改完代码、测试也过了，却停在 working 不写报告，过了十几分钟（working-no-diff 要 20 分钟才报）。处理：`herdr agent read <name> --source recent-unwrapped --lines 60` 看最后一次动作。活已经干完只差报告，或者明显停住了，就 `herdr agent send-keys <name> esc`，再 prompt "先汇报当前进度，然后接着做；做完了就写报告"。Claude 的 spinner 上 token 数还在涨，说明在做大段推理，再等一轮 |
 | `working-no-diff(Nm)` | agent 在 working，但它的 worktree 已经 N 分钟没有任何改动（HEAD、diff、未跟踪文件都没变；默认阈值 20 分钟，之后每 20 分钟报一次，`--stall-minutes` 可改、0 关闭）。只是提示，跑长测试、读大量代码时也会这样：`agent read` 抽查进展（不打断）；仍在推进就继续；卡死则 `herdr agent send-keys <name> esc` 后发 prompt "继续之前的任务，先汇报当前进度" |
 | watch 到期（Monitor 到期 / `EVENT timeout`） | 重新挂，继续 |
@@ -409,6 +410,8 @@ verify 命令在脚本里跑，不会触发审批；但测试多的命令（比�
 
    不符合的发回 worker 改。
 
+验收通过、不是马上还要给它派活的（比如等着发复审的修复）：`~/.drover/bin/drover release --name <agent名>` 释放它（第 9 节"pane 清理"）。
+
 **规矩 ↔ 谁强制**：本节每条规矩由谁把关。"脚本"的违反了会在 accept / review 的结果里直接判不通过或拒绝；"文字"的只有你照做，漏了没有任何东西报错。
 
 | 规矩 | 谁强制 |
@@ -437,7 +440,7 @@ PARTIAL / FAILED 时先读报告和屏幕（`herdr agent read <name> --source re
 | 原因 | 判断依据 | 处理 |
 |---|---|---|
 | 上下文用满 | agent 说上下文不够、开始遗忘前面的约定，或屏幕显示上下文接近上限 | 缩小范围，在同一个 worktree 开新 agent（`agent-start --split-from <旧 pane> --wt <WT_PATH>`，名字加 `-2` 这类后缀）；`brief` 的任务段写清已完成的部分（文件、函数、测试，可以引用旧报告路径）和剩下要做的 |
-| 进程退出、连接断开 | watch 出 `gone`，或 pane 里回到了 shell | 走事件表的 `gone` 流程（`agent-start --resume`），续上之后 prompt 它接着做 |
+| 进程退出、连接断开 | watch 出 `gone`，或 pane 里回到了 shell（`watch --once` 显示 `released` 的不算：那是释放的，照常 prompt 就会续上） | 走事件表的 `gone` 流程（`agent-start --resume`），续上之后 prompt 它接着做 |
 | 工具报错或原地打转 | 同一个错误连续两轮出现，或连续两轮没有新进展 | 换 kind：claude 换 codex、codex 换 claude，在同一个 worktree 开新 agent（`--split-from`），brief 里写清前一个 agent 卡在哪 |
 | 需求理解偏了 | 改动方向和目标（第 1.1 节）或任务书不符 | 先分清是谁偏了：agent 偏离了任务书 → 发纠正，写明哪里偏了、正确的是什么；任务书本身偏离了用户意图 → 按第 1.1 节把证据和新的理解给用户看，用户定了再发纠正 |
 | 其他（缺信息、环境问题） | — | 给出具体指引，prompt 同一个 agent 继续 |
@@ -485,7 +488,7 @@ PARTIAL / FAILED 时先读报告和屏幕（`herdr agent read <name> --source re
 
 开头一行写目标（第 1.1 节，用户纠正过就用纠正后的），再说结论（全部完成 / 部分完成 / 需用户决定），然后每个仓库一段：
 
-- worktree 路径、分支、workspace label、agent 名与 pane_id（用户可 `herdr agent focus <name>` 跳过去看）
+- worktree 路径、分支、workspace label、agent 名与 pane_id（用户可 `herdr agent focus <name>` 跳过去看；已释放的 worker 没有名字可 focus，标上"已释放"：`herdr pane read <pane_id>` 看它的屏幕，`herdr workspace focus <workspace_id>` 跳到它的 workspace）
 - 状态、改动文件、验证结果
 - 依赖情况：`deps` 里失败或未安装的项（如有）
 - 验收结果：图谱风险分、无测试覆盖的函数及处理结果（补了测试 / 补了运行证据 / 说明了理由）；新文件已用 `git add -N` 标记
@@ -513,7 +516,7 @@ worktree、workspace 留着（什么时候删见第 7 节和下面"任务收尾"
 - **复审 pane**：`collect` 存档后自动关闭（见 review.md）。
 - **临时 pane**（探测、调试用的）：用完立即关闭。
 - **被接替的主 agent**：同一个 worktree 换了新的主 agent 时（例如后续任务新起了 agent），把旧 agent 的报告确认已在状态文件里，然后关掉它的 pane。
-- **当前主 agent**：保留到用户说"清理"或"收尾"，方便"把上次那个也改了"这类后续直接复用它的上下文。那时 `drover cleanup` 删 worktree 会关掉它的 workspace 和里面的 agent（核实 agent 没在干活才删，见 wrapup.md）；它是 workspace 里最后一个 pane 时不单独关 pane。
+- **当前主 agent**：pane、worktree、分支、workspace 留到用户说"清理"或"收尾"（那时 `drover cleanup` 删 worktree 会关掉它的 workspace；核实里面的 agent 没在干活才删，见 wrapup.md；它是 workspace 里最后一个 pane 时不单独关 pane）。进程不留：验收通过、不是马上还要给它派活的就 `~/.drover/bin/drover release --name <名>`，只退它的 agent 进程（连同 MCP 子进程，一个 claude worker 几百 MB）；没释放的闲置 10 分钟后也会被自动释放。上下文不丢：之后照常 `drover prompt` / `brief --send`，会先在原 pane 按会话 ID 续上再发（"把上次那个也改了"这类后续照旧直接发）。
 - **探测 / 调研 worktree**（不交付改动的，探测、调研、测性能用）：报告记进状态文件后就删，不用问：`~/.drover/bin/drover cleanup --slug <slug> --probe --wt <WT>`。本地独有的提交和没提交、没被忽略的改动先存成 patch 到 `~/.drover/<slug>/probe-*.patch`（返回的 `patches`，存成了才删），patch 路径记进状态文件；里面的 agent 在 working / blocked 照样不删。要复用的（后面某一步还要接着测），状态文件里写明哪一步用、用完就删。
 - 汇报里列出还开着的 pane 和原因。
 
@@ -524,7 +527,7 @@ worktree、workspace 留着（什么时候删见第 7 节和下面"任务收尾"
 ## 子模式
 
 - `/drover status [slug]`：列出 `~/.drover/*/dispatch.md` 的任务，用 `~/.drover/bin/drover watch --once <各任务的 agent 名>` 查当前状态；给了 slug 则只看那个并读其报告文件。
-- `/drover resume <slug>`：读状态文件，用 `watch --once` 确认其中的 agent 是否还活着，活着就从第 6 节继续追踪，`gone` 按事件表处理。
+- `/drover resume <slug>`：读状态文件，用 `watch --once` 确认其中的 agent 是否还活着，活着就从第 6 节继续追踪，`gone` 按事件表处理（`released` 是被释放的 worker，不用处理）。
 
 ## 关键规则
 

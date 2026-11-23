@@ -110,6 +110,7 @@ cd ~/.drover/src
 | 主会话 | 你在主工作台开的 claude 或 codex，就是 drover 本身：路由、问答、审核、转达；要改代码的活交给编排者 |
 | 编排者（orchestrator） | 一个任务一个，在 herdr 的 `orch` workspace 里占一个 tab：分析、拆条目、起 worker、追踪、按证据验收、集成和推送 |
 | 条目和 worker | 编排者把任务拆成条目，一个条目一个 git worktree、一个 worker（claude 或 codex）；互不重叠的条目同时派发 |
+| 释放（release） | worker 做完、闲置 10 分钟（`worker_idle_release_minutes`，0 关）就退出它的进程腾出内存，worktree 和分支留着；再给它派活时按会话 ID 自动续上，上下文不丢（[release](docs/reference.md#release)） |
 | 集成 worktree | 编排者的，每个仓库一个（分支 `task/<slug>`）：各条目的提交在这里归集、整体检查一次、同步上游、推送 |
 | `request.md` / `rollup.md` | 主会话写给编排者的需求；编排者交回的一页汇报（≤ 40 行），主会话只读这一页 |
 | 完成证据 | 每份任务书都写清"用什么命令、看到什么结果算通过"，验收时脚本重跑这些命令，不只看 worker 的自述 |

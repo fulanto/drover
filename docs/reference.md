@@ -25,7 +25,8 @@
 | `prompt` | 把文件（或 `--text` 短消息）发给某个 agent，看到它开工（working）就返回（正常 1 秒内，最多等 30 秒），之后交给 `watch`；发给编排者成功后记一个 `answered.json`（看板靠它分出"已转答复，等它接着做"：rollup 从那时起内容没变才算），时间线记一条转答复（内容以"收尾"开头的再记一条收尾请求）；发给顶层编排者时它的 rollup 在主会话上次读之后又改过的，照发、返回里多一个 `warning` | 主会话（转达）、编排者 |
 | `wt` | 建或复用 worktree。新建前先 fetch 源仓库主检出的上游，主检出干净且落后时快进（只快进，不硬覆盖），从远端最新起（主检出有改动、分叉时不动它，改从上游起并在 `warnings` 里报出；上游在远端已删当作没有上游；主检出不在远端默认分支上时提示一句；`--no-sync` 不同步）；复制 `.claude/settings.local.json`、`.env*`（源仓库没跟踪的，或在新 worktree 里被 gitignore 的），以及被 gitignore 的仓库规范文件（`CLAUDE.md` 等），以及仓库根目录 `.worktreeinclude`（Claude Code 的约定，gitignore 语法）匹配到的被忽略文件（如 Java 仓库的本地配置、本机测试页；在新 worktree 里不被忽略的不复制，列在 `worktreeinclude_skipped`）。多轮任务的新一轮（`--slug`，不传按分支名 `task/<slug>…` 归属；任务在这个仓库有推送记录时）：不传 `--base` 从上一轮推的远端分支起（推过两条以上要显式 `--base`）；建之前核实起点含上一轮推的提交（同分支看祖先，换分支按补丁内容比），不含就 `ok: false`、不建，列出缺的提交和两种做法；`--carry "<理由>"` 带上缺的提交照常建（理由记进 `carry.jsonl`）。推到别处的推送（remote 之后换过地址，按记录里的 `remote_url` 比主机 + 路径认，同一个仓库的 ssh / https / scp 写法算同一个）不拿来定起点、不核实、不进 `--carry`，列在 `round_check.other_remote`、进 `warnings`；全推到了别处时 `round_check.status` 是 `other_remote`，起点照第一轮。缺的提交来自没记地址的旧记录时，报错多一段：换过地址就别 `--carry`，给记录补上 `remote_url`（`no_remote_url` 给出记录所在的文件）。没有推送记录时起点和以前一样 | 编排者 |
 | `deps` | 在 worktree 里独立安装依赖（不软链源仓库） | 编排者 |
-| `agent-start` | 在 pane 里启动 claude / codex worker，自动处理启动弹窗：新目录的信任弹窗、Claude Code 对 `--add-dir` 加进来的目录弹的 "Adding a new directory" 信任框（光标默认在 "No, exit"，移到 "Yes, add it" 再确认）、codex 的升级提示。模型和 effort：`--model` / `--effort` > 任务 `orch.json` 记的（宿主和编排者相同才继承）> config > 内置默认（claude `opus[1m]` + xhigh；codex xhigh、不传模型）；claude 传 `--model`，codex 传 `-m` | 编排者 |
+| `agent-start` | 在 pane 里启动 claude / codex worker，自动处理启动弹窗：新目录的信任弹窗、Claude Code 对 `--add-dir` 加进来的目录弹的 "Adding a new directory" 信任框（光标默认在 "No, exit"，移到 "Yes, add it" 再确认）、codex 的升级提示。模型和 effort：`--model` / `--effort` > 任务 `orch.json` 记的（宿主和编排者相同才继承）> config > 内置默认（claude `opus[1m]` + xhigh；codex xhigh、不传模型）；claude 传 `--model`，codex 传 `-m`。起好记一份 worker 记录 `<slug>/<agent>.agent.json`（启动参数、pane、会话 ID），`release` 和续上按它；`--resume` 按记录里的会话 ID 续 | 编排者 |
+| `release` | 释放空闲的 worker：`--name <agent>` 退出它的 agent 进程（连同 MCP 子进程）腾出内存，pane、workspace、worktree、分支都不动；之后 `prompt` / `brief --send` 发给它会先在原 pane 按会话 ID 续上再发，`watch` 显示 `released`。只放 `agent-start` 起的、空闲（done / idle，没有确认框、接口错误、后台命令）、有会话 ID、发过话的；不放时 `ok: false`、`error` 写原因。`--idle` 是闲置扫描（空闲满 `worker_idle_release_minutes` 分钟的都放，`watch`、看板、`main-register` 到时间了在后台起它），`--idle --dry-run` 看每个候选空闲了多久、满了的为什么没放。详见下面的 [release](#release) | 编排者；`--idle` 由 watch、看板在后台起；你排查"为什么没放"时手动跑 |
 | `brief` | 按模板生成任务书（必填完成证据），可先摸底，`--send` 生成后立刻发出（和 `prompt` 一样看到开工就返回）。`--evidence-cmd` 紧跟在它所属的 `--evidence` 后面，给这条证据配验收时重跑的命令，证据清单写进 `<slug>/<agent>.evidence.json`；状态文件拿锁追加（几个同时跑不丢段）；同一个 agent 再生成时上一轮的任务书、报告、摸底挪成 `.rN`。模板里限了篇幅：摸底只写结论和证据位置，"和代码不符""需要决策"两部分写全、其余 100 行左右；报告每条 verification 一行（命令 → 汇总行 → heavy 流水号）、尽量 60 行内，worker 在对话里只回复报告路径和 status | 编排者 |
 | `accept` | 验收：标记新文件、建图、改动分析、diff 概览、crapper 查这次改动碰到的函数的圈复杂度、重跑验证命令（认得出 vitest / pytest / mvn 的输出时，退出码 0 却一个测试都没跑也判不通过；每条给 通过 / 失败 / 跳过 三个数）；`--verify-baseline` 和基线比失败条目（基线上只重跑失败的文件；解析不全、提前停了、基线不可信都按失败），`--integration` 是集成检查（不建图、不跑 crapper，dryer 扫全仓、只留碰到改动的重复；跑在试集成 worktree 上时结论记进试集成状态，检查的是工作区整体状态写成的树，没叠完、有没解决的冲突时不检查），`--no-graph` 只是不建图。建图、dryer 和验证命令都经 heavy 调度；多条验证默认同时交给调度（能同时跑的同时跑，结果按传入顺序），前后有依赖的加 `--serial` 逐条跑。`--slug --name <agent>`：带命令的证据自动当 verify 跑，`evidence` 给每条证据的结论和"证据 N 条 / 有命令 M 条 / 通过 K 条 / 只能看自述 X 条"，默认存 `<slug>/accept-<agent>.json`。结果里另有 `worker_runs`（这个 worktree 的 heavy 流水：在现在的代码上通过过的、先失败后通过的）和改动指纹（review 核对用） | 编排者 |
 | `integrate` | 集成 worktree：每个（仓库，目标分支）一个（第二条目标分支自动另建 `task/<slug>-<目标>`，指到别的目标的 worktree 拒绝复用），从最新上游建，复用时没有没推的提交就先快进到最新上游；只摘条目分支起点（`wt` 记在 `starts.jsonl`）之后的提交，起点带着目标分支没有的提交时停下列出来（`--carry-base` 带上），没有起点记录的旧条目照旧摘、给提示；"已应用"按 HEAD 核实（abort 过的冲突重摘、单列 `abandoned`，补丁比较保留空白），装依赖。冲突时试集成里有对得上的同一步（这个提交的父树、树和摘之前的树都一样）就照它解过的还原、接着摘（`replayed`）；返回的 `trial` 写明集成完的树和试集成验过的树对不对得上。新建时和 `wt` 一样核实起点含上一轮推的提交（`--from` 的条目分支里已有的不算缺），`--carry` 同 `wt`；目标分支远端还没有时要 `--create-from <远端>/<源分支>`；重建集成 worktree 不丢推送记录 | 编排者 |
@@ -101,6 +102,73 @@
 - **新目录信任弹窗**：Claude Code 启动时问工作目录的（"Yes / trust"），和问 `--add-dir` 目录的（"Adding a new directory: … This session hasn't worked here before"，选项"Yes, add it"），都是把光标移到 Yes 那项再回车。不能直接按回车：两种框的默认选项都是"No, exit"，回车会让 agent 直接退出。
 - **codex 升级提示**：按 esc 跳过（升级是全局安装，由用户决定）。
 
+claude 起到 idle 以后还要等它的会话开始（herdr 报出会话 ID）才算起好，最多等 15 秒：处理完启动弹框 herdr 马上就报 idle（屏幕上有输入框了），实测 0.4～2 秒后会话才真的开始，这中间发的话会留在输入框里、回车被吞掉（herdr 报 `agent_prompt_stalled`）。没装 herdr 的 claude 状态 hook 的机器上等不到，等满照常返回。codex 第一轮对话之后才报会话，不等。
+
+起来以后（包括卡在不认识的启动弹窗上、`ok: false` 但 agent 还活着的）写一份 worker 记录 `~/.drover/<slug>/<agent>.agent.json`，返回里的 `record` 是它的路径：
+
+| 字段 | 含义 |
+|---|---|
+| `name`、`slug`、`kind` | agent 名、任务、宿主（claude / codex） |
+| `model`、`effort` | 补完默认值之后实际用的（codex 没指定模型时没有 `model`）；续上时原样用，之后改 config 不影响 |
+| `add_dirs` | `--add-dir` 给的目录（`~/.drover/<slug>`、codex 的 heavy 调度目录续上时照旧自动加） |
+| `pane_id`、`cwd` | 起在哪个 pane、herdr 报的工作目录（`--split-from` 时是 `--wt`） |
+| `started_at` | 启动时间（epoch 秒） |
+| `session_id` | 宿主的会话 ID，取自 herdr 的 `agent_session`（来源见 [release](#release)）。claude 起好时就有；codex 跑完第一轮才有，释放时再取 |
+| `state` | `running` / `released` |
+| `prompted_at` | 最近一次经 `prompt` / `brief --send` 给它发话的时间。没有它的（还没发过话）不释放 |
+| `released_at`、`release_reason`、`freed_kb` | 释放时加：时间、`manual`（`release --name`）或 `idle`（闲置扫描）、放掉的进程组的 RSS 合计（KB，`ps` 用不了时没有） |
+| `resumed_at` | 续上时加 |
+
+`--resume`（agent 意外退出后在同一个 pane 续上次会话）：这个任务里有它的记录、记着会话 ID 时按 ID 续（claude `--resume <id>`，codex `resume <id>`），没给 `--kind` 时宿主也取记录的；没有记录或没记下会话 ID 时照旧 claude `--continue`、codex `resume --last`（按工作目录取最近一次会话，同一个 worktree 里有过两个会话时会续到另一个上）。
+
+别的任务释放了的 worker 的名字，在它的 pane 还在时不能拿来起新 agent（旧编排者再给这个名字发话，会发给新的那个）：报错让换名字。
+
+### release
+
+worker 做完以后进程不用留着：上下文在宿主存在磁盘上的会话里，进程退了按会话 ID 照样续得上（claude、codex 都实测过：释放后续上，答得出释放前告诉它的口令）。留着进程只占内存（`ps` 的 RSS，实测）：一个 claude worker 本体约 270～410MB，外加它起的 MCP 子进程（看项目配置，context7 的两个 node 合计约 200～280MB），端到端测试里每次释放放掉 510～590MB；codex 本体约 150～190MB，配了 MCP 时同样带着子进程，合计 470～500MB；释放后 pane 里只剩 shell，约 2MB。
+
+**释放**（`drover release --name <agent>`）依次核对，都过了才动手：
+
+1. 有 worker 记录（只放 `agent-start` 起的：编排者、子编排者、复审、主会话、自己开的 agent、这个版本之前起的 worker 都没有记录，不放）。
+2. herdr 里这个名字还在记录的那个 pane、宿主相同。
+3. 有会话 ID：herdr 这时报的优先（续上以后宿主可能换了会话），没有再用记录里的；两边都没有不放。没有会话 ID 只能按工作目录取最近一次会话续，同一个 worktree 里有过两个会话时会续错。
+4. 空闲：herdr 报 done / idle，而且按屏幕修正后还是（确认框 → `blocked`、最后一个输出块是接口错误 → `api-error`、状态栏挂着后台命令或 Monitor → `waiting-background(N)`，同 watch）。挂着后台命令的不放：它会自己接着干；而且 Claude Code 的 Bash 工具命令在它们自己的进程组里（实测），发给前台进程组的信号到不了它们。
+5. 经 drover 给它发过话（`prompt` / `brief --send`，记录里的 `prompted_at`）：没对过话的会话按 ID 续不上（claude 实测报 "No conversation found with session ID" 后退出），放了就起不回来。
+6. pane 的前台进程组认得出是这个宿主：组号不是 shell 自己的，组里至少有一个进程叫 claude / codex（看 `herdr pane process-info` 给的 `argv0`、`name` 和 `argv` 里的脚本路径：原生安装的组长 `argv0` 就是 `claude`；npm 装的是 `node …/bin/claude`；codex 的 npm 包再起的原生二进制 `argv0` 是 `…/codex`）。认不出时不发信号，`error` 里列出看到的每个进程（pid 和命令行）。
+
+然后把记录改成 `released`，给前台进程组发 SIGTERM，最多等 10 秒，还在就 SIGKILL。MCP 子进程跟着退（实测）：claude 的和它在同一个进程组里；codex 的各在自己的进程组里，codex 一退它们 3 秒内也都退了。记录先改、信号后发：进程一退 herdr 就清掉名字，watch 这时读到的记录已经是 `released`，不会报 `gone`。没退掉的把记录改回去。返回里有 `signal`、`session_id`、`freed_mb`；pane 是 herdr 报的 focused 时照放、`warnings` 里提一句。已经释放了的再放一次是 `ok: true`、`already_released: true`。
+
+不用 `/exit` 退：它要往输入框里打字，输入框里有半截字时会拼成一条 prompt 发出去。
+
+**续上**：`drover prompt`、`brief --send` 发给 herdr 里已经没有、最新记录是 `released` 的 worker 时，先在原 pane 用记录里的参数加会话 ID 把它起回来（claude 加 `--resume <id>`，codex 是 `resume <id>` 加原来的选项；启动弹窗照 `agent-start` 处理，claude 等到会话开始），再把话发出去，返回里多 `resumed: true` 和 `resume_command`。刚续上发的话偶尔会留在输入框里没提交（herdr 报 `agent_prompt_stalled`，机器忙时实测有过：话打进去了，回车被当成换行）：这时屏幕上没有确认框就补一次回车，提交了的返回里带 `submitted_with: extra_enter`，还是没提交的照 herdr 的结果报回去。发话和释放对同一个 agent 拿同一把锁（`locks/agent-<名>.lock`）：正在释放时进来的话等它放完再续上；正在发话时闲置扫描跳过它。续不上时不发、`ok: false`、`outcome: resume_failed`，`error` 写下一步：
+
+- 原 pane 不在了（herdr 明确报 `pane_not_found`）：在它的 worktree 里新开一个 pane，`agent-start --resume`。
+- 查 pane 时 herdr 调用失败（超时、一时连不上）：不当成 pane 不在了，稍后重发。
+- 原 pane 里在跑别的程序：等它结束，或换一个 pane `agent-start --resume`。
+- 起来又退出了（`start.pane_output` 里有宿主的报错）：宿主说这个会话续不了的，去掉 `--resume` 起一个新会话，之前的上下文没有了，任务书要重发。
+
+按旧流程跑着的编排者不知道有释放：它照旧 `prompt` / `brief --send` 就会续上；它直接 `herdr agent read <名>` 会报 agent_not_found，这时看屏幕用 `herdr pane read <pane_id>`。
+
+**闲置自动释放**：`agent-start` 起的 worker 连续空闲满 `worker_idle_release_minutes` 分钟（默认 10，见[配置](configuration.md)）、pane 不是 herdr 报的 focused（你可能正在看它；被 focus 了计时清零，离开后从头算），由后台扫描 `release --idle` 放掉，核对同上。中间干过活（herdr 的状态序号变了）从头算。
+
+- 谁触发：普通 `watch`、`watch --main` 的每一轮，`board` 文本 / `--json` / `--live`，`main-register`。它们只读一个小文件，离上次满 60 秒才在后台起一次扫描、不等它；扫描一次只跑一个。这些都没在跑时没有扫描。
+- 扫描一次只调一次 `herdr agent list`，各自从什么时候开始空闲记在 `~/.drover/idle-release.json`；输出追加进 `~/.drover/idle-release.log`（超过 512KB 清空重写）。
+- 默认 10 分钟的依据：Anthropic 的 prompt 缓存默认 5 分钟有效（[Prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)："By default, the cache has a 5-minute lifetime"），闲置超过以后留着进程不省 token，只省几秒启动。
+
+**为什么没被放**：`drover release --name <agent> --dry-run` 走一遍核对、不动手，`error` 就是原因；`drover release --idle --dry-run` 列出每个候选已经空闲多久（`idle_minutes`）、满了的会放谁（`released`）、不放的和原因（`refused`）。常见的：
+
+- 没有会话 ID。会话 ID 是 herdr 的状态 hook 报的：`herdr integration install claude`（codex 同理，install.py 会装）在宿主的 SessionStart hook 里调 herdr 的 `pane.report_agent_session`，之后 `herdr agent get <名>` 的 `agent_session`（`source` 是 `herdr:claude` 这类）才有值。没装或不是 current（`herdr integration status`）的机器上 herdr 拿不到会话 ID，闲置释放不会生效，手动 `release` 会拒绝并写明这一条；装好后新起的 agent 才有。
+- 认不出进程组（少见的启动方式）：`error` 里有看到的进程。
+- 还没经 drover 给它发过话：起了以后一直没派活的 worker 不放（放了续不上）。
+- 没有 worker 记录：这个版本之前起的 worker 不会被放，照旧留到清理 / 收尾。
+- drover 自己跑在沙箱里时没有权限给别的进程发信号（`error` 里写明）。
+
+**释放的代价**：
+
+- 命令级的"不再询问"存在文件里，不丢：claude 写在 worktree 的 `.claude/settings.local.json`，codex 写在全局规则文件 `~/.codex/rules/default.rules`。
+- 会话里临时切过的权限模式（shift+tab、"switch to auto mode"）不留，续上后回到启动时的（claude worker 是 `acceptEdits`）。
+- 续上要几秒启动，第一轮要重读上下文（缓存过期以后本来也要重读）。
+
 ### brief
 
 - 宿主：`--kind` 不传时按 `--name` 这个 agent 在 herdr 里的实际宿主写（agent 还没起时用 orch.json 的 `default_kind`，再是调用方）；传了却和活着的 agent 对不上会进 `warnings`。
@@ -110,6 +178,8 @@
 - 写到 `<slug>/<agent名>.prompt.md`，证据清单（每条证据和它的命令）写到 `<slug>/<agent名>.evidence.json`；在状态文件末尾追加 `## brief：<agent名>（时间，kind，摸底：是/否）` 段，列出完成证据和命令。状态文件拿锁追加，几个 brief 同时跑也不丢段。重新生成会再追加一段，以最后一段为准；同一个 agent 上一轮的任务书、报告、摸底先挪成 `<agent名>.prompt.rN.md` / `<agent名>.rN.md` / `<agent名>.survey.rN.md`（新 brief 段写出挪到哪了）。
 
 ### watch
+
+`released`：herdr 里没有这个名字、它最新的 worker 记录是 `released`、释放时的 pane 还在。只在启动时和 `--once` 显示；done / idle 变成 `released` 不输出、不算事件（`--until-event` 不因为它退出），续上以后的状态照常报。释放时的 pane 被关了（原地续不了）报 `gone`。pane 还在不在是每轮一次 `herdr pane list` 查的（盯着的名字里没有已释放的就不查），这次调用失败时不知道在不在：沿用上一轮显示的，启动那一轮按 `released`，不报 `gone`。普通 watch 每一轮也触发闲置扫描（见 [release](#release)）。
 
 `blocked` 的重报：同一个 agent 可能连着报两次 `blocked`：herdr 的状态序号变了（中间那下 working 没轮询到）、弹框内容换了、或者一直有弹框而 herdr 的原始状态变了（比如 blocked → working），watch 都会重报。两个弹框一字不差（同一条命令连着两次）且中间那下没轮询到时，watch 认不出是新的。herdr 报 done、但屏幕底部是确认弹框时（比如 Claude Code 的 WebFetch 域名授权，herdr 有时认不出、报成 done），watch 也报 `blocked`；herdr 报 working、但屏幕底部是后台子 agent 的确认框时（主 agent 停在 "✻ Waiting for N background agent(s) to finish"，herdr 按这一行报 working；watch 在 working 时每 10 秒看一次屏幕），watch 也报 `blocked`。
 
@@ -270,6 +340,7 @@ drover/
 │   ├── <agent>.evidence.json        # brief 写的证据清单：每条完成证据和验收重跑它的命令（--evidence-cmd），accept --name 读
 │   ├── <agent>.survey.md            # 摸底结果（走摸底的条目才有）
 │   ├── <agent>.md                   # worker 的报告（=== DISPATCH RESULT === 块）
+│   ├── <agent>.agent.json           # worker 记录（agent-start 写）：启动参数、pane、会话 ID、state（running / released），release 和续上按它，字段见 agent-start
 │   ├── <agent>.prompt.rN.md         # 同一个 agent 再 brief 时挪走的上一轮任务书（报告、摸底同样是 <agent>.rN.md、<agent>.survey.rN.md）
 │   ├── evidence/<agent>/            # 证据产物：截图、录屏、接口响应、能重跑的检查脚本（worker 放，报告列路径）
 │   ├── heavy-runs.jsonl             # heavy 流水：条目 worktree 里经 heavy 跑的每条命令一行（worktree、命令、退出码、汇总行、改动指纹）
@@ -321,6 +392,10 @@ drover/
 │                                    #   backfill），这是 CPU 可以空着还有人排队的唯一情形。codex 沙箱里
 │                                    #   ps 不让执行、整机实测读得到：没有进程树实测的票按预留算、但不超过整机实测；整机也读不到时退回按预留
 ├── locks/update.lock                # 更新锁：同一时间只跑一个 drover update（自动的、手动的）
+├── locks/agent-<名>.lock            # 释放和发话对同一个 agent 互斥（release、闲置扫描、prompt、brief --send 都拿）
+├── locks/idle-release.lock          # 闲置扫描一次只跑一个；locks/idle-release-tick.json 是上次起扫描的时间（满 60 秒才再起）
+├── idle-release.json                # 闲置扫描记的候选：每个空闲着的 worker 的 pane、herdr 状态序号、从什么时候开始空闲
+├── idle-release.log                 # 后台闲置扫描的输出（每次一个 JSON：released、refused、idle_minutes；超过 512KB 清空重写）
 ├── board-tab.json                   # 看板 tab 是哪个（tab、pane、workspace）、主会话在哪个 pane，board --tab 复用、--live 认出自己在看板 tab 里、补登记靠它
 ├── board-live.json                  # 看板 tab 里的 board --live 每轮写的心跳（pid、pane、它跑的代码的版本、时间）；board --tab 靠它认出旧代码的看板、重启
 ├── board-pane.json                  # 旧的看板分屏（board --pane）是哪个 pane、开在哪个主会话 pane 下面；board --tab 关掉分屏时一起删

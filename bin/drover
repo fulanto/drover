@@ -11,7 +11,9 @@ JSON 对象，字段 ok 表示是否成功；失败时 error 字段说明原因�
                 复制 settings.local.json 和 .env*（源仓库没跟踪的，或在 worktree 里被忽略的），返回 workspace/pane/路径/起点 commit
   deps          在 worktree 里独立安装依赖（不软链源仓库），返回给 agent prompt 用的中文摘要；--save 存成 JSON 给 brief 用
   agent-start   在 pane 里启动 claude/codex agent（--kind 不给时用主会话的宿主），自动处理新目录的信任弹窗；
-                --split-from 在旁边新开 pane 再启动
+                --split-from 在旁边新开 pane 再启动；起好记一份 worker 记录（<slug>/<名>.agent.json），释放和续上按它
+  release       释放空闲的 worker：退出它的 agent 进程（连同 MCP 子进程）腾出内存，pane、worktree、分支都留着；之后
+                prompt / brief --send 发给它会先在原 pane 按会话 ID 续上。--idle 是闲置扫描（watch、看板到时间了在后台起它）
   orch-start    为一个任务起编排者（orchestrator）：在 orch workspace 里新开 tab，启动 claude 或 codex（--kind，不给时跟调用方的宿主），
                 发出编排者开场 prompt；orch.json 记下主会话的宿主（default_kind），任务里的 worker 默认用它；
                 --model / --effort 也记进 orch.json 当任务默认，同宿主的 worker、复审、子编排者不传时继承
@@ -2323,15 +2325,24 @@ CLAUDE_DEFAULT_EFFORT = "xhigh"
 CODEX_DEFAULT_EFFORT = "xhigh"
 
 
+def model_defaults(kind: str, model: Optional[str], effort: Optional[str]) -> tuple:
+    """(model, effort) 补上 config / 内置默认之后的值；codex 没指定模型是 None（不传，用 ~/.codex/config.toml 的）。
+    agent-start 把补完的值记进 worker 记录，续上时原样用（config 之后改了也不变）。"""
+    if kind == "claude":
+        return (model or CONFIG.get("claude_model") or CLAUDE_DEFAULT_MODEL,
+                effort or CONFIG.get("claude_effort") or CLAUDE_DEFAULT_EFFORT)
+    return model, effort or CONFIG.get("codex_effort") or CODEX_DEFAULT_EFFORT
+
+
 def claude_model_args(model: Optional[str], effort: Optional[str]) -> list:
-    return ["--model", model or CONFIG.get("claude_model") or CLAUDE_DEFAULT_MODEL,
-            "--effort", effort or CONFIG.get("claude_effort") or CLAUDE_DEFAULT_EFFORT]
+    model, effort = model_defaults("claude", model, effort)
+    return ["--model", model, "--effort", effort]
 
 
 def codex_model_args(model: Optional[str], effort: Optional[str]) -> list:
     # `codex --help`、`codex resume --help` 都有 "-m, --model <MODEL>  Model the agent should use"。
-    return [*(["-m", model] if model else []),
-            "-c", f"model_reasoning_effort={effort or CONFIG.get('codex_effort') or CODEX_DEFAULT_EFFORT}"]
+    model, effort = model_defaults("codex", model, effort)
+    return [*(["-m", model] if model else []), "-c", f"model_reasoning_effort={effort}"]
 
 
 def task_model(kind: str, model: Optional[str], effort: Optional[str], *slugs: Optional[str]) -> tuple:
@@ -2348,6 +2359,25 @@ STARTUP_SETTLE_SECONDS = 4
 # 新 pane 的 shell 还没就绪时（agent_pane_busy）的重试次数和间隔。
 PANE_READY_RETRIES = 5
 PANE_READY_WAIT_SECONDS = 2
+# Claude Code 处理完启动弹框（信任框）以后，herdr 马上报 done / idle（屏幕上有输入框了），会话其实还没开始：实测最后一个
+# 弹框确认后 0.4～2 秒，SessionStart hook 才跑、herdr 的 agent_session 才有值（新起和 --resume 都一样，机器忙时更久）。
+# 这中间发的话会留在输入框里、回车被吞掉，herdr 报 agent_prompt_stalled（释放后自动续上、紧接着发话，机器忙时实测两次
+# 都这样）。所以 claude 起到 idle 以后再等会话开始才算就绪。没装 herdr 的 claude 状态 hook 时一直等不到，等满照常返回。
+# codex 第一轮对话之后才报会话，不等。
+SESSION_START_WAIT = 15
+SESSION_START_POLL = 0.5
+
+
+def wait_session_start(name: str) -> Optional[str]:
+    """等 herdr 报出这个 agent 的会话 ID（见 SESSION_START_WAIT 上面的说明），最多 SESSION_START_WAIT 秒。返回会话 ID，
+    没等到（或 agent 不在了）是 None。"""
+    deadline = time.time() + SESSION_START_WAIT
+    while True:
+        ok, res = herdr(["agent", "get", name], timeout=30)
+        session = ((res.get("agent") or {}).get("agent_session") or {}).get("value") if ok else None
+        if session or not ok or time.time() >= deadline:
+            return session
+        time.sleep(SESSION_START_POLL)
 
 
 def start_agent(name: str, kind: str, pane: str, agent_args: list, dry_run: bool) -> dict:
@@ -2369,6 +2399,9 @@ def start_agent(name: str, kind: str, pane: str, agent_args: list, dry_run: bool
         time.sleep(PANE_READY_WAIT_SECONDS)
     if not ok and res.get("code") != "agent_not_ready":
         raise DroverError("herdr agent start 失败", command="herdr " + shlex.join(cmd), error=res)
+    started = (res.get("agent") or {}) if ok else {}  # herdr 报的工作目录、会话 ID（会话开始了才有，见 SESSION_START_WAIT）
+    seen = {k: v for k, v in (("cwd", started.get("cwd")),
+                              ("session_id", (started.get("agent_session") or {}).get("value"))) if v}
 
     handled: list = []
     status: Optional[str] = None
@@ -2407,8 +2440,12 @@ def start_agent(name: str, kind: str, pane: str, agent_args: list, dry_run: bool
         return {"ok": False, "name": name, "pane_id": pane, "status": status,
                 "startup_dialogs_handled": handled, "screen": tail(agent_screen(name), 3000),
                 "error": "启动后状态一直没稳定到 idle（连续处理弹窗或等待后仍不就绪），看 screen 后按第 7 节决策表处理"}
+    if kind == "claude":
+        session = wait_session_start(name)
+        if session:
+            seen["session_id"] = session
     return {"ok": status in ("idle", "done"), "name": name, "kind": kind, "pane_id": pane, "status": status,
-            "startup_dialogs_handled": handled,
+            "startup_dialogs_handled": handled, **seen,
             "command": "herdr " + shlex.join(cmd)}
 
 
@@ -2449,44 +2486,69 @@ def task_default_kind(slug: str) -> tuple[Optional[str], str]:
     return (kind, "orch") if kind else (caller_kind(), "caller")
 
 
+def worker_args(kind: str, slug: str, model: Optional[str], effort: Optional[str], add_dirs: list) -> list:
+    """agent-start 起 worker 交给宿主的参数（不含续会话的那几个）：~/.drover/<slug> 和每个 add_dirs 加为可访问目录。
+    agent-start 和续上（resume_worker）共用这一份，续上时按 worker 记录里的值原样重放。"""
+    dirs = [str(STATE_HOME / slug), *add_dirs]
+    if kind == "claude":
+        args = [*claude_model_args(model, effort), "--permission-mode", "acceptEdits", "--name", f"worker-{slug}"]
+    else:
+        # codex worker 跑在 workspace-write 沙箱里，写不了 heavy 的调度目录就不排队直接跑、调度器也看不见它的负载。
+        # --add-dir 让目录可写：`codex --help` 写明 "Additional directories that should be writable alongside the
+        # primary workspace"，用 codex exec 实测过加进去的目录能建文件、别的目录被拒。
+        # claude worker 默认不在沙箱里，不加（加了还会多弹一次 "Adding a new directory" 信任框）。
+        dirs.append(str(HEAVY_DIR))
+        args = ["-a", "on-request", "-s", "workspace-write", *CODEX_BASE_ARGS]
+    for d in dirs:
+        args += ["--add-dir", d]
+    return args if kind == "claude" else args + codex_model_args(model, effort)
+
+
+def resume_args(kind: str, args: list, session_id: Optional[str]) -> list:
+    """在同一个 pane 接着上次的会话（选项照旧）：有会话 ID 按 ID 续（claude --resume <id>，codex resume <id>；两种都实测过
+    带原来的选项续上、上下文完整，--name、--add-dir、沙箱参数照旧生效）；没有时 claude --continue、codex resume --last，
+    都是按工作目录取最近一次，同一个目录里有过两个会话时会续到别人的——只有 agent-start --resume 找不到记下的会话 ID 时
+    才走这条（老用法）；释放 → 续上那条路上一定有会话 ID（没有的不释放，见 release_checks）。"""
+    if kind == "codex":
+        return ["resume", session_id or "--last", *args]
+    return [*args, *(["--resume", session_id] if session_id else ["--continue"])]
+
+
+def agent_start_kind(a: argparse.Namespace, previous: Optional[dict]) -> tuple[str, str]:
+    """agent-start 的宿主和来由：--kind（explicit）> 续的那个 worker 记录里的（record，只在 --resume 时）> 任务默认
+    （task_default_kind）。都没有报错。"""
+    if a.kind:
+        return a.kind, "explicit"
+    if previous and previous.get("kind") in HOST_KINDS:
+        return previous["kind"], "record"
+    kind, source = task_default_kind(a.slug)
+    if kind is None:
+        raise DroverError(f"{STATE_HOME / a.slug / 'orch.json'} 里没有 default_kind，又{NO_CALLER_KIND}：加 --kind claude|codex",
+                          caller_pane=os.environ.get("HERDR_PANE_ID"))
+    return kind, source
+
+
 def cmd_agent_start(a: argparse.Namespace) -> dict:
     if bool(a.pane) == bool(a.split_from):
         raise DroverError("--pane 和 --split-from 必须且只能给一个")
     if a.split_from and not a.wt:
         raise DroverError("--split-from 要配合 --wt（新 pane 的工作目录）")
     check_slug(a.slug)
-    slug_dir = STATE_HOME / a.slug
-    kind, kind_source = (a.kind, "explicit") if a.kind else task_default_kind(a.slug)
-    if kind is None:
-        raise DroverError(f"{slug_dir / 'orch.json'} 里没有 default_kind，又{NO_CALLER_KIND}：加 --kind claude|codex",
-                          caller_pane=os.environ.get("HERDR_PANE_ID"))
+    check_agent_name(a.name)
+    previous = find_agent_record(a.name, a.slug) if a.resume else None  # --resume 续的是这个任务里记下的那个 worker
+    kind, kind_source = agent_start_kind(a, previous)
     if not a.dry_run:
-        slug_dir.mkdir(parents=True, exist_ok=True)
-    add_dirs = [str(slug_dir), *a.add_dir]
-    if kind == "codex":
-        # codex worker 跑在 workspace-write 沙箱里，写不了 heavy 的调度目录就不排队直接跑、调度器也看不见它的负载。
-        # --add-dir 让目录可写：`codex --help` 写明 "Additional directories that should be writable alongside the
-        # primary workspace"，用 codex exec 实测过加进去的目录能建文件、别的目录被拒。
-        # claude worker 默认不在沙箱里，不加（加了还会多弹一次 "Adding a new directory" 信任框）。
-        add_dirs.append(str(HEAVY_DIR))
-        if not a.dry_run:
+        (STATE_HOME / a.slug).mkdir(parents=True, exist_ok=True)
+        if kind == "codex":
             HEAVY_DIR.mkdir(parents=True, exist_ok=True)
-    model, effort = task_model(kind, a.model, a.effort, a.slug)
-    if kind == "claude":
-        args = [*claude_model_args(model, effort), "--permission-mode", "acceptEdits", "--name", f"worker-{a.slug}"]
-        for d in add_dirs:
-            args += ["--add-dir", d]
-    else:
-        args = ["-a", "on-request", "-s", "workspace-write", *CODEX_BASE_ARGS]
-        for d in add_dirs:
-            args += ["--add-dir", d]
-        args += codex_model_args(model, effort)
+        check_name_free(a.name, a.slug)
+    model, effort = model_defaults(kind, *task_model(kind, a.model, a.effort, a.slug))
+    args = worker_args(kind, a.slug, model, effort, a.add_dir)
     if a.resume:
-        # agent 意外退出后在同一个 pane 接着上次的会话：claude 加 --continue，codex 用 resume --last（选项照旧）。
-        args = ["resume", "--last", *args] if kind == "codex" else [*args, "--continue"]
+        # agent 意外退出后在同一个 pane 接着上次的会话：按 worker 记录里的会话 ID 续，没记下的按工作目录取最近一次。
+        args = resume_args(kind, args, (previous or {}).get("session_id"))
     if a.split_from:
         # 同一个 worktree 换 agent（换 kind、缩小范围重开）：在旧 agent 旁边新开 pane，旧 pane 由编排者确认报告存档后关闭。
-        check_agent_name(a.name)
         if a.dry_run:
             planned = start_agent(a.name, kind, "<新 pane>", args, True)["planned"]
             result = {"ok": True, "dry_run": True,
@@ -2496,10 +2558,517 @@ def cmd_agent_start(a: argparse.Namespace) -> dict:
             result = start_agent(a.name, kind, pane, args, False)
             result["split_from"] = a.split_from
             result["pane_id"] = pane
+            result.setdefault("cwd", str(Path(a.wt).expanduser().resolve()))
     else:
         result = start_agent(a.name, kind, a.pane, args, a.dry_run)
     result.update(kind=kind, kind_source=kind_source)
+    if not a.dry_run and result.get("status") != "gone":
+        # 起来了就记（卡在不认识的启动弹窗上、ok 是 false 的也记：编排者处理完它照常干活，没有记录就永远不会被释放）。
+        result["record"] = write_worker_record(a.name, a.slug, kind, (model, effort), a.add_dir, result, previous)
     return result
+
+
+# ---------------------------------------------------------------- 释放空闲的 worker、发话时续上（release）
+# worker 做完以后进程一直不退（以前的规矩是留到清理 / 收尾，"方便复用它的上下文"）：11-22 一个任务积了 64 个 herdr agent、
+# 53 个 done，24G 内存用满、持续换页。上下文在磁盘上的会话里，进程退了按会话 ID 照样续得上（claude --resume <id>、
+# codex resume <id> 带原来的选项都实测过：答得出退出前告诉它的口令），所以进程的寿命跟着"有没有活"走：
+# - 释放（drover release，或闲置满 worker_idle_release_minutes 分钟后台自动放）：给 pane 的前台进程组发 SIGTERM，pane 留着回到
+#   shell，workspace、worktree、分支都不动；会话 ID 记进 worker 记录。MCP 子进程跟着退（实测）：claude 的都在这个组里；
+#   codex 的各在自己的进程组里（前台进程组里只有 codex 一个进程），codex 一退它们 3 秒内也都退了。
+# - 续上：drover prompt / brief --send 发给已经释放的 worker 时，先在原 pane 按记录里的参数和会话 ID 起回来再发（deliver）。
+#   正在跑的旧编排者不知道有释放这回事，照旧 prompt / brief --send 就会续上；watch 报 released，不报 gone。
+# - 只碰 agent-start 起的 worker：它写 worker 记录 <slug>/<name>.agent.json（WORKER_RECORD），编排者（orch-start）、复审（review）、
+#   主会话、用户自己开的 agent、这版之前起的 worker 都没有，自然不碰，不用名单。
+# - 没有会话 ID 的不放、没经 drover 发过话的不放（release_checks）：前一种放了只能按工作目录取最近一次会话续，同一个 worktree
+#   里有过两个会话时会续到别人的；后一种会话里没有内容，按 ID 续不上（claude 实测报 No conversation found 退出）。
+#   会话 ID 是 herdr 的状态 hook 报的（herdr integration install claude / codex 装的 SessionStart hook 调
+#   pane.report_agent_session，agent get / list 里的 agent_session，source 是 herdr:claude 这类；install.py 会装）。
+# - 释放和发话对同一个 agent 拿同一把锁（agent_lock）：刚判定空闲、正要退出时进来的 prompt 等它放完再续上；发话拿着锁一直到
+#   agent 开工，之后的释放看到 working 就不放。
+# - 记录先改成 released 再发信号（stop_worker）：进程一退 herdr 就清掉名字，watch 这时读到的记录已经是 released，不会在
+#   "进程没了、记录还没写"的空当里报 gone 把编排者叫醒去重启。
+# 不用 /exit 退：它要往输入框里打字，输入框里有半截字时会拼成一条 prompt 发出去；SIGTERM 两种宿主一样、不看界面
+# （claude 收到后正常退出、打印 resume 提示；codex 被信号结束，会话照样续得上，都实测过）。
+WORKER_RECORD = "{name}.agent.json"
+AGENT_LOCK_WAIT = 120     # 秒：发话等释放 / 续上做完（释放最多十几秒，续上最多等 agent 启动的 150 秒的一部分）
+RELEASE_LOCK_WAIT = 30    # 秒：手动 release 等正在进行的发话
+RELEASE_TERM_SECONDS = 10  # SIGTERM 之后最多等这么久，还在就 SIGKILL 整个进程组
+RELEASE_KILL_SECONDS = 5
+RELEASE_NAME_SECONDS = 5  # 进程没了以后等 herdr 清掉名字（实测立刻就清）
+# 释放前按屏幕修正后的状态不是 done / idle 时，为什么不放。
+RELEASE_REFUSALS = {
+    "working": "在干活",
+    "blocked": "卡在确认框上，要先处理",
+    "api-error": "停在接口错误上（这一轮被打断了，要先让它接着做）",
+    "unknown": "herdr 认不出它的状态",
+}
+RESUME_HOW = "给它发话（drover prompt / brief --send）时自动在原 pane 按会话 ID 续上"
+
+
+def agent_record_path(slug: str, name: str) -> Path:
+    return STATE_HOME / slug / WORKER_RECORD.format(name=name)
+
+
+def worker_records(name: str = "*", slug: str = "*") -> dict:
+    """名字 → 它最新的 worker 记录（带上 "path"）。同名在几个任务里都有时取修改时间最新的（同 latest_orch_metas：名字会被
+    后来的任务复用）。不给名字是全部（闲置扫描一次 glob 拿完），给了 slug 只看那个任务。"""
+    best: dict = {}
+    for path in STATE_HOME.glob(f"{slug}/" + WORKER_RECORD.format(name=name)):
+        rec = read_json_dict(path)
+        with contextlib.suppress(OSError):
+            mtime = path.stat().st_mtime
+            if rec.get("name") and (rec["name"] not in best or mtime > best[rec["name"]][0]):
+                best[rec["name"]] = (mtime, {**rec, "path": str(path)})
+    return {n: rec for n, (_, rec) in best.items()}
+
+
+def find_agent_record(name: str, slug: Optional[str] = None) -> Optional[dict]:
+    """这个名字最新的 worker 记录，没有返回 None；给了 slug 只看那个任务。"""
+    return worker_records(name, slug or "*").get(name)
+
+
+def update_agent_record(rec: dict, **changes: Any) -> dict:
+    """改 worker 记录（调用方拿着这个 agent 的锁）；值是 None 的字段删掉。返回改完的记录。"""
+    new = {k: v for k, v in {**rec, **changes}.items() if k != "path" and v is not None}
+    write_json_atomic(Path(rec["path"]), new)
+    return {**new, "path": rec["path"]}
+
+
+def write_worker_record(name: str, slug: str, kind: str, model_effort: tuple, add_dirs: list, result: dict,
+                        previous: Optional[dict]) -> str:
+    """agent-start 起好以后写 <slug>/<name>.agent.json：续上时按它原样重放参数（worker_args），释放只认有它的 agent。
+    字段：name、slug、kind、model / effort（补完默认值的，codex 没指定模型时没有 model）、add_dirs（--add-dir 给的）、pane_id、
+    cwd（herdr 报的工作目录，--split-from 时是 --wt）、started_at、session_id（claude 等到会话开始就有；codex 第一轮之后才有，
+    释放时再取）、state（running / released）。之后加的：prompted_at（最近一次经 drover 给它发话的时间，deliver 记；
+    没发过话的不释放）、released_at、release_reason（manual / idle）、freed_kb（释放时）、resumed_at（续上时）。
+    previous 是 --resume 续的那份旧记录：herdr 这次没报会话 ID 时沿用它的，发过话的也沿用（同一个会话）。"""
+    path = agent_record_path(slug, name)
+    old = previous or {}
+    write_json_atomic(path, {k: v for k, v in {
+        "name": name, "slug": slug, "kind": kind, "model": model_effort[0], "effort": model_effort[1],
+        "add_dirs": list(add_dirs), "pane_id": result["pane_id"], "cwd": result.get("cwd"), "started_at": time.time(),
+        "session_id": result.get("session_id") or old.get("session_id"), "prompted_at": old.get("prompted_at"),
+        "state": "running"}.items() if v is not None})
+    return str(path)
+
+
+def pane_processes(pane: str) -> Optional[dict]:
+    """herdr pane process-info 的 process_info（实测 herdr 的输出）：foreground_process_group_id、shell_pid、
+    foreground_processes（每个有 pid、argv0、name，多数还有 argv、cmdline、cwd）。
+    pane 不在了返回 None——只认 herdr 明确报的 pane_not_found。别的失败（超时、herdr 一时连不上、旧版 herdr 没有这个命令、
+    返回里没有 process_info）是"不知道"，抛 DroverError：当成不在的话，续上会误报 pane 没了，同名检查会误放行。"""
+    try:
+        ok, res = herdr(["pane", "process-info", "--pane", pane], timeout=30)
+    except DroverError as exc:  # 超时、找不到 herdr
+        ok, res = False, {"code": "failed", "message": exc.message}
+    if ok and isinstance(res.get("process_info"), dict):
+        return res["process_info"]
+    if not ok and res.get("code") == "pane_not_found":
+        return None
+    why = f"{res.get('code')}：{res.get('message')}" if not ok else "返回里没有 process_info"
+    raise DroverError(f"herdr pane process-info --pane {pane} 没拿到结果（{why}）：不知道这个 pane 现在的情况，稍后重试；"
+                      "一直这样的话看 herdr 是不是太旧（herdr pane 的帮助里要有 process-info）")
+
+
+def at_shell(info: dict) -> bool:
+    """pane 回到了 shell：前台进程组就是 shell 自己。"""
+    return isinstance(info.get("shell_pid"), int) and info.get("foreground_process_group_id") == info["shell_pid"]
+
+
+def check_name_free(name: str, slug: str) -> None:
+    """释放以后名字在 herdr 里空出来了，别的任务要是用同一个名字起 agent，旧编排者再 prompt 它就会发给新的那个。所以最新的
+    worker 记录是别的任务释放了的、而且它的 pane 还在（还能在那里续上）时不让用；pane 已经不在了（续不了）不拦。
+    pane 在不在查不到（pane_processes 抛错）时也不让用：报错里写的是 herdr 调用失败，稍后重试。"""
+    rec = find_agent_record(name)
+    if (rec and rec.get("slug") != slug and rec.get("state") == "released"
+            and pane_processes(str(rec.get("pane_id"))) is not None):
+        raise DroverError(f"agent 名 {name} 是任务 {rec.get('slug')} 释放了的 worker（pane {rec.get('pane_id')} 还在，给它发话"
+                          "会在那里续上），换一个名字", record=rec["path"])
+
+
+@contextlib.contextmanager
+def agent_lock(name: str, wait: Optional[float]):
+    """释放和发话对同一个 agent 互斥（见本节开头）。yield 同 flock_file：True 拿到、False 没等到、None 锁文件建不了。"""
+    with flock_file(STATE_HOME / "locks" / f"agent-{name}.lock", wait) as got:
+        yield got
+
+
+def process_names(proc: dict) -> set:
+    """这个进程可能叫什么：argv0、name、argv 里第一个不是选项的参数（解释器跑脚本时的脚本路径），都只取文件名。"""
+    argv = [str(x) for x in proc.get("argv") or []]
+    script = next((x for x in argv[1:] if not x.startswith("-")), None)
+    return {Path(str(x)).name for x in (proc.get("argv0"), proc.get("name"), *argv[:1], script) if x}
+
+
+def host_group(info: dict, kind: str) -> Optional[int]:
+    """pane 的前台进程组是 kind 这个宿主时返回组号，认不出返回 None（不发信号）。
+    主要依据在调用方：herdr 认定这个 pane 里是这个宿主的 agent、状态 done / idle（release_checks）。这里只防 herdr 的认定
+    过时了（agent 刚退、pane 里已经在跑别的东西）时杀错：组号不是 shell 自己的，组里至少有一个进程叫 kind（process_names）。
+    不要求组长的 argv0 就是 claude / codex，不同装法组长不一样（herdr pane process-info 的实测输出和各装法的启动方式）：
+    - 原生安装：组长 argv0 是 claude（name 是版本号，如 2.1.330）；
+    - npm 装的：入口是 #!/usr/bin/env node 的脚本，组长是 node <…/bin/claude> 或 node <…/bin/codex>，脚本名对得上；
+    - codex 的 npm 包再起原生二进制：子进程的 argv0 是 …/codex，和 node 在同一个组里。
+    都认不出时调用方拒绝，原因里列出看到的进程（seen_processes）。"""
+    pgid = info.get("foreground_process_group_id")
+    if not isinstance(pgid, int) or at_shell(info):
+        return None
+    return pgid if any(kind in process_names(p) for p in info.get("foreground_processes") or []) else None
+
+
+def seen_processes(info: dict) -> str:
+    """拒绝原因里给人看的：前台进程组里有哪些进程（pid 和命令行，命令行太长截断）。"""
+    procs = info.get("foreground_processes") or []
+    return "；".join(f"pid {p.get('pid')} {str(p.get('cmdline') or p.get('argv0') or p.get('name'))[:120]}"
+                     for p in procs) or "没有进程"
+
+
+def group_alive(pgid: int) -> bool:
+    """进程组里还有进程。EPERM 也算还在：macOS 上组里只剩刚被杀、还没被回收的进程时 killpg(pgid, 0) 报 EPERM（自测里实测），
+    回收完才报 ESRCH。"""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def stop_group(pgid: int) -> str:
+    """SIGTERM 整个进程组，等 RELEASE_TERM_SECONDS 秒；还在就 SIGKILL，再等 RELEASE_KILL_SECONDS 秒。返回用了哪个信号；
+    没权限发信号（drover 自己跑在沙箱里）、两个信号之后还在都抛 DroverError。"""
+    for sig, seconds in ((signal.SIGTERM, RELEASE_TERM_SECONDS), (signal.SIGKILL, RELEASE_KILL_SECONDS)):
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            pass
+        except PermissionError as exc:
+            raise DroverError(f"没有权限给进程组 {pgid} 发信号（{exc}）：drover 跑在沙箱里时发不了，没有释放")
+        deadline = time.time() + seconds
+        while group_alive(pgid) and time.time() < deadline:
+            time.sleep(0.2)
+        if not group_alive(pgid):
+            return sig.name
+    raise DroverError(f"进程组 {pgid} SIGTERM、SIGKILL 之后还在，没有释放")
+
+
+def group_rss_kb(pgid: int) -> Optional[int]:
+    """组长和它的子孙（MCP 子进程，含 codex 那种不在这个进程组里的）的 RSS 合计（KB）；ps 用不了时 None。"""
+    table = ps_table()
+    return sum(table[p][1] for p in tree_pids(pgid, table) if p in table) if table else None
+
+
+def release_status(name: str, agent: dict, kind: str) -> str:
+    """释放前的状态：herdr 报的，done / idle 时按屏幕修正（确认框 → blocked、接口错误 → api-error、后台命令 →
+    waiting-background(N)，同 watch 的 screen_override）。"""
+    status = agent.get("agent_status") or "unknown"
+    if status in ("done", "idle"):
+        status = screen_override(status, screen_or_empty(name), kind) or status
+    return status
+
+
+def refusal(name: str, status: str) -> str:
+    why = (RELEASE_REFUSALS.get(status) or
+           ("挂着后台命令或 Monitor，会自己接着干" if status.startswith("waiting-background") else f"状态是 {status}"))
+    return f"{name} {why}，没有释放（只在 done / idle 时放）"
+
+
+def worker_agent(name: str, rec: dict) -> Optional[dict]:
+    """herdr 里的这个 worker（agent get 的 agent）；已经释放了（herdr 明确说没有这个名字、记录是 released）返回 None。
+    别的都抛 DroverError：herdr 调用失败、名字没了而记录不是 released（它自己退出的）、名字现在指的不是记录的那个 pane / 宿主。"""
+    ok, res = herdr(["agent", "get", name], timeout=30)
+    if not ok and res.get("code") != "agent_not_found":
+        raise DroverError(f"herdr agent get {name} 失败（{res.get('code')}：{res.get('message')}），没有释放，稍后重试")
+    if not ok and rec.get("state") == "released":
+        return None
+    if not ok:
+        raise DroverError(f"herdr 里没有 agent {name}：它已经退出了（不是 drover 释放的），没有可放的进程")
+    agent = res.get("agent") or {}
+    if (agent.get("pane_id"), agent.get("agent")) != (rec.get("pane_id"), rec.get("kind")):
+        raise DroverError(f"{name} 现在是 pane {agent.get('pane_id')} 里的 {agent.get('agent')}，不是 agent-start 记下的那个 "
+                          f"worker（pane {rec.get('pane_id')}、{rec.get('kind')}），不碰")
+    return agent
+
+
+def release_checks(name: str, rec: dict, agent: dict) -> tuple:
+    """放之前的核对，都过了返回 (会话 ID, 状态, 前台进程组号)；不过抛 DroverError（原因）：
+    - 有会话 ID（herdr 这时报的优先：续上以后宿主可能换了会话；没有再用记录里的）。两边都没有不放，见本节开头；
+    - 按屏幕修正后是 done / idle（release_status）；
+    - 经 drover 给它发过话（记录里有 prompted_at，deliver 记的）：会话里有内容才续得上；
+    - pane 的前台进程组认得出是这个宿主（host_group），认不出时原因里列出看到的进程。"""
+    kind, pane = rec.get("kind"), str(rec.get("pane_id"))
+    session = (agent.get("agent_session") or {}).get("value") or rec.get("session_id")
+    if not session:
+        raise DroverError(f"{name} 没有会话 ID（herdr 没报 agent_session，agent-start 也没记下），没有释放：放了只能按工作目录取"
+                          f"最近一次会话续，会续到别的会话上。会话 ID 是 herdr 的状态 hook 报的：herdr integration status 里 "
+                          f"{kind} 应该是 current，不是就跑 herdr integration install {kind}（或重跑 install.py），之后新起的 "
+                          "agent 才有；codex 要跑完第一轮才报")
+    status = release_status(name, agent, kind)
+    if status not in ("done", "idle"):
+        raise DroverError(refusal(name, status), status=status)
+    if not rec.get("prompted_at"):
+        raise DroverError(f"还没经 drover 给 {name} 发过话（prompt / brief --send），没有释放：没对过话的会话按 ID 续不上"
+                          "（claude 实测报 No conversation found），放了它的 pane 里就起不回来了")
+    info = pane_processes(pane)
+    if info is None:
+        raise DroverError(f"herdr 说 {name} 在 pane {pane}，又说这个 pane 不存在，没有释放")
+    pgid = host_group(info, kind)
+    if pgid is None:
+        raise DroverError(f"pane {pane} 的前台进程组里认不出 {kind}，没有释放（不给认不出的进程发信号）。看到的进程："
+                          f"{seen_processes(info)}", foreground_processes=info.get("foreground_processes"))
+    return session, status, pgid
+
+
+def stop_worker(name: str, rec: dict, agent: dict, session: str, pgid: int, reason: str) -> dict:
+    """退掉进程、记成 released，返回里写用了哪个信号、放掉多少内存、要注意的。记录先写再发信号（见本节开头）；没退掉
+    （stop_group 抛错）把记录改回原样再抛。"""
+    rss = group_rss_kb(pgid)
+    update_agent_record(rec, state="released", released_at=time.time(), release_reason=reason, session_id=session,
+                        cwd=agent.get("cwd") or rec.get("cwd"), freed_kb=rss, resumed_at=None)
+    try:
+        sig = stop_group(pgid)
+    except DroverError:
+        update_agent_record(rec)
+        raise
+    deadline = time.time() + RELEASE_NAME_SECONDS
+    while not agent_missing(name) and time.time() < deadline:
+        time.sleep(0.2)
+    warnings = [w for w, bad in (("这个 pane 是 herdr 报的 focused（用户可能正在看它）", agent.get("focused")),
+                                 ("进程已经退了，herdr 还没清掉这个名字：过一会儿再给它发话", not agent_missing(name)))
+                if bad]
+    return {"signal": sig, "freed_mb": round(rss / 1024) if rss is not None else None,
+            **({"warnings": warnings} if warnings else {})}
+
+
+def release_one(name: str, rec: dict, reason: str, dry_run: bool) -> dict:
+    """释放一个 worker（调用方拿着它的锁）：核对（worker_agent、release_checks）都过了才发信号。不放时返回 ok: false 和
+    原因（不抛：闲置扫描接着看下一个）；已经释放了的再放一次是 ok（already_released），什么都不做。"""
+    out = {"name": name, "slug": rec.get("slug"), "kind": rec.get("kind"), "pane_id": rec.get("pane_id"),
+           "record": rec["path"], "resume": RESUME_HOW}
+    try:
+        agent = worker_agent(name, rec)
+        if agent is None:
+            return {**out, "ok": True, "already_released": True, "session_id": rec.get("session_id")}
+        session, status, pgid = release_checks(name, rec, agent)
+        out.update(ok=True, status=status, session_id=session, reason=reason)
+        if dry_run:
+            return {**out, "dry_run": True, "planned": [f"记进 {rec['path']}（state: released）",
+                                                       f"kill -TERM -{pgid}（{RELEASE_TERM_SECONDS} 秒后还在就 SIGKILL）"]}
+        return {**out, **stop_worker(name, rec, agent, session, pgid, reason)}
+    except DroverError as exc:
+        return {**{k: v for k, v in out.items() if k != "resume"}, "ok": False, "error": exc.message, **exc.extra}
+
+
+def release_locked(name: str, slug: Optional[str], reason: str, dry_run: bool, wait: float) -> Optional[dict]:
+    """拿这个 agent 的锁再放（release_one）；等了 wait 秒锁还没放开（正在给它发话或续上）返回 None。记录拿到锁以后才读：
+    等锁的时候它可能被续上、换了会话。没有 agent-start 记录的不放。"""
+    with agent_lock(name, wait) as got:
+        if got is False:
+            return None
+        rec = find_agent_record(name, slug)
+        if rec is None:
+            return {"ok": False, "name": name,
+                    "error": f"{name} 没有 agent-start 记录（{home_path(agent_record_path(slug or '*', name))}），没有释放："
+                             "只放 drover agent-start 起的 worker；编排者、子编排者、复审、主会话、自己开的 agent 和这版之前"
+                             "起的 worker 都不放"}
+        return release_one(name, rec, reason, dry_run)
+
+
+def resume_worker(rec: dict) -> tuple:
+    """在原 pane 按记录里的参数和会话 ID 把释放了的 worker 起回来（start_agent：查名字占用、处理启动弹窗、等到 idle、claude
+    等到会话开始）。返回 (改过的记录, 发话返回里要带的说明)。原 pane 不在了、pane 的情况查不到（herdr 调用失败，
+    pane_processes 抛的）、pane 里在跑别的程序、起不来都抛 DroverError，写清下一步。"""
+    name, kind, pane, slug, session = (rec.get(k) for k in ("name", "kind", "pane_id", "slug", "session_id"))
+    manual = (f"drover agent-start --name {name} --slug {slug} --kind {kind} --pane <pane> --resume"
+              "（按记下的会话 ID 续），续上后再发一次")
+    if not session:  # 释放时一定记了（release_checks）；没有只能是记录被改过
+        raise DroverError(f"{name} 的记录里没有会话 ID（{rec['path']}），没法按 ID 续：到它的 pane（{pane}）里手动起", record=rec["path"])
+    info = pane_processes(str(pane))
+    if info is None:
+        raise DroverError(f"{name} 释放时在 pane {pane}，这个 pane 已经不在了：在它的 worktree（{rec.get('cwd')}）里新开一个 pane，"
+                          f"用 {manual}", record=rec["path"])
+    if not at_shell(info):
+        raise DroverError(f"pane {pane} 里现在在跑别的程序（{seen_processes(info)}），没有续上：等它结束或换一个 pane，"
+                          f"用 {manual}", record=rec["path"])
+    if kind == "codex":
+        HEAVY_DIR.mkdir(parents=True, exist_ok=True)
+    args = resume_args(kind, worker_args(kind, slug, rec.get("model"), rec.get("effort"), rec.get("add_dirs") or []), session)
+    started = start_agent(name, kind, pane, args, False)
+    if started.get("status") != "gone":  # 起来了（卡在启动弹窗上、ok 是 false 的也算）：记录回到 running，同 agent-start
+        rec = update_agent_record(rec, state="running", resumed_at=time.time(),
+                                  session_id=started.get("session_id") or session)
+    if not started.get("ok"):
+        raise DroverError(f"在 pane {pane} 续 {name} 没续好（{started.get('status')}，start 里有屏幕 / 报错）：它还在、卡在弹窗上的，"
+                          f"处理完弹窗再发一次；起来又退出了的（gone）看 start.pane_output 里宿主的报错，用 {manual}；"
+                          "宿主说这个会话续不了的，去掉 --resume 起一个新会话（之前的上下文没有了，任务书要重发）",
+                          start=started, record=rec["path"])
+    return rec, {"resumed": True, "resume_command": started["command"],
+                 "startup_dialogs_handled": started.get("startup_dialogs_handled")}
+
+
+def agent_missing(name: str) -> bool:
+    """herdr 明确说没有这个名字（agent_not_found）；超时、连不上、别的错误都不算（不能当成已经退出去续）。"""
+    try:
+        ok, res = herdr(["agent", "get", name], timeout=30)
+    except DroverError:
+        return False
+    return not ok and res.get("code") == "agent_not_found"
+
+
+RESUME_SUBMIT_WAIT_MS = 10000  # 补了回车以后最多等它开工这么久
+
+
+def submit_leftover(name: str, kind: str, sent: dict) -> dict:
+    """刚续上就发话、herdr 报 agent_prompt_stalled 时补一次回车，返回新的发送结果（没补、补了没用都把原来的还回去）。
+    实测（机器忙时三次续上里有一次，等到会话开始以后也还有）：话已经打进输入框了，回车却被当成换行、没有提交，agent 一直
+    idle；这时再按一次回车就提交了（探针实测：输入框里留着话时 send-keys enter → working）。输入框是空的话回车什么都不做。
+    屏幕上有确认框、接口错误、后台命令（screen_override 不为空）时不按：回车可能落在别的东西上。"""
+    status = sent.get("status")
+    if (sent.get("outcome") != "agent_prompt_stalled" or status not in ("idle", "done")
+            or screen_override(status, screen_or_empty(name), kind)):
+        return sent
+    herdr(["agent", "send-keys", name, "enter"], timeout=30)
+    herdr(["agent", "wait", name, "--until", "working", "--until", "blocked", "--timeout", str(RESUME_SUBMIT_WAIT_MS)],
+          timeout=RESUME_SUBMIT_WAIT_MS / 1000 + 30)
+    if agent_status(name) != "working":
+        return sent
+    return {"ok": True, "outcome": "started", "status": "working", "submitted_with": "extra_enter"}
+
+
+def deliver(name: str, text: str, timeout_ms: int) -> dict:
+    """prompt、brief --send 发话：拿这个 agent 的锁；它被释放了（herdr 里没有、最新的 worker 记录是 released）就先在原 pane
+    续上（resume_worker），再 send_prompt。锁拿到发完：发话和释放不会交错（见本节开头）。续不上返回 ok: false、
+    outcome resume_failed（error 写下一步），不发。刚续上发的话没提交（agent_prompt_stalled）时补一次回车（submit_leftover）。
+    发出去了在 worker 记录里记 prompted_at：没对过话的会话续不上，释放只放发过话的（release_checks）。"""
+    with agent_lock(name, AGENT_LOCK_WAIT) as got:
+        if got is False:
+            return {"ok": False, "outcome": "locked", "error": f"{name} 正在被释放或续上，等了 {AGENT_LOCK_WAIT} 秒锁还没放开",
+                    "hint": "稍后再发一次"}
+        rec = find_agent_record(name)
+        resumed: dict = {}
+        if rec and rec.get("state") == "released" and agent_missing(name):
+            try:
+                rec, resumed = resume_worker(rec)
+            except DroverError as exc:
+                return {"ok": False, "outcome": "resume_failed", "status": "released", "error": exc.message,
+                        "hint": exc.message, **exc.extra}
+        sent = send_prompt(name, text, timeout_ms)
+        if resumed:
+            sent = submit_leftover(name, rec.get("kind"), sent)
+        if rec and sent["ok"]:
+            update_agent_record(rec, prompted_at=time.time())
+        return {**sent, **resumed}
+
+
+def cmd_release(a: argparse.Namespace) -> dict:
+    """drover release --name：手动释放一个 worker（不看 focused，focused 时返回里提示）。--idle 是闲置扫描（release_idle）。"""
+    if a.idle:
+        return release_idle(a.dry_run)
+    check_agent_name(a.name)
+    if a.slug:
+        check_slug(a.slug)
+    res = release_locked(a.name, a.slug, "manual", a.dry_run, RELEASE_LOCK_WAIT)
+    if res is None:
+        raise DroverError(f"正在给 {a.name} 发话或续上（等了 {RELEASE_LOCK_WAIT} 秒锁还没放开），稍后再试")
+    return res
+
+
+# 闲置自动释放：agent-start 起的 worker 连续空闲（herdr 报 done / idle、按屏幕修正后还是）满 N 分钟、pane 不是 focused（用户可能
+# 正在看它；被 focus 了计时清零，离开后从头算）→ 释放。tick 挂在一直在跑的循环里（watch 普通的和 --main 每一轮、board 文本 /
+# --json / --live、main-register）：主会话那边的循环不一定在跑（Codex 主会话两条消息之间什么都不跑、看板 tab 可能关了、主会话
+# 直接编排时没有 watch --main），普通 watch 正好在有 worker 的时候在跑。tick 自己只读一个小文件，到点了在后台起
+# release --idle 就返回（同 auto_update_tick），扫描一次只跑一个（IDLE_RELEASE_LOCK）。
+# 默认 10 分钟的依据：Anthropic 的 prompt 缓存默认 5 分钟有效（https://platform.claude.com/docs/en/build-with-claude/prompt-caching
+# "By default, the cache has a 5-minute lifetime"），过了以后留着进程不省 token，只省几秒启动。
+IDLE_RELEASE_MINUTES = 10   # 默认 N；config 的 worker_idle_release_minutes 可改，0 关；环境变量 DROVER_IDLE_RELEASE=0 也关（自测用）
+IDLE_TICK_SECONDS = 60      # tick 离上次起扫描满这么久才再起
+IDLE_RELEASE_FILE = STATE_HOME / "idle-release.json"  # 扫描记的候选：agents {名: {pane, seq, since}}、last_scan（拿着扫描锁写）
+IDLE_TICK_FILE = STATE_HOME / "locks" / "idle-release-tick.json"  # tick 上次起扫描的时间
+IDLE_RELEASE_LOCK = STATE_HOME / "locks" / "idle-release.lock"
+IDLE_RELEASE_LOG = STATE_HOME / "idle-release.log"    # 后台扫描的输出（每次一个 JSON；超过 BACKGROUND_LOG_MAX 清空重写）
+# 后台进程跑的命令：这份 drover 自己。自测换成假的。
+IDLE_RELEASE_ARGV = [sys.executable, str(PKG_ROOT / "bin" / "drover"), "release", "--idle"]
+
+
+def idle_release_minutes() -> float:
+    """闲置多少分钟自动释放，0 = 关：环境变量 DROVER_IDLE_RELEASE=0（false / off 也认）优先，再是 config 的
+    worker_idle_release_minutes，没配是 IDLE_RELEASE_MINUTES。"""
+    if os.environ.get("DROVER_IDLE_RELEASE", "").strip().lower() in AUTO_UPDATE_OFF:
+        return 0.0
+    value = as_float(CONFIG.get("worker_idle_release_minutes"))
+    return float(IDLE_RELEASE_MINUTES) if value is None else max(value, 0.0)
+
+
+def idle_release_tick() -> str:
+    """开着、离上次满 IDLE_TICK_SECONDS 秒就在后台起 release --idle，自己立刻返回（不等它）。返回 off / not_due / started /
+    error，不抛异常：调用方是 watch、看板、hook，任何失败都不能影响它们。两个调用方同时到点时可能各起一个，后起的拿不到扫描锁就退出。"""
+    if not idle_release_minutes():
+        return "off"
+    now = time.time()
+    try:
+        last = as_float(read_json_dict(IDLE_TICK_FILE).get("at"))
+        if last is not None and 0 <= now - last < IDLE_TICK_SECONDS:
+            return "not_due"
+        IDLE_TICK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(IDLE_TICK_FILE, {"at": now})
+        spawn_background(IDLE_RELEASE_ARGV, IDLE_RELEASE_LOG, "drover-idle-release")
+        return "started"
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return "error"
+
+
+def idle_candidates(agents: list, records: dict, old: dict, now: float) -> dict:
+    """这一轮空闲着的候选 → {pane, seq, since}：有 worker 记录、herdr 里还在记录的 pane、宿主相同，herdr 报 done / idle，pane
+    不是 focused。pane 和 herdr 的状态序号都和上一轮记的一样就接着算（since 不动），否则从现在起算；不在结果里的（干活了、
+    被 focus 了、退出了）下次从头算。记录里的 state 不看：写着 released、herdr 里同一个 pane 却有这个 agent（有人手动续了）
+    照样算。会话 ID、按屏幕修正（后台命令、确认框）、进程组留到满 N 分钟、真要放时再看（release_checks）。"""
+    out = {}
+    for ag in agents:
+        name = ag.get("name")
+        rec = records.get(name)
+        if (not rec or (ag.get("pane_id"), ag.get("agent")) != (rec.get("pane_id"), rec.get("kind"))
+                or ag.get("agent_status") not in ("done", "idle") or ag.get("focused")):
+            continue
+        prev = old.get(name) if isinstance(old.get(name), dict) else {}
+        same = (prev.get("pane"), prev.get("seq")) == (ag.get("pane_id"), ag.get("state_change_seq"))
+        since = as_float(prev.get("since")) if same else None
+        out[name] = {"pane": ag.get("pane_id"), "seq": ag.get("state_change_seq"), "since": now if since is None else since}
+    return out
+
+
+def release_due(names: list, dry_run: bool) -> tuple:
+    """把空闲满了的逐个放掉，返回 (放掉的, 没放的和原因)。拿不到锁的（正在给它发话）跳过，两边都不进。"""
+    released, refused = [], []
+    for name in names:
+        res = release_locked(name, None, "idle", dry_run, 0)
+        if res is not None:
+            (released if res.get("ok") else refused).append(res)
+    return released, refused
+
+
+def release_idle(dry_run: bool) -> dict:
+    """release --idle：扫一遍，空闲满 N 分钟的放掉。返回 released、refused（满了 N 分钟却没放的和原因：没有会话 ID、
+    挂着后台命令、进程组认不出……）、idle_minutes（这一轮每个候选已经空闲多久）。
+    --dry-run 只报会放谁、为什么不放，不发信号、不记候选（也不拿扫描锁）。"""
+    minutes = idle_release_minutes()
+    base = {"ok": True, "at": clock(time.time()), "minutes": minutes}
+    if not minutes:
+        return {**base, "off": True}
+    with contextlib.nullcontext(True) if dry_run else flock_file(IDLE_RELEASE_LOCK, 0) as got:
+        if not got:
+            return {**base, "skipped": "另一个闲置扫描正在跑" if got is False else "状态目录写不了"}
+        agents = list_agents()
+        if agents is None:
+            return {**base, "ok": False, "error": "herdr agent list 读不到"}
+        now = time.time()
+        old = read_json_dict(IDLE_RELEASE_FILE).get("agents")
+        idle = idle_candidates(agents, worker_records(), old if isinstance(old, dict) else {}, now)
+        released, refused = release_due(sorted(n for n, seen in idle.items() if now - seen["since"] >= minutes * 60),
+                                        dry_run)
+        if not dry_run:
+            write_json_atomic(IDLE_RELEASE_FILE, {"agents": idle, "last_scan": now})
+    return {**base, "released": released, "refused": refused,
+            "idle_minutes": {n: round((now - s["since"]) / 60, 1) for n, s in idle.items()}}
 
 
 # ---------------------------------------------------------------- orch-start
@@ -3281,11 +3850,12 @@ def record_main_session(pane: str, session_id: Optional[str], info: dict, record
 
 def main_session_seen(record_rules: bool) -> None:
     """main-register 认出了主会话：record_rules 时先记下"载入时"的规则（main-rules.json），再触发自动更新检查。顺序不能反：
-    自动更新会改 AGENTS.md。两样都不能让登记失败（tick 自己不抛异常）。"""
+    自动更新会改 AGENTS.md。顺带触发闲置 worker 的扫描。都不能让登记失败（两个 tick 自己不抛异常）。"""
     if record_rules:
         with contextlib.suppress(OSError):
             record_main_rules("main-register")
     auto_update_tick()
+    idle_release_tick()
 
 
 def cmd_main_register(a: argparse.Namespace) -> dict:
@@ -3643,7 +4213,7 @@ def cmd_prompt(a: argparse.Namespace) -> dict:
         return {"ok": True, "dry_run": True,
                 "planned": [prompt_plan(a.name, f"<{source} 的内容，{len(text)} 字符>", a.timeout)]}
     warning = unread_warning(a.name)
-    sent = send_prompt(a.name, text, a.timeout)
+    sent = deliver(a.name, text, a.timeout)
     if sent["ok"]:
         record_answered(a.name, text)
     return {**sent, **({"warning": warning} if warning else {})}
@@ -4046,6 +4616,7 @@ def append_brief_record(a: argparse.Namespace, prompt_file: Path, evidence: list
 def brief_kind(a: argparse.Namespace, warnings: list) -> tuple[str, str]:
     """任务书按哪个宿主写约束，返回 (kind, kind_source)：应等于收任务书的 agent（--name）的实际宿主。
     给了 --kind 照用（"explicit"），和 herdr 里活着的这个 agent 对不上时进 warnings；没给就取这个 agent 的宿主（"agent"）；
+    herdr 里没有、这个任务有它的 worker 记录（被释放了）时用记录的（"record"）；
     agent 还没起时同 agent-start：orch.json 的 default_kind（"orch"），再调用方（"caller"）。"""
     actual = agent_kind(a.name)
     if a.kind:
@@ -4055,6 +4626,9 @@ def brief_kind(a: argparse.Namespace, warnings: list) -> tuple[str, str]:
         return a.kind, "explicit"
     if actual:
         return actual, "agent"
+    released = find_agent_record(a.name, a.slug)  # 被释放了的 worker：herdr 里暂时没有，宿主看 agent-start 记下的
+    if released and released.get("kind") in HOST_KINDS:
+        return released["kind"], "record"
     kind, source = task_default_kind(a.slug)
     if kind is None:
         raise DroverError(f"herdr 里没有 agent {a.name}，{STATE_HOME / a.slug / 'orch.json'} 里没有 default_kind，"
@@ -4109,7 +4683,7 @@ def cmd_brief(a: argparse.Namespace) -> dict:
     result["previous_round"] = moved
     result.update(append_brief_record(a, prompt_file, evidence, evidence_file, moved))
     if a.send:
-        sent = send_prompt(a.name, prompt, PROMPT_TIMEOUT_MS)
+        sent = deliver(a.name, prompt, PROMPT_TIMEOUT_MS)
         result["sent"] = sent
         result["ok"] = sent["ok"]
         if not sent["ok"]:
@@ -4296,6 +4870,9 @@ WATCH_START_EVENTS = ("blocked", "api-error", "gone")
 WATCH_DESCRIPTION = f"""\
 轮询 agent 状态，启动时输出每个 agent 的当前状态，之后变化时输出一行 EVENT <名> <状态> @<时:分:秒>。
 状态是 herdr 的 working / blocked / done / idle / unknown，agent 退出是 gone；watch 会按屏幕改报或补报：
+  released                herdr 里没有这个名字，它是被释放的 worker（drover release 或闲置自动释放：进程退了，pane 还在）：
+                          不用处理，drover prompt / brief --send 发给它会自动续上。只在启动时和 --once 显示，done / idle
+                          变成 released 不输出、不算事件；续上以后照常报。释放时的 pane 被关了（原地续不了）报 gone
   blocked                 herdr 报 done / idle、但屏幕底部是确认弹框（如 WebFetch 授权）时也报 blocked。
                           herdr 报 working（主 agent 在等后台子 agent："Waiting for N background agent(s) to finish"）、
                           但屏幕底部是子 agent 的确认框时也报 blocked（只看 Claude Code，working 时每 {WORKING_DIALOG_CHECK_SECONDS} 秒
@@ -4427,12 +5004,62 @@ def list_agents() -> Optional[list]:
         return None
 
 
+def live_panes() -> Optional[set]:
+    """herdr 里现有的全部 pane ID（herdr pane list 不带 --workspace，一次调用）；没拿到（超时、连不上、返回认不出）是 None。"""
+    try:
+        ok, res = herdr(["pane", "list"], timeout=30)
+    except DroverError:
+        return None
+    panes = res.get("panes") if ok else None
+    if not isinstance(panes, list):
+        return None
+    return {p["pane_id"] for p in panes if isinstance(p, dict) and p.get("pane_id")}
+
+
+def absent_shown(names: list, by_name: dict, absent: dict, previous: dict) -> dict:
+    """watch：herdr 里没有的名字这一轮显示什么，名 → released / gone。
+    released：它最新的 worker 记录是 released、记录的 pane 还在（给它发话会在那里自动续上，不用编排者处理）；
+    gone：别的（自己退出了、从来不是 agent-start 起的、pane 被关了原地续不了）。
+    开销不随已释放的个数涨：记录只在名字刚从 herdr 里消失时查一次，记在 absent（名 → 释放时的 pane，不是释放的是 None）里，
+    到它重新出现才清掉——记录先写成 released 再退进程（stop_worker），要变回 running 得先续上，续上名字就回来了；
+    pane 还在不在，一轮只调一次 herdr pane list（没有已释放的就不调）。pane list 没拿到时不知道在不在：沿用上一轮显示的，
+    第一轮按 released（报 gone 会叫醒编排者去重启，错报的代价大）。"""
+    for name in names:
+        if name in by_name:
+            absent.pop(name, None)
+        elif name not in absent:
+            rec = find_agent_record(name) or {}
+            absent[name] = rec.get("pane_id") if rec.get("state") == "released" else None
+    missing = [n for n in names if n not in by_name]
+    panes = live_panes() if any(absent[n] for n in missing) else set()
+    out = {}
+    for name in missing:
+        pane = absent[name]
+        if pane and panes is None:
+            prev = previous.get(name, ("", ""))[1]
+            out[name] = prev if prev in ("released", "gone") else "released"
+        else:
+            out[name] = "released" if pane and pane in panes else "gone"
+    return out
+
+
+def watch_reports(shown: str, prev_shown: str, again: bool, once: bool, first_round: bool) -> bool:
+    """这一轮要不要输出这个 agent 的 EVENT 行：--once 都输出；显示的状态变了、或者同一状态要重报（again）时输出。
+    变成 released 例外：它只是空闲时退了进程（活早干完了），没有要编排者处理的，不输出也不叫醒；启动那一轮照常显示当前状态。"""
+    if once:
+        return True
+    if shown == "released" and not first_round:
+        return False
+    return prev_shown != shown or again
+
+
 def cmd_watch(a: argparse.Namespace) -> int:
     for name in a.agents:
         check_agent_name(name)
     if a.main:
         return watch_main(a)
     previous: dict = {}  # name -> (herdr 报的状态, 输出的状态)
+    absent: dict = {}  # herdr 里没有的名字 -> 它释放时的 pane（不是被释放的是 None），见 absent_shown
     # herdr 的 state_change_seq：server 全局递增，记在该 agent 最近一次状态变化上；读屏幕、标题变化都不会改它（实测）。
     seqs: dict = {}
     dialog_fps: dict = {}  # name -> 弹框指纹（输出的状态是 blocked 时才有）
@@ -4450,6 +5077,7 @@ def cmd_watch(a: argparse.Namespace) -> int:
         if a.timeout and not a.once and time.time() - started >= a.timeout:
             print(f"EVENT timeout @{time.strftime('%H:%M:%S')}", flush=True)
             return 0
+        idle_release_tick()
         agents = list_agents()
         if agents is None:
             print(f"EVENT herdr unreachable @{time.strftime('%H:%M:%S')}", flush=True)
@@ -4462,9 +5090,11 @@ def cmd_watch(a: argparse.Namespace) -> int:
         changed = False
         # 每轮重新解析：watch 起来之后才写的 orch.json、resume 换人覆盖的 orch.json 都能跟上（几十个小文件，开销可以忽略）。
         rollup_files = orch_rollups(a.agents)
+        gone_or_released = absent_shown(a.agents, by_name, absent, previous)
         for name in a.agents:
             agent = by_name.get(name)
-            status = agent.get("agent_status", "unknown") if agent else "gone"
+            # herdr 里没有了：被释放的 worker（pane 还在、发话会自动续上）是 released，别的是 gone（退出了）。
+            status = agent.get("agent_status", "unknown") if agent else gone_or_released[name]
             seq = agent.get("state_change_seq") if agent else None
             prev_status, prev_shown = previous.get(name, ("", ""))
             # 状态和上一轮一样、序号却变了：中间经历过别的状态，没被轮询到（worker 连着弹两个确认，编排者批完第一个，
@@ -4560,7 +5190,7 @@ def cmd_watch(a: argparse.Namespace) -> int:
                     again = True
             else:
                 dialog_fps.pop(name, None)
-            if a.once or prev_shown != shown or again:
+            if watch_reports(shown, prev_shown, again, a.once, first_round):
                 # 带上时间，方便事后分开算"agent 实际耗时"和"编排者自己的耗时"。
                 print(f"EVENT {name} {shown} @{time.strftime('%H:%M:%S')}", flush=True)
                 changed = changed or not first_round or shown in WATCH_START_EVENTS
@@ -4733,6 +5363,7 @@ def watch_main(a: argparse.Namespace) -> int:
         with contextlib.suppress(OSError):  # 写不了不管：看板只是少了个兜底
             write_json_atomic(MAIN_WATCH_LIVE_FILE, {"pid": os.getpid(), "at": time.time()})
         auto_update_tick()
+        idle_release_tick()
         agents = list_agents()
         if agents is None:
             print(f"EVENT herdr unreachable @{time.strftime('%H:%M:%S')}", flush=True)
@@ -5573,6 +6204,7 @@ def board_live(a: argparse.Namespace) -> int:
                 new, old = version_pair(drover_repo(), current, loaded)
                 stuck = f"drover 看板没换成新代码 {new}：{reason}；接着用 {old}，下一轮再试"
             auto_update_tick()
+            idle_release_tick()
             now = time.time()
             with contextlib.suppress(DroverError):  # herdr 连不上：下面画看板时会显示
                 reregistered = board_reregister() or reregistered  # (时间, pane)：最近一次补登记
@@ -6144,6 +6776,7 @@ def cmd_board(a: argparse.Namespace) -> int:
     now = time.time()
     if a.json or not (a.line or a.pending):
         auto_update_tick()  # 文本 / --plain / --json：Codex 主会话每条消息都跑 --json；--line（状态栏）、--pending（脚注）不触发
+        idle_release_tick()
     if a.json:
         emit(board_json(board_rows(True, now), now))
         return 0
@@ -11971,7 +12604,7 @@ AUTO_UPDATE_MINUTES = 30            # 默认间隔，config.json 的 auto_update
 AUTO_UPDATE_NET_TIMEOUT = 60        # 秒：fetch 只试 1 次，最多这么久
 AUTO_UPDATE_SSH = "ssh -o BatchMode=yes -o ConnectTimeout=20"  # 不问密码、不问主机确认；连不上 20 秒放弃
 AUTO_UPDATE_LOCK_WAIT = 5           # 秒：后台进程等 tick 放开锁、短锁等别人写完
-AUTO_UPDATE_LOG_MAX = 512 * 1024    # 日志超过这么大，下次起后台进程时清空重写
+BACKGROUND_LOG_MAX = 512 * 1024     # 后台进程的日志（自动更新、闲置扫描）超过这么大，下次起后台进程时清空重写
 AUTO_UPDATE_RECENT_HOURS = 24       # 看板上"已自动更新""已更新（手动）"那一行留多久
 AUTO_UPDATE_UNREACHABLE_HOURS = 24  # 连续连不上多久才报一次（笔记本离线、代理没开时很常见）
 AUTO_UPDATE_OFF = ("0", "false", "no", "off")
@@ -12072,20 +12705,20 @@ def auto_update_tick() -> str:
                 return "running" if got is False else "error"
             if change_auto_record(lambda r: mark_attempt(r, now)).get("last_attempt") != now:
                 return "not_due"
-            auto_update_spawn()
+            spawn_background(AUTO_UPDATE_ARGV, AUTO_UPDATE_LOG, "drover-auto-update")
         return "started"
     except (OSError, ValueError, subprocess.SubprocessError):
         return "error"
 
 
-def auto_update_spawn() -> None:
-    """后台独立进程跑 AUTO_UPDATE_ARGV：新会话（start_new_session：hook 超时被杀、终端关掉都不连带它），stdin 接 /dev/null，
-    stdout / stderr 追加进 AUTO_UPDATE_LOG（超过 AUTO_UPDATE_LOG_MAX 先清空），不继承调用方的其他文件描述符（Claude Code 等
-    hook 的 stdout 关掉才算 hook 结束）。经 sh 放到后台（"$@" &）再退出：这里只等那个立刻退出的 sh，更新进程交给 init 收养，
-    调用方（watch、看板一跑好几天）不用等它，也不会留下没收的子进程。"""
-    big = AUTO_UPDATE_LOG.exists() and AUTO_UPDATE_LOG.stat().st_size > AUTO_UPDATE_LOG_MAX
-    with open(AUTO_UPDATE_LOG, "w" if big else "a") as log:
-        subprocess.run(["/bin/sh", "-c", '"$@" &', "drover-auto-update", *AUTO_UPDATE_ARGV], stdin=subprocess.DEVNULL,
+def spawn_background(argv: list, log_file: Path, label: str) -> None:
+    """后台独立进程跑 argv（自动更新、闲置扫描）：新会话（start_new_session：hook 超时被杀、终端关掉都不连带它），stdin 接
+    /dev/null，stdout / stderr 追加进 log_file（超过 BACKGROUND_LOG_MAX 先清空：闲置扫描每分钟追加一条），不继承调用方的其他
+    文件描述符（Claude Code 等 hook 的 stdout 关掉才算 hook 结束）。经 sh 放到后台（"$@" &）再退出：这里只等那个立刻退出的
+    sh，后台进程交给 init 收养，调用方（watch、看板一跑好几天）不用等它，也不会留下没收的子进程。label 是 sh 的 $0（ps 里看得到）。"""
+    big = log_file.exists() and log_file.stat().st_size > BACKGROUND_LOG_MAX
+    with open(log_file, "w" if big else "a") as log:
+        subprocess.run(["/bin/sh", "-c", '"$@" &', label, *argv], stdin=subprocess.DEVNULL,
                        stdout=log, stderr=subprocess.STDOUT, cwd=str(STATE_HOME), start_new_session=True,
                        close_fds=True, timeout=10)
 
@@ -12534,8 +13167,29 @@ def build_parser() -> argparse.ArgumentParser:
                                    "记的（宿主相同才继承），再是 config.json 的 claude_model（没配是 opus[1m]）；codex 不传")
     p.add_argument("--add-dir", action="append", default=[], help="额外可访问的目录（其他 worktree），可重复")
     p.add_argument("--resume", action="store_true",
-                   help="agent 意外退出后在同一个 pane 续上次会话（claude --continue / codex resume --last）")
+                   help="agent 意外退出后在同一个 pane 续上次会话：按这个任务的 worker 记录里的会话 ID 续"
+                        "（claude --resume <id> / codex resume <id>），没记下的按工作目录取最近一次"
+                        "（claude --continue / codex resume --last）")
     p.add_argument("--dry-run", action="store_true", help="只列出要执行的命令")
+
+    p = sub.add_parser("release", help="释放空闲的 worker：退出它的 agent 进程腾出内存（pane、worktree、分支留着），之后发话自动续上",
+                       description="退出 worker 的 agent 进程（给 pane 的前台进程组发 SIGTERM，MCP 子进程一起退；"
+                                   f"{RELEASE_TERM_SECONDS} 秒后还在就 SIGKILL），pane 留着回到 shell，workspace、worktree、分支不动。"
+                                   "只放 agent-start 起的 worker（有 ~/.drover/<slug>/<名>.agent.json），只在它空闲时放"
+                                   "（herdr 报 done / idle，屏幕上没有确认框、接口错误、后台命令），而且要有会话 ID、经 drover 发过话"
+                                   "（没对过话的会话续不上）；"
+                                   "不放时 ok 是 false、error 写原因。之后 drover prompt / brief --send 发给它，会先在原 pane 按"
+                                   "记下的参数和会话 ID 续上再发；watch 显示 released。"
+                                   f"闲置满 worker_idle_release_minutes 分钟（默认 {IDLE_RELEASE_MINUTES}，0 关）的 worker 会被"
+                                   "自动释放：watch、看板、main-register 到时间了在后台起 release --idle。")
+    target = p.add_mutually_exclusive_group(required=True)
+    target.add_argument("--name", help="要释放的 worker 的 agent 名")
+    target.add_argument("--idle", action="store_true",
+                        help="闲置扫描：所有任务里空闲满 N 分钟、pane 不是 focused 的 worker 都放掉；每次扫描记下各自从什么时候"
+                             f"开始空闲（~/.drover/{IDLE_RELEASE_FILE.name}）。和 --dry-run 一起只报每个候选空闲了多久、"
+                             "满了的会不会放、不放的原因")
+    p.add_argument("--slug", help="只看这个任务的 worker 记录；不给取这个名字最新的一份")
+    p.add_argument("--dry-run", action="store_true", help="只核对并列出要做的事，不发信号、不改记录")
 
     p = sub.add_parser("brief", help="按模板生成任务 prompt（必填完成证据），可选先摸底、生成后立刻发出")
     p.add_argument("--slug", required=True, help="任务 slug")
@@ -12955,6 +13609,7 @@ HANDLERS = {
     "wt": cmd_wt,
     "deps": cmd_deps,
     "agent-start": cmd_agent_start,
+    "release": cmd_release,
     "orch-start": cmd_orch_start,
     "orch-status": cmd_orch_status,
     "main-register": cmd_main_register,
@@ -12998,6 +13653,8 @@ def usage_problem(a: argparse.Namespace) -> Optional[str]:
         return "cleanup --probe 要配 --wt：探测模式不要求内容在远端，只对写明的探测 / 调研 worktree 用，不对整个任务用"
     if a.command == "accept" and a.name and not a.slug:
         return "accept --name 要配 --slug：证据清单和默认存档都在 ~/.drover/<slug>/ 下"
+    if a.command == "release" and a.idle and a.slug:
+        return "release --idle 扫的是所有任务的 worker，不和 --slug 一起用"
     return None
 
 
