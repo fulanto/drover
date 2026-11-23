@@ -453,6 +453,18 @@ class BriefCodingRulesTests(PlaybookTestBase):
                 rules = prompt[prompt.index("## 约束"):prompt.index("\n## ", prompt.index("## 约束"))]
                 self.assertIn(line, rules)
 
+    def test_no_test_servers_in_user_herdr_constraint(self) -> None:
+        # 固定约束：不在用户的 herdr 里起测试会话 / 测试 server / 测试 agent（具名会话和用户共用插件），要真实 herdr server 的
+        # 实测用包里的隔离工具；claude、codex 都有，写的路径在包里真有这个文件
+        line = ("- 不在用户的 herdr 里起测试会话、测试 server 或测试 agent（`herdr --session <名>`、不带隔离环境的 `herdr server`、"
+                "`herdr agent start`）：它们会触发用户的全局插件。实测要真实 herdr server 时用 "
+                "`~/.drover/pkg/selftest/live_herdr.py`（独立的 XDG 根目录）。")
+        for kind in ("claude", "codex"):
+            prompt = self.brief(kind, self.repo)["prompt"]
+            rules = prompt[prompt.index("## 约束"):prompt.index("\n## ", prompt.index("## 约束"))]
+            self.assertIn(line, rules)
+        self.assertTrue((PKG / "selftest" / "live_herdr.py").is_file())
+
     def test_heavy_path_is_literal_tilde(self) -> None:
         # 任务书里 heavy 写成字面的 ~/.drover/bin/drover（命中 install.py 加进全局的 Bash(~/.drover/bin/drover heavy:*)，
         # 展开成绝对路径时 worker 每跑一次都弹框）：不展开成 HOME 的绝对路径，也不指向 DROVER_STATE_DIR

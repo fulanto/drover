@@ -4777,6 +4777,12 @@ def build_brief(a: argparse.Namespace, worktrees: list, task: str, evidence: lis
     # 迁移在集成检查通过后、推送前由编排者按仓库规则统一执行（flow/integrate.md 第 4 步：定时间戳、试跑、核对账本）；
     # worker 并行、各自看不到别人的迁移，自己执行的会和它重复或乱序，写共享库还会影响别的条目和别人。
     rules.append("- 只写迁移文件和测试，不执行迁移，不对任何共享 / 生产数据库做写操作；迁移由编排者按仓库规则执行。")
+    # herdr 的具名会话只隔离 socket 和会话数据，插件是共用的：有 worker 照 herdr 技能在具名测试会话里做实测，测试 server 一启动
+    # 就跑了用户全局插件的 startup，把用户的飞书收信进程接到了测试会话上。在用户的 server 里起测试 agent 也一样，
+    # 它的状态事件照样发给用户的插件。隔离的做法在 selftest/live_herdr.py（docs/development.md"要真实 herdr 的实测"）。
+    rules.append("- 不在用户的 herdr 里起测试会话、测试 server 或测试 agent（`herdr --session <名>`、不带隔离环境的 `herdr server`、"
+                 "`herdr agent start`）：它们会触发用户的全局插件。实测要真实 herdr server 时用 "
+                 "`~/.drover/pkg/selftest/live_herdr.py`（独立的 XDG 根目录）。")
     heavy = f"`{DROVER_CMD} heavy -- <命令>`"
     # 以前只让 build 和大批测试经 heavy，worker 自己跑的相关测试、lint 调度器看不见，全量测试照样
     # 被它们拖慢、超时。heavy 改成按实测占用调度以后，轻命令经 heavy 不用排队，所以一律经 heavy。
