@@ -67,12 +67,12 @@
      ```
 
    - 骨架的"清理"一节先列出待清理的 worktree 和分支，第 7 步再改成实际结果。
-2. **清理，先看结论**：`~/.drover/bin/drover cleanup --slug <slug> --dry-run`。它逐个 worktree 和没有 worktree 的同类本地分支核实：没有进行中的 merge / rebase / cherry-pick；里面的 agent 不在 working / blocked；已提交的和没提交的改动都在这个任务推过的某条远端分支（的历史）里。核实规则（逐文件找、三方合并、哪些情况算不在远端）见 docs/reference.md 的 cleanup，核实不了的一律不删。核对的远端分支来自推送记录（`refs` 写明每条的来源），先 fetch 到最新，fetch 不了的不拿来核对。推送没落盘的老任务（推送记录里没有这条分支）加 `--target <远端>/<分支>` 补上核对分支（可重复；传错了内容对不上，就是不删）。结论：`would_remove` / `kept`（`reasons` 写哪个文件、哪个提交不在远端，哪个 agent 在干活）；`uncommitted_found_in` / `found_in` 写明每个文件在哪个提交上对上的。
-3. **去掉 `--dry-run` 再跑一次**：核实通过的删 worktree（workspace 开着用 `herdr worktree remove --workspace <id>`，会关掉 workspace 和里面的 agent；workspace 没开直接 `git worktree remove`），再 `git branch -D` 本地分支；没有 worktree 的同类本地分支核实后也删。核实不过的永远不删、不手工删。`kept` 的原因写进汇总，照上面"清理被拒绝"问用户；`remove_failed` 带着 herdr / git 的报错，先查原因再问。主检出永远不动。
+2. **清理，先看结论**：`~/.drover/bin/drover cleanup --slug <slug> --dry-run`。它逐个 worktree 和没有 worktree 的同类本地分支核实：没有进行中的 merge / rebase / cherry-pick；里面的 agent 不在 working / blocked；已提交的和没提交的改动都在这个任务推过的某条远端分支（的历史）里。条目提交在集成时解冲突改写过、原文在远端对不上的，按集成记录认（`integrate` 记着它摘成了哪个提交，那个提交在远端分支里就算交付）；没提交的改动一律按内容核实。核实规则（逐文件找、三方合并、集成记录怎么认、哪些情况算不在远端）见 docs/reference.md 的 cleanup，核实不了的一律不删。核对的远端分支来自推送记录（`refs` 写明每条的来源），先 fetch 到最新，fetch 不了的不拿来核对。推送没落盘的老任务（推送记录里没有这条分支）加 `--target <远端>/<分支>` 补上核对分支（可重复；传错了内容对不上，就是不删）。结论：`would_remove` / `kept`（`reasons` 写哪个文件、哪个提交不在远端，哪个 agent 在干活）；`uncommitted_found_in` / `found_in` 写明每个文件在哪个提交上对上的；`integrated` 列按集成记录核实的提交，`rewritten` 列这些提交改过的文件里和远端对不上原样的（集成时改写过，或者解冲突时没带上），`patches` 是删之前会存下这些提交原始版本的 patch 路径。
+3. **去掉 `--dry-run` 再跑一次**：核实通过的删 worktree（workspace 开着用 `herdr worktree remove --workspace <id>`，会关掉 workspace 和里面的 agent；workspace 没开直接 `git worktree remove`），再 `git branch -D` 本地分支；没有 worktree 的同类本地分支核实后也删。带 `integrated` 的先把那些条目提交的原始版本存成 patch（`~/.drover/<slug>/integrated-<分支>-<时间>.commits.patch`，存成了才删）。核实不过的永远不删、不手工删。`kept` 的原因写进汇总，照上面"清理被拒绝"问用户；`remove_failed` 带着 herdr / git 的报错，先查原因再问。主检出永远不动。
 4. 状态文件里记了 `source_workspace_opened`，并且那个 workspace 里没有 agent 时，`herdr workspace close <ID>`。必须先完成第 3 步：worktree 的 workspace 挂在它下面。
-5. 把 cleanup 的结果记进状态文件：删了哪些 worktree / 分支、关了哪些 agent（`agents`）、留了哪些和原因。
+5. 把 cleanup 的结果记进状态文件：删了哪些 worktree / 分支、关了哪些 agent（`agents`）、留了哪些和原因；按集成记录核实的（`integrated`）记下存的 patch 路径（`patches`）。
 6. 状态文件追加收尾记录：写一行 wrapup.md 的路径，不把全文抄进状态文件。
-7. 补上 wrapup.md 的"清理"一节：实际删了什么（worktree、分支、pane、workspace），保留了什么和原因。
+7. 补上 wrapup.md 的"清理"一节：实际删了什么（worktree、分支、pane、workspace），保留了什么和原因；按集成记录核实后删的，写上 patch 路径和 `rewritten` 列的文件。
 8. rollup 状态标"完成"，"收尾："改成 `收尾：先别，已经收尾过了`（看板收尾那一格显示"已收尾"、不能再点）；收尾做完但留了东西（上面"清理被拒绝"：用户定先留着，或者 cleanup 核实不过、用户没让删）写 `收尾：先别，已经收尾过了，留 <留了什么，简短，如"1 个 worktree">`（看板显示"已收尾，留 …"、不能再点），以后用户说"清理 <任务>"清完了改回 `收尾：先别，已经收尾过了`；只写了汇总、没清理的写 `收尾：可以`，用户再说收尾时接着清理。"结论"写精简版（下面的格式，整份 rollup 照旧不超过 40 行）。主会话原样转给用户，然后关掉你所在的 tab；用户要看全文自己打开 wrapup.md，或者来问你。（写"留 …"的原因：留了东西如果只写"可以"，看板显示能点的 [收尾]，再点只会让 cleanup 再跑一遍、照样留下。）
 
    ```

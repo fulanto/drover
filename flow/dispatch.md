@@ -468,7 +468,7 @@ PARTIAL / FAILED 时先读报告和屏幕（`herdr agent read <name> --source re
 **必须升级给用户（等答复；提问方式见附录，编排者模式写 rollup）**
 
 - git push / force push / 删远程分支 / 改 git 历史
-- 删 worktree 或本地分支：用户说"清理"或"收尾"就是同意删 `drover cleanup` 核实通过的（内容都在这个任务推过的远端分支里、里面的 agent 没在干活）；核实不过的照旧问，不手工删（不自动删，推送后也不删）
+- 删 worktree 或本地分支：用户说"清理"或"收尾"就是同意删 `drover cleanup` 核实通过的（内容都交付到这个任务推过的远端分支里、里面的 agent 没在干活；集成时解冲突改写过的条目提交按集成记录认，删之前存 patch）；核实不过的照旧问，不手工删（不自动删，推送后也不删）
 - 数据库写操作：迁移、DDL、生产或共享环境的数据修改、Supabase apply_migration
   - 例外：仓库规范（仓库里的 `AGENTS.md` / `CLAUDE.md`，第 2 节第 1 步）或仓库 playbook（第 2 节 `drover playbook --repo <仓库>`）写了迁移授权例外的，按它做：哪些环境、由谁在什么时候执行、执行前后核对什么，都以它为准（没写步骤的按 integrate.md 第 4 步的默认步骤），给 worker 的约束写进"不做"。它没覆盖到的写操作仍要升级；例外只对写了它的仓库有效。
   - 生产只走发布流程（随代码发布由仓库的 CI / 部署执行），不在本地对生产执行迁移。

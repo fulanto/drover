@@ -11365,14 +11365,16 @@ def push_uncovered(line: dict, i: int, p: dict, warnings: list) -> None:
 
 
 def integrated_records(groups: list) -> tuple[set, dict]:
-    """集成记录里的 (源仓库 realpath, 集成分支 / 推送时的分支) 集合，和摘出来的提交 {条目提交: 集成分支上的新提交}（已应用的；
-    空提交、旧版本的 resolved 没有新提交，是 None）。"""
+    """集成记录里的 (源仓库 realpath, 集成分支 / 推送时的分支) 集合，和摘出来的提交 {条目提交: [集成分支上的新提交…]}（已应用
+    的；同一个条目提交摘到几条集成分支上的各有一个；空提交、旧版本的 resolved 没记新提交，记 None）。"""
     integ, picked = set(), {}
     for g in groups:
         for _, state in g["states"]:
             integ.add((os.path.realpath(state.get("repo") or "/nonexistent"), state.get("branch")))
-            picked.update({e["sha"]: e.get("new_sha") for e in state.get("picked") or []
-                           if isinstance(e, dict) and e.get("status") in INTEGRATE_APPLIED})
+            for e in state.get("picked") or []:
+                if isinstance(e, dict) and e.get("status") in INTEGRATE_APPLIED:
+                    news = picked.setdefault(e["sha"], [])
+                    news += [] if e.get("new_sha") in news else [e.get("new_sha")]
         integ |= {(os.path.realpath(p.get("repo") or "/nonexistent"), p.get("branch")) for p in g["pushes"]}
     return integ, picked
 
@@ -11389,27 +11391,31 @@ def pushed_commits(lines: list) -> dict:
 
 
 def unpushed_on_branch(repo: str, branch: str, shas: list, start: Optional[str], picked: dict) -> list:
-    """条目分支（start 之后）上推上去的提交里没有的提交（不是祖先、cherry_marks 也不是 "-"），摘出来的新提交在推上去的提交里
-    的不算；从旧到新的 sha。"""
+    """条目分支（start 之后）上推上去的提交里没有的提交（不是祖先、cherry_marks 也不是 "-"）；集成记录里摘出来的新提交推上去了
+    的不算（picked_and_pushed），记录没记新提交的（空提交、旧版本的 resolved）照信；从旧到新的 sha。"""
     rev = f"refs/heads/{branch}"
     local = git_out(repo, "rev-list", rev, "--not", *shas, *([start] if start else [])).splitlines()
     equal = set()
     for sha in shas if local else []:
         equal |= {s for m, s in cherry_marks(repo, sha, rev, start) or [] if m == "-"}
-    return [s for s in reversed(local) if s not in equal and not picked_and_pushed(repo, s, picked, shas)]
+    return [s for s in reversed(local) if s not in equal
+            and not (s in picked and (None in picked[s] or picked_and_pushed(repo, s, picked, shas)))]
 
 
-def picked_and_pushed(repo: str, sha: str, picked: dict, shas: list) -> bool:
-    """条目提交 sha 在集成记录里算已应用，而且摘出来的新提交在推上去的提交里（空提交、旧版本没记新提交的照信）。"""
-    if sha not in picked:
-        return False
-    return not picked[sha] or any(is_ancestor(repo, picked[sha], p) for p in shas)
+def picked_and_pushed(repo: str, sha: str, picked: dict, tips: list) -> Optional[str]:
+    """条目提交 sha 按集成记录推上去了没有（wrapup 列没推的提交、cleanup 认集成记录共用）：integrate 把它摘成了集成分支上的
+    新提交，推上去的是那个新提交，所以看新提交——它连同它之前的提交都在 tips（wrapup 给推送记录里推上去的提交，cleanup 给
+    fetch 过的核对分支头）的历史里：是祖先，或者补丁内容相同（push 时上游有新提交会 rebase 集成分支，提交号换了、集成记录
+    记的还是原来那个，unverified_commits 按补丁认）。返回对上的那个新提交；没有记录、没记新提交、本地已经没有它、都对不上
+    返回 None。"""
+    return next((new for new in picked.get(sha) or []
+                 if new and rev_commit(repo, new) and not unverified_commits(repo, new, tips)[0]), None)
 
 
 def wrapup_unpushed_items(family: list, groups: list, lines: list, items: list, warnings: list) -> list:
     """待清理清单里的条目分支（不是集成分支）上有没有没推上去的提交。和 cleanup 核对已提交的同一个判断（cherry_marks：
     推上去的提交里有祖先或补丁内容相同的），核对对象是推送记录里推上去的提交（不联网）；有起点记录的从起点算起（起点之前的
-    不是这个条目的）；集成状态里记过、摘出来的新提交在推上去的提交里的也算推了（解过冲突的 cherry-pick 补丁对不上）。
+    不是这个条目的）；集成状态里记过、摘出来的新提交推上去了的也算推了（解过冲突的 cherry-pick 补丁对不上，picked_and_pushed）。
     这个仓库一次都没推过的不查（集成记录那几行已经写了没推送）。返回 [{repo, branch, commits: [{sha, subject}]}]，有的进 warnings。"""
     (integ, picked), pushed, out = integrated_records(groups), pushed_commits(lines), []
     for item in items:
@@ -11799,11 +11805,14 @@ def cmd_wrapup(a: argparse.Namespace) -> dict:
 
 
 # ---------------------------------------------------------------- cleanup
-# 清理在用户说了才做：用户说"清理"或"收尾"时编排者跑 cleanup，不自动删。逐个 worktree 核实里面的东西都已在这个任务
+# 清理在用户说了才做：用户说"清理"或"收尾"时编排者跑 cleanup，不自动删。逐个 worktree 核实里面的东西都交付到这个任务
 # 推过的远端分支（的历史）里、里面的 agent 没在干活，才删 worktree（herdr worktree remove 会关掉 workspace 和里面所有 agent）、删本地
-# 分支；核实不过的不动、列原因，照旧问用户。探测 / 调研用的 worktree（--probe）不要求在远端：先把本地独有的提交和没提交
-# 的改动存成 patch 放进任务目录，存成了再删。主检出永远不动。误判只允许落在"不删"这一边：核对的远端分支先 fetch 到最新，
-# fetch 不了的不拿来核对；看不清的（agent 列表读不到、合并提交、补丁对不上、内嵌 git 仓库）一律不删。
+# 分支；核实不过的不动、列原因，照旧问用户。已提交的交付了没有，先拿原文对（祖先、补丁内容相同），对不上的认 drover 自己做
+# 的那次集成：integrate 把条目提交摘成集成分支上的新提交（解冲突时会改写内容），新提交在远端分支里就算交付；这样过的条目
+# 提交删之前把原始版本存成 patch 放进任务目录（集成时没原样带上的部分删了找不回来）。没提交的改动不看集成记录，一律按内容
+# 核实。探测 / 调研用的 worktree（--probe）不要求在远端：先把本地独有的提交和没提交的改动存成 patch 放进任务目录，存成了
+# 再删。主检出永远不动。误判只允许落在"不删"这一边：核对的远端分支先 fetch 到最新，fetch 不了的不拿来核对；看不清的（agent
+# 列表读不到、合并提交、没有集成记录又补丁对不上、内嵌 git 仓库）一律不删。
 CLEANUP_IDLE = ("idle", "done")  # agent 只有这两种状态（按屏幕修正之后）才算没在干活
 CLEANUP_LIST_LIMIT = 10
 CLEANUP_HISTORY_LIMIT = 200  # 没提交的改动在一条核对分支的历史里，每个文件（和整份补丁）最多往回查这么多个碰过它的提交
@@ -11858,42 +11867,86 @@ def cleanup_agents(agents: Optional[list], path: str, ws_id: Optional[str]) -> t
     return names, reasons
 
 
-def unverified_commits(where: str, rev: str, refs: list) -> tuple[list, set]:
-    """rev 上没核实过的提交（rev-list 的顺序，从新到旧）和本地独有的合并提交：不是任一核对分支祖先的提交，要在某条分支的
-    git cherry 里是 "-"（补丁内容相同，挑过去的也算）才算核实过。git cherry 不看合并提交，所以合并提交直接算没过。"""
-    shas = [r["sha"] for r in refs]
-    local = git_out(where, "rev-list", rev, "--not", *shas).splitlines()
+def unverified_commits(where: str, rev: str, tips: list) -> tuple[list, set]:
+    """rev 上原文对不上的提交（rev-list 的顺序，从新到旧）和本地独有的合并提交：不是 tips（核对分支的头）里任一个的祖先的
+    提交，要在其中一个的 git cherry 里是 "-"（补丁内容相同，挑过去的也算）才算对上。git cherry 不看合并提交，所以合并提交
+    直接算没对上。"""
+    local = git_out(where, "rev-list", rev, "--not", *tips).splitlines()
     if not local:
         return [], set()
-    merges = set(git_out(where, "rev-list", "--merges", rev, "--not", *shas).splitlines())
+    merges = set(git_out(where, "rev-list", "--merges", rev, "--not", *tips).splitlines())
     equal: set = set()
-    for r in refs:
-        marks = cherry_marks(where, r["sha"], rev)
+    for tip in tips:
+        marks = cherry_marks(where, tip, rev)
         if marks is not None:
             equal |= {sha for mark, sha in marks if mark == "-"}
     bad = [s for s in local if s in merges or s not in equal]
     return bad, merges
 
 
-def cleanup_commits(where: str, rev: str, refs: list) -> list:
-    """rev 上的提交都在核对分支里吗（unverified_commits）。返回没过的原因（空 = 过）；没过的由 cleanup_content /
-    cleanup_branch 再按文件三方合并核实（解过冲突的 cherry-pick、合并提交）。"""
-    bad, merges = unverified_commits(where, rev, refs)
+def same_author(where: str, a: str, b: str) -> bool:
+    """两个提交的作者和作者时间相同（cherry-pick、rebase 都原样保留这两样）。"""
+    who = [git(where, "log", "-1", "--format=%an%x00%ae%x00%at", s) for s in (a, b)]
+    return all(p.returncode == 0 and p.stdout.strip() for p in who) and who[0].stdout == who[1].stdout
+
+
+def integrated_commits(where: str, bad: list, picked: dict, refs: list, pushed: list) -> tuple[dict, dict]:
+    """bad（原文在核对分支里对不上的提交）里按集成记录交付了的。integrate 把条目提交摘成集成分支上的新提交（解冲突时允许
+    改写），推上去的是新提交：新提交在核对分支里，这个条目提交就交付了，和它文字上的差别是集成时的改写。新提交在不在，用
+    核对分支头的同一套核实：祖先、补丁内容相同（picked_and_pushed，和 wrapup 共用），再按文件三方合并（cleanup_rev；push 时
+    rebase 到新上游、上游在旁边动过的）。集成状态里 resolved 的新提交是按"摘之前的 HEAD 之后紧接着的提交、说明相同"认的
+    （conflict_resolved_as），所以再要求新提交的作者和作者时间与条目提交相同，不同就不认。
+    返回 ({条目提交: 新提交}, {没认的条目提交: 原因})；记录没记新提交的（空提交、旧版本的 resolved）两边都不在，照内容核实。"""
     names = "、".join(r["ref"] for r in refs)
-    reasons = [f"提交 {s[:9]} {git_out(where, 'log', '-1', '--format=%s', s)}："
-               + ("合并提交，核实不了补丁内容" if s in merges else f"不在 {names} 里（不是祖先，补丁内容也对不上）")
-               for s in bad[:CLEANUP_LIST_LIMIT]]
-    if len(bad) > CLEANUP_LIST_LIMIT:
-        reasons.append(f"……共 {len(bad)} 个提交不在 {names} 里")
-    return reasons
+    tips = [r["sha"] for r in refs]
+    merged: dict = {}  # 新提交 → 按文件三方合并核实过没有（几个条目提交摘到同一条集成分支上，各核一次）
+
+    def in_history(new: str) -> bool:
+        if new not in merged:
+            merged[new] = bool(rev_commit(where, new)) and not cleanup_rev(where, new, refs, pushed, {})["reasons"]
+        return merged[new]
+
+    done, refused = {}, {}
+    for sha in bad:
+        news = [n for n in picked.get(sha) or [] if n]
+        new = picked_and_pushed(where, sha, picked, tips) or next((n for n in news if in_history(n)), None)
+        if new and same_author(where, sha, new):
+            done[sha] = new
+        elif new:
+            refused[sha] = f"集成记录里摘成了 {new[:9]}，它的作者 / 作者时间和这个提交不同，不认这条记录"
+        elif news:
+            refused[sha] = (f"集成记录里摘成了 {'、'.join(n[:9] for n in news)}，在 {names} 里核实不到（集成了没推，或者推之前"
+                            "又被改写过）")
+    return done, refused
 
 
-def compare_bases(where: str, head: str, refs: list) -> dict:
-    """三方合并的对比起点 {核对分支: 提交}：没核实过的内容开始之前。head 上的提交都核实过（只剩没提交的改动）是 head 自己；
-    有没过的是最老那个的父提交（没有合并提交时本地独有的提交是一条链，rev-list 列出的最后一个最老）；没过的里有合并提交、
+def cleanup_commits(where: str, rev: str, refs: list, pushed: list, picked: dict) -> dict:
+    """rev 上已提交的那一侧都交付了吗：原文对不上的提交（unverified_commits：不是祖先、补丁内容也不同）里，按集成记录
+    交付了的（integrated_commits）算过，其余没过。返回 {bad（原文对不上的，从新到旧）, merges（其中的合并提交）,
+    integrated（{条目提交: 集成分支上的新提交}）, left（没过的，从新到旧）, reasons（没过的原因，空 = 过）}；没过的由
+    cleanup_content / cleanup_rev 再按文件三方合并核实（没有集成记录的解过冲突的 cherry-pick、合并提交）。"""
+    bad, merges = unverified_commits(where, rev, [r["sha"] for r in refs])
+    integrated, refused = integrated_commits(where, bad, picked, refs, pushed) if picked else ({}, {})
+    left = [s for s in bad if s not in integrated]
+    names = "、".join(r["ref"] for r in refs)
+
+    def why(s: str) -> str:
+        if s in merges:
+            return "合并提交，核实不了补丁内容"
+        return refused.get(s) or f"不在 {names} 里（不是祖先，补丁内容也对不上）"
+
+    reasons = [f"提交 {s[:9]} {git_out(where, 'log', '-1', '--format=%s', s)}：{why(s)}" for s in left[:CLEANUP_LIST_LIMIT]]
+    if len(left) > CLEANUP_LIST_LIMIT:
+        reasons.append(f"……共 {len(left)} 个提交不在 {names} 里")
+    return {"bad": bad, "merges": merges, "integrated": integrated, "left": left, "reasons": reasons}
+
+
+def compare_bases(where: str, head: str, refs: list, bad: list, merges: set) -> dict:
+    """三方合并的对比起点 {核对分支: 提交}：没核实过的内容开始之前。bad / merges 是 head 上没核实过的提交（从新到旧）和
+    其中的合并提交。都核实过（只剩没提交的改动）是 head 自己；有没过的是最老那个的父提交（没有合并提交时本地独有的提交是
+    一条链，列出的最后一个最老；它后面夹着按集成记录认下的提交时，那些提交的改动也一起按内容核实）；没过的里有合并提交、
     或者最老那个没有父提交，退回 head 和这条分支的分叉点（merge-base）。不一律用分叉点：条目提交推上去之后又删掉其中几行，
     相对分叉点只是"加得比远端少"，全删回去就和分叉点一样，都会判成已包含。和这条分支没有共同历史的是 None（没法合并）。"""
-    bad, merges = unverified_commits(where, head, refs)
     since = None if merges else rev_commit(where, f"{bad[-1]}^" if bad else head)
     forks = {r["ref"]: git(where, "merge-base", head, r["sha"]).stdout.strip() or None for r in refs}
     return {ref: fork and (since or fork) for ref, fork in forks.items()}
@@ -12176,12 +12229,11 @@ def file_in_history(wt: str, tmp: str, path: str, tree: str, refs: list, bases: 
     return None, over
 
 
-def files_in_history(where: str, tmp: str, head: str, tree: str, refs: list, pushed: list,
+def files_in_history(where: str, tmp: str, head: str, tree: str, refs: list, pushed: list, bases: dict,
                      only: Optional[list]) -> Optional[tuple]:
-    """按文件三方合并核实 tree（整个工作区，或者分支头的树）相对对比起点（compare_bases：没核实过的内容开始之前）的改动；
-    only 给了只查这些文件，否则查各起点到 tree 的全部改动（只改了模式的也算）。和哪条核对分支都没有共同历史返回 None
+    """按文件三方合并核实 tree（整个工作区，或者分支头的树）相对对比起点 bases（compare_bases：没核实过的内容开始之前）的
+    改动；only 给了只查这些文件，否则查各起点到 tree 的全部改动（只改了模式的也算）。和哪条核对分支都没有共同历史返回 None
     （没法合并）。返回 ({文件: {ref, commit, how}}, 找不到的文件, 超了上限没查完的文件)。"""
-    bases = compare_bases(where, head, refs)
     if not any(bases.values()):
         return None
     check: set = set(only or [])
@@ -12214,68 +12266,124 @@ def content_reasons(refs: list, missing: list, unsure: list, uncommitted: list) 
     return reasons
 
 
-def cleanup_branch(repo: str, branch: str, refs: list, pushed: list) -> tuple[list, dict]:
-    """没有 worktree 的本地分支：提交快路径（cleanup_commits）没过时，按文件三方合并核实分支头的树相对对比起点
-    （compare_bases）的改动（files_in_history）。返回 (不删的原因, found_in)。"""
-    rev = f"refs/heads/{branch}"
-    reasons = cleanup_commits(repo, rev, refs)
-    if not reasons:
-        return [], {}
+def report_rewritten(out: dict, where: str, tmp: str, rev: str, refs: list, pushed: list, side: dict) -> None:
+    """核实通过（out["reasons"] 为空）、其中有按集成记录核实的提交时，往结果里补 rewritten：这些提交改过的文件里，原样的
+    改动在核对分支历史里找不到的（集成时改写过，或者解冲突时没带上，分不出是哪种）。只报告，不参与放行：照不认集成记录时
+    的算法核一遍——rev 的树相对"原文对不上的提交开始之前"的改动按文件三方合并，找到原样的并进 found_in。"""
+    if out["reasons"] or not side["integrated"]:
+        return
+    res = files_in_history(where, tmp, rev, git_out(where, "rev-parse", f"{rev}^{{tree}}"), refs, pushed,
+                           compare_bases(where, rev, refs, side["bad"], side["merges"]), None)
+    if res is not None:
+        merged, missing, unsure = res
+        out.update(rewritten=sorted(missing + unsure), found_in={**merged, **out["found_in"]})
+
+
+def cleanup_rev(where: str, rev: str, refs: list, pushed: list, picked: dict) -> dict:
+    """rev 上的提交都交付了吗。rev 是没有 worktree 的本地分支；认集成记录时也拿它核摘出来的新提交在不在核对分支里
+    （integrated_commits，那时 picked 是空的：只按内容）。已提交那一侧（cleanup_commits）没过时，按文件三方合并核实 rev 的
+    树相对对比起点（compare_bases）的改动（files_in_history）。
+    返回 {reasons（空 = 过）, found_in, integrated（{按集成记录核实的条目提交: 新提交}）, rewritten（见 report_rewritten）}。"""
+    side = cleanup_commits(where, rev, refs, pushed, picked)
+    out = {"reasons": side["reasons"], "found_in": {}, "integrated": side["integrated"], "rewritten": []}
+    if not side["bad"]:
+        return out
     with tempfile.TemporaryDirectory(prefix="drover-cleanup-") as tmp:
-        res = files_in_history(repo, tmp, rev, git_out(repo, "rev-parse", f"{rev}^{{tree}}"), refs, pushed, None)
-    if res is None:
-        return reasons, {}
-    merged, missing, unsure = res
-    if not missing and not unsure:
-        return [], merged
-    return reasons + content_reasons(refs, missing, unsure, []), merged
+        res = files_in_history(where, tmp, rev, git_out(where, "rev-parse", f"{rev}^{{tree}}"), refs, pushed,
+                               compare_bases(where, rev, refs, side["left"], side["merges"]), None) if side["reasons"] else None
+        if res is not None:
+            out["found_in"], missing, unsure = res
+            out["reasons"] = side["reasons"] + content_reasons(refs, missing, unsure, []) if missing or unsure else []
+        report_rewritten(out, where, tmp, rev, refs, pushed, side)
+    return out
 
 
-def cleanup_content(wt: str, refs: list, pushed: list) -> dict:
-    """worktree 里的东西（已提交的、没提交的、没被忽略的未跟踪文件）都在某条核对分支的历史里吗。要保证的是删了不丢东西：
-    内容在远端分支历史里任何一个提交上都有就能找回，不要求还在分支头上（推上去之后后来的轮次又改了同一处也算）。
-    快路径：已提交的按 cleanup_commits（祖先、git cherry）；没提交的整份补丁、再逐个文件，对分支头和历史（patch_in_history）
-    严格反向应用。快路径对不上的走按文件的三方合并（file_in_history）：base 是没核实过的内容开始之前（compare_bases：提交都
-    核实过就是 HEAD，有没过的是最老那个的父提交，没过的里有合并提交才退回分叉点），ours 是整个工作区现在的文件（worktree_tree）。
-    已提交的那侧没过时（合并提交、解过冲突的 cherry-pick），查 base 到工作区的全部改动；只有没提交的没过时，只查没过的文件。
-    有内嵌 git 仓库时 worktree_index 报错（核实不了、不删）。
-    返回 {files（没提交的改动）, reasons（空 = 过）, uncommitted_found_in, found_in}：后两个是 {文件或 "*": {ref, commit, how}}。"""
-    commit_reasons = cleanup_commits(wt, "HEAD", refs)
-    with tempfile.TemporaryDirectory(prefix="drover-cleanup-") as tmp:
+def uncommitted_quick(wt: str, tmp: str, refs: list, pushed: list) -> tuple[list, dict, list]:
+    """没提交的改动的快路径：整份补丁、再逐个文件，对各核对分支的头和历史（patch_in_history）严格反向应用。
+    返回 (没提交的改动涉及的文件, {文件或 "*"（整份）: {ref, commit, how}}, 对不上的文件)。"""
 
-        def quick_hit(patch: bytes, paths: list, modes: dict) -> Optional[dict]:
-            for r in refs:
-                hit = patch_in_history(wt, tmp, patch, modes, r, paths, pushed)[0]
-                if hit:
-                    return {"ref": r["ref"], "commit": hit[:12], "how": "快路径"}
-            return None
-
-        patch, files, modes = worktree_patch(wt, tmp)
-        quick: dict = {}
-        failing: list = []
-        whole = quick_hit(patch, files, modes) if files else None
-        if whole:
-            quick["*"] = whole
-        for f in files if not whole else []:
-            hit = quick_hit(*worktree_patch(wt, tmp, f))
+    def quick_hit(patch: bytes, paths: list, modes: dict) -> Optional[dict]:
+        for r in refs:
+            hit = patch_in_history(wt, tmp, patch, modes, r, paths, pushed)[0]
             if hit:
-                quick[f] = hit
-            else:
-                failing.append(f)
-        if not commit_reasons and not failing:
-            return {"files": files, "reasons": [], "uncommitted_found_in": quick, "found_in": {}}
+                return {"ref": r["ref"], "commit": hit[:12], "how": "快路径"}
+        return None
+
+    patch, files, modes = worktree_patch(wt, tmp)
+    whole = quick_hit(patch, files, modes) if files else None
+    if whole:
+        return files, {"*": whole}, []
+    quick: dict = {}
+    failing: list = []
+    for f in files:
+        hit = quick_hit(*worktree_patch(wt, tmp, f))
+        if hit:
+            quick[f] = hit
+        else:
+            failing.append(f)
+    return files, quick, failing
+
+
+def cleanup_content(wt: str, refs: list, pushed: list, picked: dict) -> dict:
+    """worktree 里的东西（已提交的、没提交的、没被忽略的未跟踪文件）都交付了吗。要保证的是删了不丢东西：内容在远端分支
+    历史里任何一个提交上都有就能找回，不要求还在分支头上（推上去之后后来的轮次又改了同一处也算）。
+    已提交的按 cleanup_commits：祖先、git cherry，再认集成记录（集成时解冲突改写过、原文对不上的，摘出来的新提交在核对分支里
+    就算交付）。没提交的不看集成记录，一律按内容：快路径是整份补丁、再逐个文件，对分支头和历史严格反向应用
+    （uncommitted_quick）；对不上的走按文件的三方合并（file_in_history）：base 是没核实过的内容开始之前（compare_bases：提交都
+    核实过就是 HEAD，有没过的是最老那个的父提交，没过的里有合并提交才退回分叉点），ours 是整个工作区现在的文件（worktree_tree）。
+    已提交的那侧没过时（合并提交、没有集成记录的解过冲突的 cherry-pick、集成之后又加的提交），查 base 到工作区的全部改动；
+    只有没提交的没过时，只查没过的文件。有内嵌 git 仓库时 worktree_index 报错（核实不了、不删）。
+    返回 {files（没提交的改动）, reasons（空 = 过）, uncommitted_found_in, found_in, integrated, rewritten}：两个 found_in 是
+    {文件或 "*": {ref, commit, how}}，integrated 是 {按集成记录核实的条目提交: 新提交}，rewritten 见 report_rewritten。"""
+    side = cleanup_commits(wt, "HEAD", refs, pushed, picked)
+    commit_reasons = side["reasons"]
+    with tempfile.TemporaryDirectory(prefix="drover-cleanup-") as tmp:
+        files, quick, failing = uncommitted_quick(wt, tmp, refs, pushed)
+        out = {"files": files, "reasons": [], "uncommitted_found_in": quick, "found_in": {},
+               "integrated": side["integrated"], "rewritten": []}
         res = files_in_history(wt, tmp, "HEAD", worktree_tree(wt, tmp), refs, pushed,
-                               None if commit_reasons else failing)
-    if res is None:  # 和哪条核对分支都没有共同历史：没法三方合并，照快路径的结论
-        return {"files": files, "reasons": commit_reasons + content_reasons(refs, failing, [], files),
-                "uncommitted_found_in": quick, "found_in": {}}
-    merged, missing, unsure = res
-    if not missing and not unsure:
-        return {"files": files, "reasons": [],
-                "uncommitted_found_in": {**quick, **{f: v for f, v in merged.items() if f in files}},
-                "found_in": {f: v for f, v in merged.items() if f not in files}}
-    return {"files": files, "reasons": commit_reasons + content_reasons(refs, missing, unsure, files),
-            "uncommitted_found_in": quick, "found_in": merged}
+                               compare_bases(wt, "HEAD", refs, side["left"], side["merges"]),
+                               None if commit_reasons else failing) if commit_reasons or failing else ({}, [], [])
+        if res is None:  # 和哪条核对分支都没有共同历史：没法三方合并，照快路径的结论
+            out["reasons"] = commit_reasons + content_reasons(refs, failing, [], files)
+        elif res[1] or res[2]:
+            out.update(reasons=commit_reasons + content_reasons(refs, res[1], res[2], files), found_in=res[0])
+        else:
+            out.update(uncommitted_found_in={**quick, **{f: v for f, v in res[0].items() if f in files}},
+                       found_in={f: v for f, v in res[0].items() if f not in files})
+        report_rewritten(out, wt, tmp, "HEAD", refs, pushed, side)
+    return out
+
+
+def patch_stem(prefix: str, name: str) -> str:
+    """任务目录里 patch 文件名的前半：<前缀>-<分支（或 worktree 目录名），不能当文件名的字符换成 ->-<月日-时分秒>。"""
+    return f"{prefix}-{re.sub(r'[^A-Za-z0-9._-]+', '-', name)}-{time.strftime('%m%d-%H%M%S')}"
+
+
+def save_patch(slug: str, stem: str, kind: str, data: bytes, dry_run: bool, saved: list, reasons: list, **info: Any) -> None:
+    """一份 patch 写进任务目录 <stem>.<kind>.patch：记进 saved（{path, kind, …info}；--dry-run 只记不写），写不成、写进去的
+    大小不对时往 reasons 里加一条不删的原因。"""
+    out = STATE_HOME / slug / f"{stem}.{kind}.patch"
+    saved.append({"path": str(out), "kind": kind, **info})
+    if dry_run:
+        return
+    try:
+        out.write_bytes(data)
+        if out.stat().st_size != len(data):
+            reasons.append(f"{out} 写进去的大小不对，没删")
+    except OSError as exc:
+        reasons.append(f"写不了 {out}：{exc}，没删")
+
+
+def format_patches(where: str, revs: list, reasons: list) -> bytes:
+    """git format-patch --stdout --binary（每组参数一次，输出接起来）；有一次失败或没有输出就往 reasons 里加一条不删的原因、
+    返回空。"""
+    parts = [git_bytes(where, "format-patch", "--stdout", "--binary", *args) for args in revs]
+    failed = next((p for p in parts if p.returncode != 0 or not p.stdout), None)
+    if failed:
+        reasons.append(f"git format-patch 失败：{tail(failed.stderr.decode(errors='replace'), 300)}，没删")
+        return b""
+    return b"".join(p.stdout for p in parts)
 
 
 def probe_patches(wt: str, slug: str, branch: Optional[str], dry_run: bool) -> tuple[list, list, bool]:
@@ -12291,31 +12399,43 @@ def probe_patches(wt: str, slug: str, branch: Optional[str], dry_run: bool) -> t
     with tempfile.TemporaryDirectory(prefix="drover-probe-") as tmp:
         patch, files, _ = worktree_patch(wt, tmp)
     commits = git_out(wt, "rev-list", "HEAD", "--not", "--remotes").splitlines()
-    stem = f"probe-{re.sub(r'[^A-Za-z0-9._-]+', '-', branch or Path(wt).name)}-{time.strftime('%m%d-%H%M%S')}"
-    saved, reasons = [], []
-
-    def save(kind: str, data: bytes, **info: Any) -> None:
-        out = STATE_HOME / slug / f"{stem}.{kind}.patch"
-        saved.append({"path": str(out), "kind": kind, **info})
-        if dry_run:
-            return
-        try:
-            out.write_bytes(data)
-            if out.stat().st_size != len(data):
-                reasons.append(f"{out} 写进去的大小不对，没删")
-        except OSError as exc:
-            reasons.append(f"写不了 {out}：{exc}，没删")
-
-    if commits:
-        fp = git_bytes(wt, "format-patch", "--stdout", "--binary", "HEAD", "--not", "--remotes")
-        if fp.returncode != 0 or not fp.stdout:
-            reasons.append(f"git format-patch 失败：{tail(fp.stderr.decode(errors='replace'), 300)}，没删")
-        else:
-            save("commits", fp.stdout, count=len(commits),
-                 subjects=git_out(wt, "log", "--format=%h %s", "HEAD", "--not", "--remotes").splitlines()[:CLEANUP_LIST_LIMIT])
+    stem = patch_stem("probe", branch or Path(wt).name)
+    saved: list = []
+    reasons: list = []
+    data = format_patches(wt, [["HEAD", "--not", "--remotes"]], reasons) if commits else b""
+    if data:
+        save_patch(slug, stem, "commits", data, dry_run, saved, reasons, count=len(commits),
+                   subjects=git_out(wt, "log", "--format=%h %s", "HEAD", "--not", "--remotes").splitlines()[:CLEANUP_LIST_LIMIT])
     if files:
-        save("worktree", patch, count=len(files), files=files[:CLEANUP_LIST_LIMIT])
+        save_patch(slug, stem, "worktree", patch, dry_run, saved, reasons, count=len(files), files=files[:CLEANUP_LIST_LIMIT])
     return saved, reasons, bool(files)
+
+
+def integrated_result(entry: dict, where: str, slug: str, name: str, checked: dict, removing: bool,
+                      dry_run: bool) -> list:
+    """按集成记录核实的提交（checked：cleanup_content / cleanup_rev 的结果）写进这一条的结果：integrated 是
+    [{sha, new_sha, subject}]（从旧到新）。这一条要删时（removing），集成时没原样带上的那部分删了就找不回来，所以先把这些
+    条目提交的原始版本存成 patch：逐个 format-patch 接成一份（它们不一定连续），放进任务目录
+    integrated-<分支>-<时间>.commits.patch，记进 patches（同 --probe 的格式，--dry-run 只给路径）；rewritten 是这些提交改过的
+    文件里原样的改动在核对分支历史里找不到的（最多列 CLEANUP_LIST_LIMIT 个，超了另给 rewritten_total）。
+    返回存不成时不删的原因（空 = 存好了，或者没有要存的）。"""
+    shas = list(reversed(checked["integrated"]))
+    if not shas:
+        return []
+    subjects = [git_out(where, "log", "-1", "--format=%s", s) for s in shas]
+    entry["integrated"] = [{"sha": s, "new_sha": checked["integrated"][s], "subject": t} for s, t in zip(shas, subjects)]
+    if not removing:
+        return []
+    entry["rewritten"] = checked["rewritten"][:CLEANUP_LIST_LIMIT]
+    if len(checked["rewritten"]) > CLEANUP_LIST_LIMIT:
+        entry["rewritten_total"] = len(checked["rewritten"])
+    reasons: list = []
+    data = format_patches(where, [["-1", s] for s in shas], reasons)
+    entry["patches"] = []
+    if data:
+        save_patch(slug, patch_stem("integrated", name), "commits", data, dry_run, entry["patches"], reasons,
+                   count=len(shas), subjects=[f"{s[:9]} {t}" for s, t in zip(shas, subjects)][:CLEANUP_LIST_LIMIT])
+    return reasons
 
 
 def cleanup_remove_cmd(repo: str, path: str, ws_id: Optional[str], force: bool) -> tuple[str, list]:
@@ -12343,10 +12463,11 @@ def cleanup_remove(repo: str, path: str, ws_id: Optional[str], force: bool) -> O
 
 def cmd_cleanup(a: argparse.Namespace) -> dict:
     """1C / 2A 的清理，见上面的说明。--slug 清这个任务的全部 worktree 和分支（没有 worktree 的同类本地分支也按同样核实），
-    --wt 只清指定的；--dry-run 只列结论（fetch 照做，结论是真的），不删、不调 herdr worktree remove。"""
+    --wt 只清指定的；--dry-run 只列结论（fetch 照做，结论是真的），不删、不存 patch、不调 herdr worktree remove。"""
     slug_dir = task_dir(a.slug)
     warnings: list = []
     groups = wrapup_groups([a.slug], warnings)
+    picked = integrated_records(groups)[1]  # 这个任务的集成记录：{条目提交: [集成分支上的新提交…]}
     pushes = task_pushes(a.slug)
     targets = a.target or []
     if a.wt:
@@ -12439,7 +12560,7 @@ def cmd_cleanup(a: argparse.Namespace) -> dict:
                     if missing_refs:
                         reasons.append(missing_refs)
                     else:
-                        content = cleanup_content(path, refs, d["pushed"])
+                        content = cleanup_content(path, refs, d["pushed"], picked)
                         reasons += content["reasons"]
                         files = content["files"]
                         dirty = bool(files)
@@ -12450,6 +12571,9 @@ def cmd_cleanup(a: argparse.Namespace) -> dict:
                         for key in ("uncommitted_found_in", "found_in"):
                             if content[key]:
                                 entry[key] = content[key]
+                        # 原文对不上、按集成记录核实的提交（integrated）；要删的先存它们的原始版本（patches），存不成不删
+                        reasons += integrated_result(entry, path, a.slug, w["branch"] or Path(path).name, content,
+                                                     not reasons, a.dry_run)
             except DroverError as exc:  # 这一个核实不了就不删它，别的照常
                 reasons.append(f"核实没做完：{exc.message}")
         if reasons:
@@ -12478,10 +12602,12 @@ def cmd_cleanup(a: argparse.Namespace) -> dict:
                  "matched_by": b["matched_by"], "checked_against": [r["ref"] for r in refs]}
         branch_results.append(entry)
         missing_refs = ref_reason(b["repo_path"], refs)
-        reasons, found = ([missing_refs], {}) if missing_refs else \
-            cleanup_branch(b["repo_path"], b["branch"], refs, info(b["repo_path"])["pushed"])
-        if found:
-            entry["found_in"] = found
+        checked = {"reasons": [missing_refs], "found_in": {}, "integrated": {}, "rewritten": []} if missing_refs else \
+            cleanup_rev(b["repo_path"], f"refs/heads/{b['branch']}", refs, info(b["repo_path"])["pushed"], picked)
+        if checked["found_in"]:
+            entry["found_in"] = checked["found_in"]
+        reasons = checked["reasons"] + integrated_result(entry, b["repo_path"], a.slug, b["branch"], checked,
+                                                         not checked["reasons"], a.dry_run)
         if reasons:
             entry.update(result="kept", reasons=reasons)
         elif a.dry_run:
@@ -12501,7 +12627,9 @@ def cmd_cleanup(a: argparse.Namespace) -> dict:
         "refs": {r: d["refs"] for r, d in repo_info.items()},
         "worktrees": results, "branches": branch_results, "summary": dict(count), "warnings": warnings,
         "next": ("kept 的按 reasons 逐条告诉用户、问怎么处理（没推的改动、在干活的 agent 不替用户删）；"
-                 + ("确认后去掉 --dry-run 再跑一次" if a.dry_run else "removed 的记进状态文件和 wrapup.md 的清理一节")),
+                 + ("确认后去掉 --dry-run 再跑一次" if a.dry_run else
+                    "removed 的记进状态文件和 wrapup.md 的清理一节（带 integrated 的是按集成记录核实的：把 patches 的路径和 "
+                    "rewritten 列的文件一起记上）")),
     }
 
 
@@ -13877,9 +14005,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fetch", action="store_true", help="远端头在本地没有时，先 fetch 那条远端分支再核对推送的提交还在不在")
     p.add_argument("--no-remote", action="store_true", help="不做远端核对（不跑 ls-remote）")
 
-    p = sub.add_parser("cleanup", help="清理任务的 worktree 和分支（用户说\"清理\"或\"收尾\"时才跑）：逐个核实内容都在这个任务推过的"
-                                       "远端分支里、里面的 agent 没在干活、没有进行中的 git 操作才删（herdr worktree remove 关掉"
-                                       "workspace 和 agent，再删本地分支）；核实不过的不动、列原因。主检出永远不动")
+    p = sub.add_parser("cleanup", help="清理任务的 worktree 和分支（用户说\"清理\"或\"收尾\"时才跑）：逐个核实内容都交付到这个任务推过的"
+                                       "远端分支里（集成时解冲突改写过的条目提交按集成记录认，删之前存 patch 到 "
+                                       "~/.drover/<slug>/integrated-*.patch）、里面的 agent 没在干活、没有进行中的 git 操作才删"
+                                       "（herdr worktree remove 关掉 workspace 和 agent，再删本地分支）；核实不过的不动、列原因。"
+                                       "主检出永远不动")
     p.add_argument("--slug", required=True, help="任务 slug：核对它推过的远端分支（推送记录），清它的 worktree / 分支")
     p.add_argument("--wt", action="append", help="只清这个 worktree（可重复）；不传就清这个任务的全部 worktree 和没有 worktree "
                                                  "的同类本地分支")
@@ -13889,7 +14019,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--probe", action="store_true",
                    help="探测 / 调研用的 worktree（不交付改动，要配 --wt）：不要求内容在远端，先把本地独有的提交和没提交、"
                         "没被忽略的改动存成 patch 到 ~/.drover/<slug>/probe-*.patch，存成了再删")
-    p.add_argument("--dry-run", action="store_true", help="只列每个 worktree / 分支的结论（会 fetch 核对分支），不删、"
+    p.add_argument("--dry-run", action="store_true", help="只列每个 worktree / 分支的结论（会 fetch 核对分支），不删、不存 patch、"
                                                           "不调 herdr worktree remove")
 
     p = sub.add_parser("orch-start", help="为一个任务起编排者（orch workspace 里新开 tab，启动 claude 或 codex，发开场 prompt）")

@@ -352,6 +352,52 @@ class WrapupTests(WrapupCase):
         self.assertNotIn("无（", line)
         self.assertTrue(any(b in w and "没推上去" in w for w in res["warnings"]), res["warnings"])
 
+    def test_conflict_resolved_item_commits_pushed_or_not(self) -> None:
+        """条目提交集成时解过冲突（内容改写了，补丁对不上）：摘出来的新提交推上去了 → 不算没推；另一个条目集成了、解了冲突
+        但还没推 → 算，列出来"""
+        a = self.item("a", {"shared.txt": "from a\n"})
+        self.upstream_commit("upstream shared", {"shared.txt": "from upstream\n"})
+        wt = self.integrate_resolved(a, {"shared.txt": "from upstream and a\n"})
+        self.check(wt)
+        self.assertTrue(self.push(wt)["verified"])
+        self.assertEqual(self.wrapup("--no-remote")["unpushed_items"], [])
+        b = self.item("b", {"app/core.py": "VALUE = 2\n"})
+        self.sync_upstream()
+        self.upstream_commit("upstream core", {"app/core.py": "VALUE = 3\n"})
+        self.integrate_resolved(b, {"app/core.py": "VALUE = 23\n"})
+        self.assertEqual([e["status"] for e in self.load_state()["picked"]], ["resolved", "resolved"])
+        res = self.wrapup("--no-remote")
+        self.assertEqual([(u["branch"], [c["subject"] for c in u["commits"]]) for u in res["unpushed_items"]],
+                         [(b, ["item b"])])
+
+    def test_resolved_item_pushed_after_rebase_not_listed(self) -> None:
+        """集成时解过冲突的条目提交，push 时上游又有新提交：drover rebase 了集成分支（摘出来的提交换了提交号，集成状态记的
+        还是 rebase 之前的那个）再推上去 → 按补丁内容认出它推了，不算没推"""
+        a = self.item("a", {"shared.txt": "from a\n"})
+        self.upstream_commit("upstream shared", {"shared.txt": "from upstream\n"})
+        wt = self.integrate_resolved(a, {"shared.txt": "from upstream and a\n"})
+        self.check(wt)
+        before = self.head(wt)
+        self.upstream_commit("upstream docs", {"docs/notes.md": "notes\n"})
+        self.assertTrue(self.push(wt)["rebased"])
+        self.assertTrue(self.push(wt)["verified"])
+        self.assertNotEqual(self.head(wt), before)
+        self.assertEqual(self.load_state()["picked"][0]["new_sha"], before)
+        self.assertEqual(self.wrapup("--no-remote")["unpushed_items"], [])
+
+    def test_integrated_records_keep_every_new_commit(self) -> None:
+        """集成记录读成 {条目提交: [新提交…]}：同一个条目提交摘到两条集成分支上的两个都留着（一条推了、另一条没推时不被后读
+        的那份盖掉）；没记新提交的（空提交）记 None；没应用的（conflict）不在里面"""
+        d = self.load_drover()
+        main = {"repo": str(self.src), "branch": "task/s1", "picked": [
+            {"sha": "x", "status": "resolved", "new_sha": "y1"}, {"sha": "e", "status": "empty"},
+            {"sha": "c", "status": "conflict"}]}
+        release = {"repo": str(self.src), "branch": "task/s1-release", "picked": [
+            {"sha": "x", "status": "picked", "new_sha": "y2"}, {"sha": "x", "status": "picked", "new_sha": "y2"}]}
+        integ, picked = d.integrated_records([{"states": [(None, main), (None, release)], "pushes": []}])
+        self.assertEqual(picked, {"x": ["y1", "y2"], "e": [None]})
+        self.assertEqual({b for _, b in integ}, {"task/s1", "task/s1-release"})
+
     def test_check_coverage_of_pushes(self) -> None:
         """整体检查覆盖推上去的提交：push 记下的检查和存档的 head 都对得上 → 骨架的检查行写"覆盖推到 origin/main 的 <sha>"；
         之后又带 --unchecked 推了一次 → 那次推送没有检查覆盖，warnings 和骨架都写明，带上理由"""

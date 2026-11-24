@@ -354,8 +354,8 @@ class IntegrateTests(IntegrationCase):
         self.assertEqual(d.cherry_plus(src, "ws-up", "ws-ours", "main"), [ours])
         self.assertEqual(d.cherry_plus(src, "ws-up", "ws-same", "main"), [])
         ref = [{"ref": "origin/ws-up", "sha": up}]
-        self.assertEqual(len(d.cleanup_commits(src, "refs/heads/ws-ours", ref)), 1)
-        self.assertEqual(d.cleanup_commits(src, "refs/heads/ws-same", ref), [])
+        self.assertEqual(len(d.cleanup_commits(src, "refs/heads/ws-ours", ref, [], {})["reasons"]), 1)
+        self.assertEqual(d.cleanup_commits(src, "refs/heads/ws-same", ref, [], {})["reasons"], [])
 
     def commit_on(self, branch: str, files: dict) -> str:
         """源仓库从 main 拉 branch、提交一次（说明带分支名，提交号各不相同），切回 main，返回 sha。"""

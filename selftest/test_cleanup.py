@@ -1,6 +1,7 @@
-"""cleanup：用户说"清理"或"收尾"时编排者跑，逐个 worktree 核实内容都在这个任务
+"""cleanup：用户说"清理"或"收尾"时编排者跑，逐个 worktree 核实内容都交付到这个任务
 推过的远端分支里、里面的 agent 没在干活、没有进行中的 git 操作才删（herdr worktree remove 关掉 workspace 和 agent，再删本地
 分支），核实不过的不动、列原因；--dry-run 只列；--probe 先存 patch 再删；--target 给推送记录缺的老任务补核对分支。
+集成时解冲突改写过、原文在远端对不上的条目提交按集成记录认，删之前存 patch（IntegratedTests）。
 
 仓库布局同 integrate（selftest_repos）：本地裸仓库当 origin。worktree 由 drover wt（假 herdr 真的 git worktree add）建，推送由
 真的 integrate / push 写记录；假 herdr 的 worktree remove 真的 git worktree remove（有改动要 --force）并关掉 workspace 里的 agent。
@@ -9,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import unittest
 from pathlib import Path
@@ -35,6 +37,19 @@ REAP_UPSTREAM = {"integrate": ("从上游建", "从最新上游建"), "wt_sync":
                  "push": ("上游改了就 rebase", "上游改了就 rebase；push 遇到永久错误只试 1 次"),
                  "heavy": ("两条同时跑，第二条排队并打印在跑的那条", "整机满了时第二条排队、第一条结束后开始"),
                  "heavy_sched": ("heavy 按资源调度：放行判定、需求取实测", "heavy 按实时 CPU 调度：放行判定")}
+
+
+# 集成时解冲突改写的用例：远端先有 BIND / QUOTA，条目改两处（ITEM），上游随后也改了这两处（UPSTREAM）→ cherry-pick 真的冲突，
+# 解的时候改写（RESOLVED）：注释换了说法；条目加的那一句并进上游改过的段落、句末分号改成句号。条目的原文在远端哪个提交上都
+# 对不上（按文件三方合并也判不包含）。
+BIND = "def resolve(key):\n    # 按 key 查绑定\n    return TABLE[key]\n"
+QUOTA = "# 配额\n\n## 注册表\n\n能力 key 在总表里登记。\n\n## 计费\n\n每次调用扣 1 点。\n"
+ITEM = {"app/bind.py": "def resolve(key):\n    # 按 key 查绑定；查不到抛 NotConfigured\n    check(key)\n    return TABLE[key]\n",
+        "docs/quota.md": QUOTA.replace("登记。\n", "登记。\n能力 key `record-structure` 在本部署解析；\n")}
+UPSTREAM = {"app/bind.py": BIND.replace("查绑定", "查绑定（区分大小写）"),
+            "docs/quota.md": QUOTA.replace("登记。", "登记，表在 stem_agent_bindings。")}
+RESOLVED = {"app/bind.py": "def resolve(key):\n    # 按 key（区分大小写）找绑定，没配置就报错\n    check(key)\n    return TABLE[key]\n",
+            "docs/quota.md": QUOTA.replace("登记。", "登记，表在 stem_agent_bindings；`record-structure` 在本部署解析。")}
 
 
 def reap_table(rows) -> str:
@@ -95,9 +110,14 @@ class CleanupCase(IntegrationCase):
         for b in branches:
             args += ["--from", b]
         wt = Path(self.drover_json(*args)["worktree_path"])
-        self.assertTrue(self.drover_json("push", "--wt", str(wt), "--target", "main",
-                                         "--unchecked", "自测：cleanup 用例不测整体检查")["verified"])
+        self.push_unchecked(wt)
         return wt
+
+    def push_unchecked(self, wt: Path) -> dict:
+        """从这个 worktree 推到 origin/main（不测整体检查），核对推上去了。"""
+        res = self.drover_json("push", "--wt", str(wt), "--target", "main", "--unchecked", "自测：cleanup 用例不测整体检查")
+        self.assertTrue(res["verified"], res)
+        return res
 
     def ship_patch(self, item: Path, name: str = "r1") -> Path:
         """patch 模式：条目 worktree 不提交，git diff --binary 导补丁，叠到 wt 建的集成 worktree 里提交、push。"""
@@ -106,8 +126,7 @@ class CleanupCase(IntegrationCase):
         wt = self.wt(name)
         self.git(wt, "apply", "--index", str(self.tmp / f"{name}.patch"))
         self.git(wt, "commit", "-q", "-m", f"ship {name}")
-        self.assertTrue(self.drover_json("push", "--wt", str(wt), "--target", "main",
-                                         "--unchecked", "自测：cleanup 用例不测整体检查")["verified"])
+        self.push_unchecked(wt)
         return wt
 
     def remote_commit(self, message: str, files: dict) -> str:
@@ -573,6 +592,215 @@ class CleanupTests(CleanupCase):
         self.assertIn("不是这个任务的 worktree", e[other]["reasons"][0])
         self.assertTrue(other.is_dir())
         self.assertEqual(self.removes(), [])
+
+
+class IntegratedTests(CleanupCase):
+    """条目提交在正式集成时解过冲突、内容被改写后才推上去：原文在远端对不上，按集成记录认（integrate 记着条目提交摘成了
+    集成分支上的哪个提交，那个提交在核对分支里就算交付）。都走真实命令：wt → integrate（真冲突、真解）→ push → cleanup。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.remote_commit("seed", {"app/bind.py": BIND, "docs/quota.md": QUOTA})
+
+    def integrate_item(self, name: str = "a") -> tuple:
+        """条目 worktree 提交 ITEM（外加一个不冲突的新文件），上游随后改了同两处 → integrate 停在冲突上 → 解的时候改写成
+        RESOLVED。还没推。返回 (条目 worktree, 集成 worktree, 条目提交)。"""
+        item = self.wt(name)
+        sha = self.commit(item, f"item {name}", {**ITEM, "app/extra.py": "E = 1\n"})
+        self.remote_commit("upstream touches the same lines", UPSTREAM)
+        return item, self.integrate_resolved(f"task/{SLUG}-{name}", RESOLVED), sha
+
+    def new_sha(self, sha: str) -> str:
+        """集成状态里这个条目提交摘成的新提交。"""
+        return next(e["new_sha"] for e in self.load_state()["picked"] if e["sha"] == sha)
+
+    def saved(self) -> list:
+        """任务目录里按集成记录核实时留底的 patch。"""
+        return sorted((self.state / SLUG).glob("integrated-*.patch"))
+
+    def test_rewritten_on_integrate_then_pushed_removed_with_patch(self) -> None:
+        """集成时解冲突改写了内容（注释换说法、分号改句号、并进上游段落）推上去 → 条目 worktree 和分支自动删；删之前把条目
+        提交的原始版本存成 patch（能在条目起点上还原），结果写明按集成记录核实的提交、patch、哪些文件和远端对不上原样（没改写
+        的那个文件在 found_in）。--dry-run 只报：不存 patch、不删"""
+        item, integ, sha = self.integrate_item()
+        self.push_unchecked(integ)
+        dry = self.by_path(self.cleanup("--dry-run"))[item]
+        self.assertEqual(dry["result"], "would_remove", dry)
+        self.assertEqual(dry["integrated"], [{"sha": sha, "new_sha": self.new_sha(sha), "subject": "item a"}])
+        self.assertEqual(dry["rewritten"], ["app/bind.py", "docs/quota.md"])
+        self.assertEqual(dry["found_in"], {"app/extra.py": merged_at("origin/main", self.remote_head())})
+        self.assertEqual([(p["kind"], p["count"]) for p in dry["patches"]], [("commits", 1)])
+        self.assertEqual(self.saved(), [])
+        self.assertTrue(item.is_dir() and self.has_branch(f"task/{SLUG}-a"))
+        e = self.by_path(self.cleanup())
+        self.assertEqual((e[item]["result"], e[item]["force"]), ("removed", False))
+        self.assertEqual(e[integ]["result"], "removed")
+        self.assertFalse(item.exists() or self.has_branch(f"task/{SLUG}-a"))
+        self.assertEqual([Path(p["path"]) for p in e[item]["patches"]], self.saved())
+        self.assertEqual(len(self.saved()), 1)
+        self.assertTrue(self.saved()[0].name.startswith(f"integrated-task-{SLUG}-a-"))
+        restore = self.tmp / "restore"
+        self.git(self.src, "worktree", "add", "-q", "--detach", str(restore), f"{sha}^")
+        self.git(restore, "am", "-q", str(self.saved()[0]))
+        self.assertEqual(self.git(restore, "rev-parse", "HEAD^{tree}"), self.git(self.src, "rev-parse", f"{sha}^{{tree}}"))
+
+    def test_branch_without_worktree_removed_with_patch(self) -> None:
+        """条目 worktree 已经不在、只剩条目分支：同样按集成记录认、删分支之前存 patch"""
+        item, integ, sha = self.integrate_item()
+        self.push_unchecked(integ)
+        self.git(self.src, "worktree", "remove", str(item))
+        res = self.cleanup()
+        b = {x["branch"]: x for x in res["branches"]}[f"task/{SLUG}-a"]
+        self.assertEqual(b["result"], "removed", b)
+        self.assertEqual([(x["sha"], x["new_sha"]) for x in b["integrated"]], [(sha, self.new_sha(sha))])
+        self.assertEqual(b["rewritten"], ["app/bind.py", "docs/quota.md"])
+        self.assertEqual([Path(p["path"]) for p in b["patches"]], self.saved())
+        self.assertIn("Subject: [PATCH] item a", self.saved()[0].read_text())
+        self.assertFalse(self.has_branch(f"task/{SLUG}-a"))
+
+    def rebased_push(self, integ: Path, upstream: dict) -> str:
+        """推之前上游又有新提交：push 先 rebase 集成分支（这次不推），再跑一次推上去。集成状态记的新提交还是 rebase 之前的
+        那个，它不在远端。返回 rebase 之前的那个提交。"""
+        before = self.head(integ)
+        self.remote_commit("upstream moves before push", upstream)
+        self.assertTrue(self.drover_json("push", "--wt", str(integ), "--target", "main", "--unchecked", "自测")["rebased"])
+        self.push_unchecked(integ)
+        self.assertNotIn(before, self.git(self.src, "rev-list", self.remote_head()).split())
+        return before
+
+    def test_pushed_after_rebase_removed(self) -> None:
+        """push 时上游有新提交、drover 自己 rebase 了：推上去的提交换了提交号，集成记录里的还是原来那个（不是远端的祖先）。
+        上游改的是别的文件 → 两个提交补丁内容相同，认记录 → 条目 worktree 照样自动删、patch 存下来"""
+        item, integ, sha = self.integrate_item()
+        before = self.rebased_push(integ, {"docs/notes.md": "notes\n"})
+        self.assertEqual(self.new_sha(sha), before)
+        e = self.by_path(self.cleanup())
+        self.assertEqual(e[item]["result"], "removed", e[item])
+        self.assertEqual([(x["sha"], x["new_sha"]) for x in e[item]["integrated"]], [(sha, before)])
+        self.assertEqual(len(self.saved()), 1)
+        self.assertFalse(item.exists() or self.has_branch(f"task/{SLUG}-a"))
+
+    def test_pushed_after_rebase_next_to_upstream_change_removed(self) -> None:
+        """同上，但上游改的是同一个文件、隔一行的地方：rebase 干净，补丁的上下文变了（补丁号不同）→ 新提交按文件三方合并
+        核实在远端 → 认记录、照样删"""
+        item, integ, sha = self.integrate_item()
+        before = self.rebased_push(integ, {"docs/quota.md": UPSTREAM["docs/quota.md"].replace("## 计费", "## 计费规则")})
+        d = self.load_drover()
+        self.assertEqual(d.unverified_commits(str(self.src), before, [self.remote_head()])[0], [before])
+        e = self.by_path(self.cleanup())
+        self.assertEqual(e[item]["result"], "removed", e[item])
+        self.assertEqual([(x["sha"], x["new_sha"]) for x in e[item]["integrated"]], [(sha, before)])
+        self.assertEqual(len(self.saved()), 1)
+
+    def test_commits_added_or_amended_after_integration_kept(self) -> None:
+        """集成并推上去之后条目分支又变了：又加了一个提交；或者 amend 过（提交号变了，集成记录里没有它）→ 不删，原因列出
+        没在记录里的那个提交和它的文件；不存 patch"""
+        item, integ, sha = self.integrate_item()
+        self.push_unchecked(integ)
+        self.assertEqual(self.by_path(self.cleanup("--dry-run"))[item]["result"], "would_remove")
+        later = self.commit(item, "later work", {"app/later.py": "L = 1\n"})
+        added = self.by_path(self.cleanup())[item]
+        self.assertEqual(added["result"], "kept", added)
+        self.assertEqual(added["reasons"], [f"提交 {later[:9]} later work：不在 origin/main 里（不是祖先，补丁内容也对不上）",
+                                            "已提交的改动 app/later.py：在 origin/main 的历史里找不到包含这些改动的提交"])
+        self.assertEqual([x["sha"] for x in added["integrated"]], [sha])
+        self.assertNotIn("patches", added)
+        self.git(item, "reset", "-q", "--hard", sha)
+        (item / "app" / "bind.py").write_text(ITEM["app/bind.py"] + "# amended\n")
+        self.git(item, "commit", "-q", "-a", "--amend", "--no-edit")
+        amended = self.by_path(self.cleanup())[item]
+        self.assertEqual(amended["result"], "kept", amended)
+        self.assertIn(f"提交 {self.head(item)[:9]} item a：不在 origin/main 里", amended["reasons"][0])
+        self.assertIn("已提交的改动 app/bind.py：在 origin/main 的历史里找不到包含这些改动的提交", amended["reasons"])
+        self.assertNotIn("integrated", amended)
+        self.assertEqual(self.saved(), [])
+        self.assertTrue(item.is_dir() and self.has_branch(f"task/{SLUG}-a"))
+
+    def test_integrated_but_not_pushed_kept(self) -> None:
+        """集成了、解了冲突，但没推（这个任务在这个仓库推过别的条目，核对分支在）：集成记录里摘出来的新提交在核对分支里
+        祖先、补丁、三方合并都核实不到 → 不认记录，照内容核实 → 不删，原因写明摘成了哪个提交、在哪条分支里核实不到"""
+        b = self.wt("b")
+        self.commit(b, "item b", {"app/b.py": "B = 1\n"})
+        self.ship_commits(f"task/{SLUG}-b")
+        item, integ, sha = self.integrate_item()
+        e = self.by_path(self.cleanup())
+        self.assertEqual({k: e[k]["result"] for k in (item, integ, b)}, {item: "kept", integ: "kept", b: "removed"})
+        self.assertEqual(e[item]["reasons"], [
+            f"提交 {sha[:9]} item a：集成记录里摘成了 {self.new_sha(sha)[:9]}，在 origin/main 里核实不到（集成了没推，或者推之前"
+            "又被改写过）",
+            "已提交的改动 app/bind.py：在 origin/main 的历史里找不到包含这些改动的提交",
+            "已提交的改动 app/extra.py：在 origin/main 的历史里找不到包含这些改动的提交",
+            "已提交的改动 docs/quota.md：在 origin/main 的历史里找不到包含这些改动的提交"])
+        self.assertNotIn("integrated", e[item])
+        self.assertEqual(self.saved(), [])
+        self.assertTrue(item.is_dir() and integ.is_dir())
+
+    def test_uncommitted_on_top_of_integrated_checked_by_content(self) -> None:
+        """提交按集成记录过了，没提交的改动照旧按内容核实（相对 HEAD）：改成和远端一模一样的 → 过（带 --force）；另有远端
+        没有的改动、未跟踪文件 → 不删，逐个文件写原因，不存 patch"""
+        item, integ, sha = self.integrate_item()
+        self.push_unchecked(integ)
+        (item / "app" / "bind.py").write_text(RESOLVED["app/bind.py"])
+        same = self.by_path(self.cleanup("--dry-run"))[item]
+        self.assertEqual((same["result"], same["force"]), ("would_remove", True))
+        self.assertEqual(same["uncommitted_found_in"], {"*": quick("origin/main", self.remote_head())})
+        (item / "app" / "bind.py").write_text(RESOLVED["app/bind.py"] + "TIMEOUT = 5\n")
+        (item / "notes.txt").write_text("没推的笔记\n")
+        e = self.by_path(self.cleanup())[item]
+        self.assertEqual(e["result"], "kept", e)
+        self.assertEqual(e["reasons"], ["没提交的改动 app/bind.py：在 origin/main 的历史里找不到包含这些改动的提交",
+                                        "没提交的改动 notes.txt：在 origin/main 的历史里找不到包含这些改动的提交"])
+        self.assertEqual([x["sha"] for x in e["integrated"]], [sha])
+        self.assertNotIn("patches", e)
+        self.assertEqual(self.saved(), [])
+        self.assertTrue((item / "notes.txt").exists())
+
+    def test_record_without_new_commit_falls_back_to_content(self) -> None:
+        """集成记录没记摘成了哪个提交的，不认记录、按内容核实。旧版本的 resolved（没有 new_sha）：改写过的原文对不上 → 不删；
+        空提交（条目的改动已经原样在上游里，status empty）：内容核实本来就能过 → 删，不算按记录核实、不存 patch"""
+        item, integ, sha = self.integrate_item()
+        self.push_unchecked(integ)
+        state = self.load_state()
+        del state["picked"][0]["new_sha"]
+        self.state_file().write_text(json.dumps(state))
+        old = self.by_path(self.cleanup("--dry-run"))[item]
+        self.assertEqual(old["result"], "kept", old)
+        self.assertEqual(old["reasons"][0], f"提交 {sha[:9]} item a：不在 origin/main 里（不是祖先，补丁内容也对不上）")
+        self.assertNotIn("integrated", old)
+        empty = self.wt("e")
+        self.commit(empty, "item e", {"app/e.py": "E = 1\n"})
+        self.remote_commit("upstream already has it", {"app/e.py": "E = 1\n", "docs/e.md": "e\n"})
+        self.drover_json("integrate", "--repo", self.REPO, "--slug", SLUG, "--target", "main", "--from", f"task/{SLUG}-e")
+        self.assertEqual(self.load_state()["picked"][-1]["status"], "empty")
+        e = self.by_path(self.cleanup())[empty]
+        self.assertEqual(e["result"], "removed", e)
+        self.assertEqual(e["found_in"], {"app/e.py": merged_at("origin/main", self.remote_head())})
+        self.assertNotIn("integrated", e)
+        self.assertEqual(self.saved(), [])
+
+    def test_record_pointing_at_another_commit_not_trusted(self) -> None:
+        """集成状态里 resolved 的新提交是按"冲突后紧接着的提交、说明相同"认的：冲突后 --abort，手工提交了一个说明相同的别的
+        提交，记录会说条目提交已应用。那个提交的作者时间和条目提交不同 → 不认这条记录，照内容核实 → 不删、原因写明"""
+        item = self.wt("a")
+        sha = self.commit(item, "item a", ITEM)
+        self.remote_commit("upstream touches the same lines", UPSTREAM)
+        args = ["integrate", "--repo", self.REPO, "--slug", SLUG, "--target", "main", "--from", f"task/{SLUG}-a"]
+        integ = Path(self.drover_json(*args, rc=1)["worktree_path"])
+        self.git(integ, "cherry-pick", "--abort")
+        self.write_files(integ, {"app/other.py": "O = 1\n"})
+        self.git(integ, "add", "-A")
+        self.git(integ, "commit", "-q", "-m", "item a", "--date", "2001-02-03T04:05:06")
+        self.drover_json(*args)
+        other = self.head(integ)
+        self.assertEqual((self.load_state()["picked"][0]["status"], self.new_sha(sha)), ("resolved", other))
+        self.push_unchecked(integ)
+        e = self.by_path(self.cleanup())[item]
+        self.assertEqual(e["result"], "kept", e)
+        self.assertEqual(e["reasons"][0], f"提交 {sha[:9]} item a：集成记录里摘成了 {other[:9]}，它的作者 / 作者时间"
+                                          "和这个提交不同，不认这条记录")
+        self.assertNotIn("integrated", e)
+        self.assertEqual(self.saved(), [])
+        self.assertTrue(item.is_dir())
 
 
 if __name__ == "__main__":

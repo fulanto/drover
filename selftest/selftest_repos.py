@@ -75,6 +75,20 @@ class IntegrationCase(DroverTestCase):
             args += ["--from", b]
         return self.drover_json(*args, rc=rc)
 
+    def integrate_resolved(self, branch: str, resolved: dict, slug: str = "") -> Path:
+        """integrate 这条条目分支，真的停在冲突上（冲突的正好是 resolved 里的文件）；在集成 worktree 里把它们写成 resolved
+        （解冲突时改写内容）→ add → cherry-pick --continue → 重跑 integrate：状态记 resolved 和摘出来的新提交。
+        返回集成 worktree。"""
+        args = ["integrate", "--repo", self.REPO, "--slug", slug or self.SLUG, "--target", "main", "--from", branch]
+        res = self.drover_json(*args, rc=1)
+        self.assertEqual(sorted(res.get("conflicts") or []), sorted(resolved), res)
+        wt = Path(res["worktree_path"])
+        self.write_files(wt, resolved)
+        self.git(wt, "add", "-A")
+        self.git(wt, "cherry-pick", "--continue")
+        self.drover_json(*args)
+        return wt
+
     def push(self, wt: Path, *extra: str, rc: int = 0) -> dict:
         return self.drover_json("push", "--wt", str(wt), "--target", "main", *extra, rc=rc)
 
