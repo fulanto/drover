@@ -57,10 +57,13 @@
   - 其他子命令一律报错退出（误用一眼能看出来）
 假测试工具：按调用名（vitest / tsc / eslint / pytest）打印对应格式的输出，失败条目读当前目录的 fake-<工具>.json，
 调用（工具名、参数、cwd）记进 tool-calls.log。vitest / pytest / eslint 的参数里带文件时只报这些文件里的失败
-（基线子集、超时复核）；vitest 的超时单独跑时通过，rerun_fail 里的文件除外。tsc 不看参数。
+（基线子集、vitest 的单独重跑）。tsc 不看参数。
 spec 里有 output 时原样回放（真实工具的输出样例），退出码取 exit（默认 0）；带 sleep 的先睡这么多秒，再重读一次 spec
-（真工具边跑边读文件：跑的过程中目录被删了就读不到、报错退出）。vitest 另有 unhandled（汇总里 N 个未处理错误，没有 FAIL 行；
-只在整条跑时出现）、rerun_no_tests（复核点名文件时 "No test files found"、退出码 0）。
+（真工具边跑边读文件：跑的过程中目录被删了就读不到、报错退出）。
+vitest 的失败条目：{file, test, kind, flaky?, errors?}。kind 见 VITEST_KINDS（assert / timeout / suite / file / file-timeout）；
+flaky 的只在整套跑时失败、点名文件时通过（偶发，和 kind 无关）；errors: 2 是一条用例两个 error（同名的两行 FAIL）。
+另有 unhandled（汇总里 N 个未处理错误，没有 FAIL 行；只在整套跑时出现）、rerun_no_tests（点名文件时 "No test files found"、
+退出码 0）、rerun_skip（点了名也不跑的文件：--shard 把点名的文件筛掉一部分的样子）。
 """
 
 from __future__ import annotations
@@ -508,22 +511,38 @@ if "output" in spec:
     sys.exit(spec.get("exit", 0))
 
 
+# 失败的 kind → (哪一节, 报错的第一行)。套件一节：整个文件失败（file：import 时抛错；file-timeout：文件顶层的 beforeAll
+# 超时，FAIL 行带 "[ 文件 ]"）和 describe 级失败（suite：beforeAll 抛错，FAIL 行是 "文件 > describe 名"、不带方括号）；
+# 用例一节：assert、timeout。报错文字照 vitest 4.1.7 的真实输出（selftest_vitest_samples.py）。
+VITEST_KINDS = {"assert": ("tests", "AssertionError: expected 1 to be 2 // Object.is equality"),
+                "timeout": ("tests", "Error: Test timed out in 5000ms."),
+                "suite": ("suites", "Error: setup exploded"),
+                "file": ("suites", "Error: import exploded"),
+                "file-timeout": ("suites", "Error: Hook timed out in 10000ms.")}
+
+
+def state_line(title, items, total):
+    """汇总行："     Tests  1 failed | 10 passed | 2 skipped (13)"，为 0 的项不打（vitest 的 getStateString）。"""
+    body = " | ".join("%d %s" % (n, word) for word, n in items if n)
+    return "%s  %s (%d)" % (title.rjust(11), body, total)
+
+
 def vitest():
+    """照 vitest 4.1.7 在 AI agent 里跑时的结构打印（见 selftest_vitest_samples.py）：只列失败的文件；"Failed Suites N" 一节在前、"Failed Tests N" 一节
+    在后，每个 error 一行 FAIL、一段报错、一条分隔线 [i/总 error 数]（一条失败带 errors: 2 就是同名的两行 FAIL）；最后是汇总行。"""
     picked = [a for a in args if TEST_FILE_RE.search(a)]
-    if picked and spec.get("rerun_no_tests"):  # 复核点名的文件一个都没匹配上，命令又带 passWithNoTests（vitest 4.1.11 的样子）
+    if picked and spec.get("rerun_no_tests"):  # 点名的文件一个都没匹配上，命令又带 passWithNoTests（vitest 4.1.11 的样子）
         print(" RUN  v4.1.11 %s\n\nNo test files found, exiting with code 0\n" % os.getcwd())
         return 0
     failures = spec.get("failures", [])
-    if picked:  # 只跑指定的文件（基线子集、超时复核）：断言失败照旧失败，超时单独跑时通过；rerun_fail 里的文件还失败（按断言失败打印）
-        bad = set(spec.get("rerun_fail", []))
-        failures = [f if f.get("kind", "assert") == "assert" else dict(f, kind="assert") for f in failures
-                    if f["file"] in picked and (f.get("kind", "assert") == "assert" or f["file"] in bad)]
-        files = picked
+    if picked:  # 只跑点名的文件（基线子集、单独重跑）：flaky 的失败只在整套里出现；rerun_skip 里的点了名也不跑（--shard 的样子）
+        files = [f for f in picked if f not in spec.get("rerun_skip", [])]
+        failures = [f for f in failures if f["file"] in files and not f.get("flaky")]
     else:
         files = sorted({f["file"] for f in failures} | set(spec.get("passing_files", ["src/ok.test.ts"])))
     prefix = spec.get("path_prefix", "")
     # project_labels 模拟配了 test.projects（.ts 在 project "ts"、.tsx 在 "tsx"）的 vitest 4：plain 是不带颜色的 "|ts| "，
-    # color 是带 ANSI 的色块（FAIL 行整行按 vitest 4.1.7 的原样着色）；不写就是没有 projects 的旧输出。
+    # color 是带 ANSI 的色块（FAIL 行、横幅按 vitest 4.1.7 的原样着色，分隔线按它的源码 c.red(c.dim(…))）；不写就是没有 projects 的输出。
     labels = spec.get("project_labels")
     color = labels == "color"
 
@@ -531,39 +550,50 @@ def vitest():
         name = "tsx" if path.endswith("x") else "ts"
         return {"plain": "|%s| " % name, "color": "\x1b[30m\x1b[43m %s \x1b[49m\x1b[39m " % name}.get(labels, "")
 
+    def banner(text, left):
+        dashes = ("⎯" * left, "⎯" * 7)
+        if color:
+            return "\x1b[31m%s\x1b[39m\x1b[1m\x1b[41m %s \x1b[49m\x1b[22m\x1b[31m%s\x1b[39m" % (dashes[0], text, dashes[1])
+        return "%s %s %s" % (dashes[0], text, dashes[1])
+
     fail_head = "\x1b[41m\x1b[1m FAIL \x1b[22m\x1b[49m " if color else " FAIL  "
     sep = "\x1b[2m > \x1b[22m" if color else " > "
-    failed_files = sorted({f["file"] for f in failures})
-    out = [("\x1b[1m\x1b[30m\x1b[46m RUN \x1b[49m\x1b[39m\x1b[22m \x1b[36mv4.1.7 \x1b[39m" if color else " RUN  v1.6.0 ")
-           + os.getcwd(), ""]
-    out += [" %s %s%s%s (2 tests)" % ("❯" if f in failed_files else "✓", label(f), prefix, f) for f in files]
-    if failures:
-        out += ["", "⎯⎯⎯⎯⎯⎯ Failed Tests %d ⎯⎯⎯⎯⎯⎯" % len(failures)]
+    sections = {"suites": [], "tests": []}
     for f in failures:
-        path = prefix + f["file"]
-        kind = f.get("kind", "assert")
-        if kind == "file-timeout":  # 整个文件失败（beforeAll 超时）
-            out += ["", fail_head + label(f["file"]) + path + ("\x1b[2m [ %s ]\x1b[22m" if color else " [ %s ]") % path,
-                    "Error: Hook timed out in 10000ms."]
-        else:
-            out += ["", fail_head + label(f["file"]) + path + sep + sep.join(f["test"].split(" > ")),
-                    "Error: Test timed out in 5000ms." if kind == "timeout"
-                    else "AssertionError: expected 1 to be 2 // Object.is equality"]
-        out.append(" ❯ %s:3:5" % path)
+        sections[VITEST_KINDS[f.get("kind", "assert")][0]].append(f)
+    failed_files = sorted({f["file"] for f in failures})
+    out = [("\x1b[1m\x1b[30m\x1b[46m RUN \x1b[49m\x1b[39m\x1b[22m \x1b[36mv4.1.7 \x1b[39m" if color else " RUN  v4.1.7 ")
+           + os.getcwd(), ""]
+    out += [" ❯ %s%s%s (2 tests | 1 failed) 3ms" % (label(f), prefix, f) for f in failed_files]
+    total_errors = sum(f.get("errors", 1) for f in failures)
+    done = 0
+    for name, title, left in (("suites", "Failed Suites", 6), ("tests", "Failed Tests", 7)):
+        if sections[name]:
+            out += ["", banner("%s %d" % (title, len(sections[name])), left)]
+        for f in sections[name]:
+            path = prefix + f["file"]
+            kind = f.get("kind", "assert")
+            if kind in ("file", "file-timeout"):
+                name_part = ("\x1b[2m [ %s ]\x1b[22m" if color else " [ %s ]") % path
+            else:
+                name_part = sep + sep.join(f["test"].split(" > "))
+            for _ in range(f.get("errors", 1)):
+                done += 1
+                divider = "⎯" * 23 + "[%d/%d]⎯" % (done, total_errors)
+                out += ["", fail_head + label(f["file"]) + path + name_part, VITEST_KINDS[kind][1], " ❯ %s:3:5" % path, "",
+                        "\x1b[31m\x1b[2m%s\x1b[22m\x1b[39m" % divider if color else divider]
     unhandled = 0 if picked else spec.get("unhandled", 0)
     plural = "s" if unhandled > 1 else ""
-    if unhandled:  # vitest 4.1.11：Unhandled Errors 一节没有 FAIL 行，汇总多一行 "Errors  N error(s)"，退出码 1
+    if unhandled:  # vitest 4.1.7：Unhandled Errors 一节没有 FAIL 行、没有带编号的分隔线，汇总多一行 "Errors  N error(s)"，退出码 1
         out += ["", "⎯⎯⎯⎯⎯⎯ Unhandled Errors ⎯⎯⎯⎯⎯⎯", "",
                 "Vitest caught %d unhandled error%s during the test run." % (unhandled, plural),
                 "", "⎯⎯⎯⎯ Unhandled Rejection ⎯⎯⎯⎯⎯", "Error: unhandled boom",
-                'This error originated in "src/ok.test.ts" test file.']
-    test_failed = spec.get("tests_failed", sum(1 for f in failures if f.get("kind") != "file-timeout"))
+                'This error originated in "src/ok.test.ts" test file.', "⎯" * 30]
     n = len(files)
-    out.append("")
-    out.append(" Test Files  %d failed | %d passed (%d)" % (len(failed_files), n - len(failed_files), n)
-               if failed_files else " Test Files  %d passed (%d)" % (n, n))
-    out.append("      Tests  %d failed | 10 passed (%d)" % (test_failed, 10 + test_failed)
-               if test_failed else "      Tests  10 passed (10)")
+    skipped = 2 * sum(1 for f in sections["suites"] if f.get("kind") != "file")  # 套件失败：它的用例算 skipped
+    counts = [("failed", len(sections["tests"])), ("passed", 10), ("skipped", skipped)]
+    out += ["", state_line("Test Files", [("failed", len(failed_files)), ("passed", n - len(failed_files))], n),
+            state_line("Tests", counts, sum(c for _, c in counts))]
     if unhandled:
         out.append("     Errors  %d error%s" % (unhandled, plural))
     print("\n".join(out))

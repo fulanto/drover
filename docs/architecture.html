@@ -2179,7 +2179,7 @@ footer.end { margin-top: 64px; font-size: 13px; color: var(--muted); display: fl
       <h3>几个省心的机关</h3>
       <ul>
         <li><strong>和基线比</strong>：<code>--verify-baseline</code> 的命令失败时，CLI 在 BASE 上临时建一个 worktree，只重跑当前失败所在的文件（tsc 照旧跑整条），按条目比失败集合（vitest / pytest / tsc / eslint），没有新增就算通过；失败的文件 BASE 上没有，直接算新增。基线结果按仓库 + BASE + 命令 + 重跑的文件缓存。</li>
-        <li><strong>负载超时复核</strong>：vitest 的失败全是超时，就把失败文件单独重跑一次，过了判通过，并标出 <code>flaky_timeouts</code>。</li>
+        <li><strong>偶发失败复核</strong>：vitest 有失败时，把失败所在的文件单独重跑一次，以单独跑的结果为准（看能不能复现，不看报错文字）：不复现的不算失败、不算新增，文件标在 <code>flaky_files</code>；带 <code>--verify-baseline</code> 时拿单独跑的结果和基线比。</li>
         <li><strong>重命令按资源调度</strong>：<code>--verify</code> 的每条命令和建图都经 <code>heavy</code> 调度，机器还有余量就马上跑，真满了才排队（怎么算见<a href="#ending">结尾</a>）；多条 <code>--verify</code> 默认同时交给调度，结果按传入的顺序排，前后有依赖的加 <code>--serial</code> 逐条跑。worker 的测试、lint、类型检查、构建一律经 <code>drover heavy -- &lt;命令&gt;</code>。</li>
         <li><strong>可选复审</strong>：带 <code>--review</code> 时，<code>review</code> 一条命令在 worker 旁边分屏起只读 codex 并立刻发出 prompt，<code>collect</code> 存档后关 pane；High / Medium 交回修一轮。</li>
       </ul>

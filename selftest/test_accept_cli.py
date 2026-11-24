@@ -1,4 +1,4 @@
-"""accept 端到端（CLI 子进程）：--verify 的负载超时复核、--verify-baseline 和基线比、--no-graph 跳过建图
+"""accept 端到端（CLI 子进程）：--verify 的偶发失败复核（单独重跑）、--verify-baseline 和基线比、--no-graph 跳过建图
 （--brief、accept-summary、review 读跳过的图谱）；不建图、锁和缓存都在临时状态目录。
 验收看证据：认得出测试框架（vitest / pytest / selftest/run.py / mvn surefire）、退出码 0 却一个测试都没跑的判不通过，
 摘要固定给 通过 / 失败 / 跳过 三个数；两个 accept 同时比同一个基线不互删。
@@ -59,6 +59,8 @@ SELFTEST_SUMMARY = ("最慢的 10 个用例（秒）：\n     1.2  test_x.A.test
                     "========== 1 failed, 40 passed, 2 skipped in 12.3s (-j 8) ==========\n")
 # 基线上本来就有的一条 tsc 错误（集成检查同时比基线的用例用）
 TSC_OLD = "src/old.ts(1,14): error TS2322: Type 'string' is not assignable to type 'number'.\n\nFound 1 error.\n"
+# 假 vitest 的一条偶发失败：断言形态，只在整套跑时出现，点名 src/a.test.ts 单独跑时通过
+FLAKY_A = {"file": "src/a.test.ts", "test": "a > b", "kind": "assert", "flaky": True}
 
 
 def printer(output: str, code: int = 0) -> str:
@@ -72,9 +74,10 @@ class AcceptCliTests(DroverTestCase):
         if shutil.which("code-review-graph", path=self.env["PATH"]):
             self.skipTest("临时 PATH 里还能找到 code-review-graph，跑 accept 会真的建图")
         self.wt = self.work / "app"
+        # 基线上 vitest 整套跑时有一条断言失败，单独跑 src/a.test.ts 不复现（偶发）
         self.base = self.init_repo(self.wt, {
             "src/a.test.ts": "test('a', () => {})\n",
-            "fake-vitest.json": json.dumps({"failures": [{"file": "src/a.test.ts", "test": "a > b", "kind": "timeout"}]}),
+            "fake-vitest.json": json.dumps({"failures": [FLAKY_A]}),
             "fake-pytest.json": json.dumps({"failures": ["tests/test_a.py::test_x"]}),
         })
         self.write_files(self.wt, {"src/a.ts": "export const a = 1\n", "README.md": "# app\n"})
@@ -86,18 +89,48 @@ class AcceptCliTests(DroverTestCase):
         self.assertTrue(save.is_file())
         return res
 
-    def test_verify_flaky_timeout_without_graph(self) -> None:
-        """--verify：只超时 → 复核通过、带 flaky_timeouts；不建图（graph 报找不到命令、没有 .code-review-graph）；调度状态在状态目录"""
+    def test_verify_flaky_failure_without_graph(self) -> None:
+        """--verify：整套里的断言失败单独重跑不复现 → 判通过、带 flaky_files 和 isolated_rerun；不建图（graph 报找不到命令、
+        没有 .code-review-graph）；调度状态在状态目录"""
         res = self.accept("--verify", "vitest run src/ --environment node")
         self.assertEqual(res["graph"], {"ok": False, "error": "找不到 code-review-graph 命令"})
         self.assertFalse((self.wt / ".code-review-graph").exists())
         self.assertEqual(sorted(res["intent_to_add"]), ["README.md", "src/a.ts"])
         v = res["verify"][0]
         self.assertTrue(v["ok"], v)
-        self.assertEqual(v["flaky_timeouts"], ["src/a.test.ts"])
-        self.assertEqual(v["timeout_recheck"]["command"], "vitest run --environment node src/a.test.ts")
+        self.assertEqual(v["flaky_files"], ["src/a.test.ts"])
+        self.assertEqual(v["isolated_rerun"]["command"], "vitest run --environment node src/a.test.ts")
+        self.assertIn("output_tail", v["isolated_rerun"])
         self.assertFalse(res["verify_failed"])
         self.assertTrue((self.state / "locks" / "heavy" / "history.json").is_file())  # 进了 heavy 调度
+
+    def test_baseline_flaky_and_real_new_in_brief(self) -> None:
+        """--verify-baseline --brief：整套里一条偶发的断言失败（单独重跑不复现）加一条真新增（新加的测试文件，单独跑也失败）
+        → verify_failed，new_failures 只有真新增那条，flaky_files 列出偶发的文件；摘要带单独重跑的命令、退出码、计数，
+        不带输出尾部。去掉真新增再验 → 通过、照样列出偶发的文件"""
+        self.write_files(self.wt, {"src/n.test.ts": "test('n', () => {})\n"})
+        real_new = {"file": "src/n.test.ts", "test": "n > breaks", "kind": "assert"}
+        self.write_spec(self.wt, "vitest", {"failures": [FLAKY_A, real_new]})
+        res = self.accept("--no-graph", "--brief", "--verify-baseline", "vitest run")
+        v = res["verify"][0]
+        self.assertTrue(res["verify_failed"])
+        self.assertFalse(v["ok"], v)
+        self.assertEqual(v["baseline"]["new_failures"], ["src/n.test.ts > n > breaks"])
+        self.assertEqual(v["flaky_files"], ["src/a.test.ts"])
+        rerun = v["isolated_rerun"]
+        self.assertEqual(rerun["command"], "vitest run src/a.test.ts src/n.test.ts")
+        self.assertEqual(rerun["exit_code"], 1)
+        self.assertEqual(rerun["tests"], {"passed": 10, "failed": 1, "skipped": 0})
+        self.assertEqual(rerun["not_reproduced"], ["src/a.test.ts > a > b"])
+        self.assertNotIn("output_tail", rerun)
+        self.write_spec(self.wt, "vitest", {"failures": [FLAKY_A]})
+        res = self.accept("--no-graph", "--brief", "--verify-baseline", "vitest run")
+        v = res["verify"][0]
+        self.assertFalse(res["verify_failed"])
+        self.assertTrue(v["ok"], v)
+        self.assertEqual(v["flaky_files"], ["src/a.test.ts"])
+        self.assertEqual(v["isolated_rerun"]["exit_code"], 0)
+        self.assertNotIn("baseline", v)
 
     def test_verify_baseline_vs_plain_verify(self) -> None:
         """同一条失败的命令：--verify 判失败；--verify-baseline 和 BASE 比，失败都是基线上本来就有的 → 通过"""

@@ -374,9 +374,9 @@ agent 名：`[a-z][a-z0-9_-]{0,31}`，在 `herdr agent list` 中唯一。用 `<�
 
 verify 命令在脚本里跑，不会触发审批；但测试多的命令（比如集成检查的全量测试）可能超过宿主单条命令的时长上限（Claude Code 的 Bash 是 10 分钟），预计会超时就放后台执行 accept（见附录），等完成再读结果。
 
-**重命令排队**：`--verify` 的每条命令和建图都经 `drover heavy` 的调度，机器还有余量就马上跑，真满了才排队（调度规则见 docs/reference.md 的 heavy）。排过队的条目带 `lock_waited_seconds`（主命令、超时复核、基线上那一步排队秒数之和）。worker 的测试、lint、类型检查、构建一律经 `drover heavy -- <命令>` 进同一套调度（brief 里写明了）。全机现在谁在跑、谁在等、整机实测忙多少、heavy 占多少 / 容量：`drover heavy --status`。
+**重命令排队**：`--verify` 的每条命令和建图都经 `drover heavy` 的调度，机器还有余量就马上跑，真满了才排队（调度规则见 docs/reference.md 的 heavy）。排过队的条目带 `lock_waited_seconds`（主命令、vitest 的单独重跑、基线上那一步排队秒数之和）。worker 的测试、lint、类型检查、构建一律经 `drover heavy -- <命令>` 进同一套调度（brief 里写明了）。全机现在谁在跑、谁在等、整机实测忙多少、heavy 占多少 / 容量：`drover heavy --status`。
 
-**负载超时自动复核**：vitest 失败全是 "Test/Hook timed out" 时，accept 把失败的文件单独重跑一次，单独跑通过就判这条通过、带 `flaky_timeouts`（文件列表）和 `note`（什么时候复核、什么时候照常判失败，见 docs/reference.md 的 accept）。汇报时把 `flaky_timeouts` 列出来。
+**偶发失败自动复核**：vitest 有失败时，accept 把失败所在的文件在同一个 worktree 上单独重跑一次，以单独跑的结果为准：单独跑不复现的不算失败（`--verify-baseline` 时不算新增），仍然失败的照常判。看的是能不能复现，不看报错是超时还是断言。整套里失败、单独重跑没复现的文件列在 `flaky_files`，重跑的命令、退出码、计数在 `isolated_rerun`（什么时候不重跑、重跑的结果什么时候不算数，见 docs/reference.md 的 accept）。汇报时把 `flaky_files` 列出来：这次改动自己引入的间歇性失败（比如新写的测试不稳）单独重跑碰巧通过也会在里面，脚本分不出来。
 
 **没有测试真的跑不算通过**：认得出是 vitest / pytest / mvn（surefire）的输出时，脚本数实际跑了几个；退出码 0 却一个都没跑（没找到测试文件、全部跳过、被 `-k` / `-t` 筛光）判不通过，`note` 写明。认不出的命令（tsc、build、脚本）照旧只看退出码。
 
@@ -420,7 +420,7 @@ verify 命令在脚本里跑，不会触发审批；但测试多的命令（比�
 | 验证命令失败就不通过（第 1 项） | 脚本：accept 的 `verify_failed: true` |
 | 认得出的测试框架一个测试都没跑就不通过 | 脚本：accept 把这条 verify 判失败，`note` 写明 |
 | 带命令的完成证据要重跑（第 2 项） | 脚本：`accept --slug --name` 读 `<agent名>.evidence.json` 自动跑，结论在 `evidence.items` |
-| vitest 失败全是超时时单独复核 | 脚本：accept 的 `flaky_timeouts`（汇报里列出来是文字） |
+| vitest 失败时单独重跑失败的文件，不复现的不算失败 | 脚本：accept 的 `isolated_rerun`、`flaky_files`（汇报里列出 `flaky_files` 是文字） |
 | 验收没过、或验收之后又改过，不起复审 | 脚本：review 拒绝（存档的 `verify_failed`，worktree / HEAD / 改动指纹核对） |
 | 只能看自述的证据逐条对上结果（第 2 项） | 文字（脚本只标"只能看自述"） |
 | 改动和报告对得上、没有越界改动（第 3、5 项） | 文字（脚本只给 `status_porcelain`、`graph.changed_files`） |

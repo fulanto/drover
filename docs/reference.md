@@ -208,11 +208,16 @@ herdr 重启后会把 pane 里的 claude / codex 续上，但它自己拼的续�
 
 依次执行：记录 `git status --porcelain` → `git add -N .` 把新文件纳入 diff → 在 worktree 里全量建图 → `detect-changes --brief` → `git diff <BASE_SHA> --stat` → crapper 算这次改动碰到的函数的圈复杂度 → 在 worktree 里重跑 `--verify`。带 `--integration` 时不建图（`graph.skipped: true`；图谱结论只在条目验收时用，大仓库建一次要几十秒）、不跑 crapper、改跑 dryer（也交给调度，大仓库单核约 85 秒）。存档还记着 worktree、HEAD 和改动指纹，`review` 从这里取图谱摘要和验证结果，并核对它就是要审的这份代码。`--integration` 跑在试集成 worktree 上时怎么记结论见下面的 trial。
 
-负载超时复核：vitest 有失败、而且失败全是 "Test/Hook timed out" 时，把失败的文件单独重跑一次；单独跑通过（同样要真的跑到测试），这条 verify 就判通过，带 `flaky_timeouts`（文件列表）和 `note`，`exit_code` 保留第一次的结果。只要有一条不是超时的失败（汇总里的未处理错误 `Errors  N error` 也算），就不复核、照常判失败。
+偶发失败复核（vitest）：命令失败时，把失败所在的文件在同一个 worktree 上单独重跑一次（原命令的选项保留，目录参数和 `--changed` 去掉，和基线上那一步是同一种命令），这边的失败以单独跑的结果为准。看的是能不能复现，不看报错文字；依据是 vitest 默认每个测试文件跑在自己隔离的 worker 里，单独跑一个文件语义不变，只是没了整套的负载。pytest 同进程跑、单独跑和整套跑语义不同，eslint / tsc 是确定性的，都不重跑。
+- 结果在 `isolated_rerun`：`files`、`command`、`exit_code`、`seconds`、`tests`、`counts`、`not_reproduced`（整套里有、重跑里没有的失败条目，最多 30 条）、`output_tail`。一个文件的失败全都没复现，就列进 `flaky_files`。重跑没有失败，这条 verify 判通过，`exit_code` 保留第一次的结果；还有失败就照常判失败，带 `--verify-baseline` 时拿重跑的结果和基线比。
+- 不重跑、按整套那次的结果算（`note` 写原因）：汇总里有未处理错误（`Errors  N error`）或失败对不上 worktree 里的文件；命令经 make 之类包装，拆不出只跑失败文件的命令；命令行关了文件隔离（`--no-isolate`、`--isolate=false`）。整套的失败条目本身不完整（解析对不上数、`--bail` 提前停了）时也不重跑，照常判失败。
+- 重跑的结果不算数、按整套那次的结果算（`isolated_rerun.note` 写原因）：没跑成；退出码 0 却没跑到测试；汇总行 `Test Files` 的总数少于点名的文件数（没跑到的不能当成没复现；命令带 `--shard` 时点名的文件只跑一部分，所以这类命令的偶发失败复核不了）；重跑的失败条目不完整或对不上文件。
+- 判不了的：单独重跑时又偶发失败的照样算失败（只重跑一次）；配置文件里的 `isolate: false` 看不到，这类仓库里"单独跑能过、整套才失败"的失败会被当成偶发；这次改动引入的间歇性失败，单独重跑碰巧通过也会判通过。所以 `flaky_files` 每次都列出来。
 
 和基线比（`--verify-baseline`，集成检查用）：
-- 基线上只重跑当前失败所在的文件：vitest / pytest 按失败用例所在的测试文件，eslint 按报错的文件（选项保留，原来的目录参数去掉；vitest 的 `--changed` 也去掉）；tsc 没法拆，和拆不出文件的命令（经 make 之类包装、失败路径对不上 worktree 里的文件）一样跑整条。在 `--base` 上临时建一个 detached worktree（`~/.drover/baselines/` 下，复制 .env、装依赖，跑完就删）。`baseline.targets` 是基线上跑了的文件（没有这个字段就是跑了整条）；当前失败的文件 BASE 上没有（新加的测试）的列在 `baseline.not_on_base`，不放进基线命令、失败直接算新增，一个都不剩就不建基线 worktree。
-- 失败条目：vitest、pytest（`FAILED` / `ERROR` 行）、tsc（文件 + 错误码）、eslint（文件 + 规则，只算 error）。条目不带行号，改动挪了行也对得上。认不出条目格式的错误行也算条目，不会被"都是旧失败"盖掉：vitest 汇总里的未处理错误记 `(未处理错误)`，tsc 不带文件的全局错误记 `(全局) TSxxxx`，eslint 没有规则名的（语法错误）记 `文件 (无规则)`。
+- 基线上只重跑当前失败所在的文件：vitest / pytest 按失败用例所在的测试文件，eslint 按报错的文件（选项保留，原来的目录参数去掉；vitest 的 `--changed` 也去掉）；tsc 没法拆，和拆不出文件的命令（经 make 之类包装、失败路径对不上 worktree 里的文件）一样跑整条。vitest 的"当前失败"是上面单独重跑之后仍然失败的，两边都是单独跑这些文件的结果；每次偶发的文件不一样，基线要跑的文件也不变。在 `--base` 上临时建一个 detached worktree（`~/.drover/baselines/` 下，复制 .env、装依赖，跑完就删）。`baseline.targets` 是基线上跑了的文件（没有这个字段就是跑了整条）；当前失败的文件 BASE 上没有（新加的测试）的列在 `baseline.not_on_base`，不放进基线命令、失败直接算新增，一个都不剩就不建基线 worktree。
+- 失败条目：vitest（失败明细里一行 `FAIL` 一条：用例、describe 级套件、整个文件；一条用例几个 error 就是几条同名的）、pytest（`FAILED` / `ERROR` 行）、tsc（文件 + 错误码）、eslint（文件 + 规则，只算 error）。条目不带行号，改动挪了行也对得上。认不出条目格式的错误行也算条目，不会被"都是旧失败"盖掉：vitest 汇总里的未处理错误记 `(未处理错误)`，tsc 不带文件的全局错误记 `(全局) TSxxxx`，eslint 没有规则名的（语法错误）记 `文件 (无规则)`。
+- 条目数和工具自己报的总数对不上就不比、按失败处理（有解析不出的失败）：vitest 拿失败明细里分隔线 `⎯⎯⎯[i/N]⎯` 上的 error 总数和解析到的 `FAIL` 行数比（每个 error 一行 `FAIL`；分隔线右边固定带一个 ⎯，测试自己打的一行 `[1/3]` 不算；不拿 `Tests N failed` 比，套件失败不计入它，一条用例几个 error 也只算一条），pytest 比汇总行的 failed + error，tsc 比 `Found N errors`，eslint 比 `✖ … (N errors`。
 - 基线结果按"仓库 + BASE + 命令 + 重跑的文件"缓存在 `~/.drover/baselines/`，同一个基线、同一批文件只跑一次。（基线上每次跑整条命令的话，大仓库每换一个上游就要多跑一整套 vitest。）基线 worktree 装依赖失败、基线命令没跑成（超时、起不来）或基线输出同样解析不全时，算基线不可信：不写缓存、按失败处理。两个验收同时比同一个基线时，后到的等前一个跑完、直接用它的缓存。
 - 只有"在基线上跑命令"那一步进 heavy 调度：建基线 worktree、复制本地文件、装依赖不占预留。
 

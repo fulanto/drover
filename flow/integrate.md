@@ -43,14 +43,15 @@
    - 目标分支远端还没有（新建远程分支，比如按日期建的 release）→ `ok: false`：从哪条分支建写进 rollup 交用户定，定了加 `--create-from <远端>/<源分支>`，push 照常核对和记录。
    - 新建集成 worktree 时同样核实起点含这个任务上一轮推到远端的提交（返回里有 `round_check`，见文末"新一轮的起点"）；`--from` 的条目分支里已有的不算缺（一轮推两条分支时第二条集成的就是同一批条目提交，条目 worktree 用 `--carry` 带上过的也在条目分支里）。还缺 → `ok: false`、不建，交用户定：加 `--carry "<理由>"` 先带上再摘条目，或者 `--target` 改回上一轮的分支。
    - `source_sync` / `warnings` 和主干第 3.1 节一样看；`base` 是下一步整体检查的 `--base`；`source_workspace_opened` 记进状态文件。
-3. **整体检查一次**（集成完的树等于试集成验过的树时跳过：push 认试集成的检查，见第 5 步）：`drover accept --wt <集成WT> --base <base> --save <slug>/accept-integrate-<仓库名>.json --brief --integration --verify "<tsc>" --verify "<build>" --verify-baseline "<全量测试>" [--verify-baseline "<lint>"] [--verify "<i18n 等仓库门禁>"]`，放后台跑（见附录）。全量测试只在这里跑；负载超时会自动复核（主干第 6.1 节）。`--integration` 不建图、不跑 crapper，改由 dryer 扫全仓找重复；它还把检查的提交、树和过没过记进集成状态（返回的 `integration_check`），第 5 步 push 按它核对，所以整体检查一定带 `--integration`、在干净的（都提交了的）集成 worktree 上跑。通过后把返回的 `head`（这次全量通过的提交）记进状态文件，下面"再跑检查"要用。
+3. **整体检查一次**（集成完的树等于试集成验过的树时跳过：push 认试集成的检查，见第 5 步）：`drover accept --wt <集成WT> --base <base> --save <slug>/accept-integrate-<仓库名>.json --brief --integration --verify "<tsc>" --verify "<build>" --verify-baseline "<全量测试>" [--verify-baseline "<lint>"] [--verify "<i18n 等仓库门禁>"]`，放后台跑（见附录）。全量测试只在这里跑；vitest 整套里才出现的偶发失败会自动复核（主干第 6.1 节）。`--integration` 不建图、不跑 crapper，改由 dryer 扫全仓找重复；它还把检查的提交、树和过没过记进集成状态（返回的 `integration_check`），第 5 步 push 按它核对，所以整体检查一定带 `--integration`、在干净的（都提交了的）集成 worktree 上跑。通过后把返回的 `head`（这次全量通过的提交）记进状态文件，下面"再跑检查"要用。
    - 有前后依赖的加 `--serial` 逐条跑，比如某条门禁要读 build 的产物，或者两条命令会写同一个产物目录。
    - **重复**（`duplicates`，dryer，相似度 ≥ 0.8）：只留至少一边碰到这次改动行的重复对（`duplicates.pairs`，`文件:起-止` 两两一对；`candidates` 是全仓一共几对）。每一对要么合并，要么在汇报里写不合并的理由，发回对应条目的 worker 改或让它补理由；没碰到改动的旧重复不管。`duplicates.ok: false` 带 `error`（"测不了：…"）**不算不通过**，状态文件记一行；`skipped: true` 是开关关了。
 
    **和基线比**（`--verify-baseline`）：仓库基线本来就有失败的命令（常见是全量测试、lint；具体哪些，看仓库规范或 playbook）放 `--verify-baseline`，不放 `--verify`。命令通过就和普通 verify 一样；失败时脚本和 `--base` 比失败条目，只看有没有新增（基线上重跑哪些文件、缓存，见 docs/reference.md 的 accept）：
    - 没有新增失败 → 判通过，`note` 写明"失败 N 条全部是基线上本来就有的"，`baseline.fixed` 列出这次修好的（只统计重跑了的文件）；
-   - 有新增 → 判失败，`baseline.new_failures` 列出来，发给 agent 修；vitest 新增的失败全是超时时，会先把这些文件单独重跑一次（负载超时）。
-   - 基线是单独跑这几个文件，某条用例单独跑能过、整套跑才失败（执行顺序、共享状态）时，会被误报成新增（只会误报，不会漏报），`note` 里有提示。遇到时在集成 worktree 里也单独跑这个文件（`drover heavy --cwd <集成WT> -- <测试命令> <文件>`）：也能过、diff 又没碰它相关的代码，就不是这次引入的，汇报时写明；单独跑仍失败才是真的新增。
+   - 有新增 → 判失败，`baseline.new_failures` 列出来，发给 agent 修。
+   - vitest：这边先把失败所在的文件单独重跑一次，再拿单独跑的结果和基线上同样单独跑的结果比，两边条件一样。整套里失败、单独重跑没复现的不算新增，文件列在 `flaky_files`，汇报时写明。没做成单独重跑的按整套那次的结果比，`note` 写原因，这时整套里才出现的偶发失败照样算新增：整套里有未处理错误、失败对不上 worktree 里的文件、命令经 make 之类包装、命令行关了文件隔离（`--no-isolate`），或者重跑时点名的文件没跑全（命令带 `--shard`）。配置文件里关了隔离（`isolate: false`）脚本看不到：这类仓库里"单独跑能过、整套才失败"的失败会被当成偶发，看 `flaky_files` 时留意。
+   - pytest、eslint（和没做成单独重跑的 vitest）：这边是整条命令那次的结果，基线是单独跑这几个文件，某条用例单独跑能过、整套跑才失败（执行顺序、共享状态）时，会被误报成新增（只会误报，不会漏报），`note` 里有提示。遇到时在集成 worktree 里也单独跑这个文件（`drover heavy --cwd <集成WT> -- <测试命令> <文件>`）：也能过、diff 又没碰它相关的代码，就不是这次引入的，汇报时写明；单独跑仍失败才是真的新增。
    - 支持 vitest、pytest、tsc、eslint。认不出的输出、退出码非 0 却解析不到失败条目、工具自己报的失败数和解析出的条数对不上、输出里看得出提前停了（pytest `-x` / `--maxfail` / 收集出错，vitest `--bail`；去掉再验）、基线不可信（基线 worktree 装依赖失败、基线命令没跑成）一律按失败处理，在 `baseline.error` 里说明。
 
    **再跑检查按增量定范围**：集成 worktree 已经在同一个上游上全量通过之后，又补了条目、修了一处、改了个名，再跑检查时看这次比上次全量通过的提交（状态文件里记的 `head`）多了什么（`git -C <集成WT> diff --stat <head>`），`--base` 照旧用 integrate 返回的上游 `base`：

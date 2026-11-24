@@ -708,7 +708,7 @@ class AcceptSchedTests(SchedTestCase):
 
     def test_baseline_prep_outside_reservation(self) -> None:
         """--verify-baseline：建基线 worktree、复制本地文件、装依赖时不占预留（没有任何排队票），在基线上跑命令那一步进调度
-        （记了实测）；vitest 超时复核也进调度"""
+        （记了实测）；vitest 的单独重跑也进调度"""
         fail_a = {"file": "src/a.test.ts", "test": "math > adds", "kind": "assert"}
         self.base = self.commit(self.wt, "tests", {"src/a.test.ts": "// x\n",
                                                    "fake-vitest.json": json.dumps({"failures": [fail_a]})})
@@ -725,12 +725,12 @@ class AcceptSchedTests(SchedTestCase):
         self.assertIn("没有新增", entry["note"])
         self.assertEqual(seen, [("copy_local_files", []), ("cmd_deps", [])])
         shapes = sorted(e["shape"] for e in self.history().values())
-        self.assertEqual(shapes, ["vitest run", "vitest run <1 个文件>"])  # 这边的整条 + 基线上只跑失败的文件
-        # 超时复核：失败全是超时 → 单独重跑失败文件，也经调度
-        self.write_spec(self.wt, "vitest", {"failures": [dict(fail_a, kind="timeout")]})
+        self.assertEqual(shapes, ["vitest run", "vitest run <1 个文件>"])  # 这边的整条；这边的单独重跑和基线上那一步是同一种命令
+        # 整套里才出现的失败 → 单独重跑失败文件，也经调度
+        self.write_spec(self.wt, "vitest", {"failures": [dict(fail_a, flaky=True)]})
         entry = self.d.run_verify(str(self.wt), "vitest run --environment node", 60)
         self.assertTrue(entry["ok"], entry)
-        self.assertEqual(entry["flaky_timeouts"], ["src/a.test.ts"])
+        self.assertEqual(entry["flaky_files"], ["src/a.test.ts"])
         self.assertIn("vitest run --environment node <1 个文件>", [e["shape"] for e in self.history().values()])
         self.assertEqual(self.tickets(), [])
 

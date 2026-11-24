@@ -2,6 +2,7 @@
 
 解析单测直接喂文本；比对用假工具：基线提交里的 fake-<工具>.json 是基线上的失败，worktree 里改过的是这次的失败。
 BaselineEvidenceTests 让假工具原样回放真实输出样例（spec 的 output），测解析不出的失败、对不上数、提前停了、基线不可信。
+vitest 的当前侧先单独重跑失败文件（test_vitest_recheck.py），再拿单独跑的结果和基线比：BaselineSubsetTests 里偶发的不算新增。
 基线 worktree、缓存都建在临时状态目录的 baselines/ 下。
 """
 
@@ -14,6 +15,7 @@ import unittest
 from collections import Counter
 
 import selftest_fakes
+import selftest_vitest_samples as samples
 from selftest_support import DroverTestCase
 
 A = {"file": "src/a.test.ts", "test": "math > adds", "kind": "assert"}
@@ -31,13 +33,12 @@ OTHER_TOOLS = {
                [["src/a.ts", "no-unused-vars"], ["src/c.ts", "@typescript-eslint/no-explicit-any"]],
                "src/c.ts @typescript-eslint/no-explicit-any", "src/b.ts no-undef"),
 }
-# 真实工具的输出样例（vitest 4.1.11、pytest 9.2.0 在本机实测，去掉 ANSI；eslint / tsc 按工具的格式写），回放给假工具用。
+# 真实工具的输出样例，回放给假工具用。vitest 的在 selftest_vitest_samples.py（4.1.7 原样）；pytest 9.2.0 在本机实测、去掉 ANSI；
+# eslint / tsc 按工具的格式写。
 KEY_OLD = "src/old.test.js > old broken"
-VITEST_OLD = (" RUN  v4.1.11 /x/app\n\n Test Files  1 failed | 1 passed (2)\n      Tests  1 failed | 1 passed (2)\n"
-              "\n⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯\n\n FAIL  src/old.test.js > old broken\n"
-              "AssertionError: expected 1 to be 2 // Object.is equality\n")
-# 同一次运行又多了 2 个未处理错误：汇总多一行 "Errors"（vitest 4.1.11 紧跟在 Tests 行后面），没有 FAIL 行
-VITEST_OLD_UNHANDLED = VITEST_OLD.replace("(2)\n\n", "(2)\n     Errors  2 errors\n\n", 1)
+VITEST_OLD = samples.OLD
+# 同一次运行又多了 2 个未处理错误：多一节 Unhandled Errors、汇总多一行 "Errors  2 errors"，没有 FAIL 行
+VITEST_OLD_UNHANDLED = samples.OLD_UNHANDLED
 TSC_OLD_LINE = "src/old.ts(1,14): error TS2322: Type 'string' is not assignable to type 'number'.\n"
 TSC_GLOBAL = ("error TS2688: Cannot find type definition file for 'node'.\n  The file is in the program because:\n"
               "    Entry point of type library 'node' specified in compilerOptions\n")
@@ -51,10 +52,8 @@ PYTEST_COLLECT_STOPPED = ("=========================== short test summary info =
                           "ERROR tests/test_a.py\n!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection "
                           "!!!!!!!!!!!!!!!!!!!!\n1 error in 0.05s\n")
 # vitest --bail 1：串行时没开始的文件不算进任何一项（各项之和小于总数）；并行时已开始的被取消、算成 skipped
-VITEST_BAIL_SERIAL = (" RUN  v4.1.11 /x/app\n\n Test Files  1 failed (3)\n      Tests  1 failed (1)\n\n"
-                      " FAIL  src/old.test.js > old broken\nAssertionError: expected 1 to be 2\n")
-VITEST_BAIL_PARALLEL = (" RUN  v4.1.11 /x/app\n\n Test Files  1 failed | 3 passed (4)\n      Tests  1 failed | 6 skipped (7)\n\n"
-                        " FAIL  src/old.test.js > old broken\nAssertionError: expected 1 to be 2\n")
+VITEST_BAIL_SERIAL = samples.BAIL_SERIAL
+VITEST_BAIL_PARALLEL = samples.BAIL_PARALLEL
 
 
 class ParseFailuresTests(DroverTestCase):
@@ -95,8 +94,7 @@ class ParseFailuresTests(DroverTestCase):
             with self.subTest(name):
                 self.assertEqual(self.d.parse_failures(["bunx", "vitest", "run"], text, self.root), ("vitest", want))
                 entries = self.d.vitest_failure_entries(self.d.ANSI_RE.sub("", text), self.root)
-                self.assertEqual([(path, is_timeout) for _, path, is_timeout in entries],
-                                 [("src/b.test.ts", True), ("src/c.test.tsx", True), ("src/a.test.ts", False)])
+                self.assertEqual([path for _, path in entries], ["src/b.test.ts", "src/c.test.tsx", "src/a.test.ts"])
         # 用例名里又出现测试文件名：文件取标签后面的第一个
         tricky = " RUN  v4.1.7 /x\n\n FAIL  |ts| src/e.test.ts > loads x.spec.ts fixtures\nError: x\n"
         self.assertEqual(self.d.parse_failures(["vitest"], tricky, self.root),
@@ -145,6 +143,43 @@ class ParseFailuresTests(DroverTestCase):
         self.assertEqual(self.d.parse_failures(["pnpm", "lint"], ESLINT_PARSE_ERROR + ESLINT_OLD
                                                + "✖ 2 problems (2 errors, 0 warnings)\n", self.root),
                          ("eslint", Counter({"src/new.js (无规则)": 1, "src/old.js no-unused-vars": 1})))
+
+    def test_vitest_real_failure_shapes(self) -> None:
+        """vitest 4.1.7 的真实输出：describe 级套件失败（FAIL 行不带方括号）、整个文件失败、一条用例两个 error（同名两行）、
+        两条同名用例抛同样的 error（并成一组）→ 一行 FAIL 一条；解析到的行数等于分隔线上的 error 总数，自检不报对不上"""
+        suite, multi = "src/suite-hook.test.ts > needs setup", "src/multi-error.test.ts > soft > two soft failures"
+        cases = [("describe 级", samples.SUITE_HOOK, Counter({suite: 1})),
+                 ("两个 error", samples.MULTI_ERROR, Counter({multi: 2})),
+                 ("混在一起", samples.MIXED, Counter({"src/file-import.test.ts [ src/file-import.test.ts ]": 1, suite: 1,
+                                                  multi: 2, "src/same-name.test.ts > dup": 2}))]
+        for name, text, want in cases:
+            with self.subTest(name):
+                self.assertEqual(self.d.parse_failures(["vitest", "run"], text, self.root), ("vitest", want))
+                self.assertIsNone(self.d.reported_mismatch("vitest", text, want))
+        # 两段 vitest 输出（一条命令里连着跑两次）：各段的总数相加
+        self.assertIsNone(self.d.reported_mismatch("vitest", samples.MIXED + samples.MULTI_ERROR, Counter()))
+
+    def test_vitest_unparsed_fail_lines_reported(self) -> None:
+        """文件名认不出的 FAIL 行（不带 .test. / .spec.）：解析到的行数比分隔线上的总数少 → 自检报对不上。
+        用例级的、整个文件失败的（"Tests N failed" 里没有它）都兜得住"""
+        self.assertEqual(self.d.reported_mismatch("vitest", samples.UNPARSED_NAME, Counter()),
+                         "vitest 自己报了 1 条失败，解析出 0 条")
+        self.assertEqual(self.d.reported_mismatch("vitest", samples.UNPARSED_FILE_LEVEL, Counter()),
+                         "vitest 自己报了 3 条失败，解析出 2 条")
+
+    def test_vitest_bare_counter_line_is_not_a_divider(self) -> None:
+        """测试自己往 stdout 打的 "[1/3]"（不带 ⎯）不是分隔线，不算进 vitest 报的总数：自检不报对不上。真的分隔线照常认：
+        这份输出后面再接一份有解析不出的失败的输出，报的是两条真分隔线的总数之和（2），不是 2 + 3"""
+        text = samples.CONSOLE_COUNTER
+        self.assertIn("\n[1/3]\n", text)
+        self.assertIn("⎯[1/1]⎯\n", text)
+        self.assertIsNone(self.d.reported_mismatch("vitest", text, Counter()))
+        self.assertEqual(self.d.reported_mismatch("vitest", text + samples.UNPARSED_NAME, Counter()),
+                         "vitest 自己报了 2 条失败，解析出 1 条")
+        # 终端窄到左边一个 ⎯ 都放不下时，右边那个还在（vitest 的 divider(text, undefined, 1)：left 最小 0，right 固定 1）。
+        # 这一行是照源码写的，不是抓的样本。
+        narrow = " RUN  v4.1.7 /x\n\n FAIL  src/a.test.ts > x\nError: boom\n\n[1/2]⎯\n"
+        self.assertEqual(self.d.reported_mismatch("vitest", narrow, Counter()), "vitest 自己报了 2 条失败，解析出 1 条")
 
 
 class BaselineCompareTests(DroverTestCase):
@@ -208,13 +243,16 @@ class BaselineCompareTests(DroverTestCase):
         self.assertNotIn("compare_baseline", entry)
         self.assertFalse((self.state / "baselines").exists())
 
-    def test_new_timeouts_rechecked(self) -> None:
-        """新增的失败全是超时 → 单独重跑这些文件，通过就判通过（flaky_timeouts）"""
-        entry = self.verify("vitest", {"failures": [A, B, dict(C, kind="timeout")]}, "vitest run")
-        self.assertTrue(entry["ok"], entry)
-        self.assertEqual(entry["flaky_timeouts"], ["src/c.test.ts"])
-        self.assertEqual(entry["baseline"]["new_timeout_recheck"]["exit_code"], 0)
-        self.assertEqual(self.tool_calls("vitest")[-1]["args"], ["run", "src/c.test.ts"])
+    def test_unmapped_failures_not_rerun(self) -> None:
+        """失败对不上 worktree 里的文件（这组的测试文件都不在 worktree 里）→ 没有能点名重跑的文件：不做单独重跑、note 写原因，
+        当前侧按整套那次的算，整套里才出现的那条照样算新增"""
+        entry = self.verify("vitest", {"failures": [A, B, dict(C, flaky=True)]}, "vitest run")
+        self.assertFalse(entry["ok"], entry)
+        self.assertNotIn("isolated_rerun", entry)
+        self.assertNotIn("flaky_files", entry)
+        self.assertEqual(entry["baseline"]["new_failures"], [KEY_C])
+        self.assertIn("没做单独重跑", entry["note"])
+        self.assertEqual([c["args"] for c in self.tool_calls("vitest")], [["run"], ["run"]])  # 这边整套 + 基线上整条
 
     def test_other_parsers_fixed_and_new(self) -> None:
         """pytest / tsc / eslint：没有新增 → 通过；修好一条又新增一条 → 失败，new 和 fixed 都对"""
@@ -253,10 +291,11 @@ class BaselineEvidenceTests(DroverTestCase):
         self.d = self.load_drover()
         self.wt = self.work / "app"
 
-    def make(self, tool: str, base_output: str, base_exit: int, **extra) -> None:
-        """基线提交：tool 在基线上打印 base_output、以 base_exit 退出（extra 里的 sleep 等原样写进 spec）。"""
+    def make(self, tool: str, base_output: str, base_exit: int, files: tuple = (), **extra) -> None:
+        """基线提交：tool 在基线上打印 base_output、以 base_exit 退出（extra 里的 sleep 等原样写进 spec）；files 是另外提交的
+        空测试文件（样例里的失败对得上 worktree 里的文件，vitest 才会单独重跑）。"""
         self.base = self.init_repo(self.wt, {f"fake-{tool}.json": json.dumps(
-            {"output": base_output, "exit": base_exit, **extra})})
+            {"output": base_output, "exit": base_exit, **extra}), **{path: "// x\n" for path in files}})
 
     def verify(self, tool: str, output: str, command: str, exit_code: int = 1, timeout: float = 60) -> dict:
         self.write_spec(self.wt, tool, {"output": output, "exit": exit_code})
@@ -279,7 +318,46 @@ class BaselineEvidenceTests(DroverTestCase):
                 entry = self.verify(tool, output, command)
                 self.assertFalse(entry["ok"], entry)
                 self.assertEqual(entry["baseline"]["new_failures"], new)
-                self.assertNotIn("note", entry)
+                self.assertNotIn("没有新增", entry.get("note", ""))
+                if tool != "vitest":  # vitest 的 note 写的是为什么没做单独重跑
+                    self.assertNotIn("note", entry)
+
+    def test_vitest_suite_failures_and_multi_error_compared(self) -> None:
+        """vitest 4.1.7 的真实输出回放：describe 级套件失败、一条用例两个 error、几种形态混在一起、测试自己往 stdout 打了
+        不带 ⎯ 的 "[1/3]"，基线上也是同样的失败 → 不报"解析对不上"，照常和基线比、没有新增、判通过。样例里的文件在
+        worktree 里，当前侧先单独重跑、基线只跑这些文件"""
+        cases = [("describe 级", samples.SUITE_HOOK, ["src/suite-hook.test.ts"], 1),
+                 ("两个 error", samples.MULTI_ERROR, ["src/multi-error.test.ts"], 2),
+                 ("混在一起", samples.MIXED, ["src/file-import.test.ts", "src/multi-error.test.ts",
+                                          "src/same-name.test.ts", "src/suite-hook.test.ts"], 6),
+                 ("测试打的 [1/3]", samples.CONSOLE_COUNTER, ["src/console-divider.test.ts"], 1)]
+        for name, sample, files, count in cases:
+            with self.subTest(name):
+                self.make("vitest", sample, 1, files=tuple(files))
+                entry = self.verify("vitest", sample, "vitest run")
+                self.assertTrue(entry["ok"], entry)
+                self.assertNotIn("error", entry["baseline"])
+                self.assertEqual(entry["baseline"]["new_failures"], [])
+                self.assertEqual(entry["baseline"]["current_failures"], count)
+                self.assertEqual(entry["baseline"]["baseline_failures"], count)
+                self.assertEqual(entry["baseline"]["targets"], files)
+                self.assertEqual(entry["isolated_rerun"]["files"], files)
+                self.assertEqual(entry["isolated_rerun"]["not_reproduced"], [])
+                self.assertNotIn("flaky_files", entry)
+                self.assertIn("没有新增", entry["note"])
+
+    def test_vitest_unparsed_failure_still_blocked(self) -> None:
+        """真有解析不出的失败照样兜住：文件名认不出的用例失败、认不出的文件整个失败（基线上也是同样的输出，认得出的两条
+        都是本来就有的）→ 不和基线比、按失败处理，baseline.error 写明对不上，不建基线 worktree、不单独重跑"""
+        for name, sample, want in (("用例级", samples.UNPARSED_NAME, "解析出 0 条"),
+                                   ("整个文件", samples.UNPARSED_FILE_LEVEL, "报了 3 条失败，解析出 2 条")):
+            with self.subTest(name):
+                self.make("vitest", sample, 1, files=("src/assert-and-timeout.test.ts",))
+                entry = self.verify("vitest", sample, "vitest run")
+                self.assertFalse(entry["ok"], entry)
+                self.assertIn(want, entry["baseline"]["error"])
+                self.assertNotIn("isolated_rerun", entry)
+                self.assertFalse((self.state / "baselines").exists())
 
     def test_reported_total_mismatch_fails(self) -> None:
         """工具自己报的失败数（pytest 汇总写 2 failed）和解析出的条数（1 条 FAILED 行，基线上本来就有）对不上 → 不和基线比，
@@ -372,15 +450,106 @@ class BaselineSubsetTests(DroverTestCase):
     def base_calls(self, tool: str) -> list:
         return [c["args"] for c in self.tool_calls(tool) if c["cwd"].startswith(str(self.state / "baselines"))]
 
+    def wt_calls(self, tool: str) -> list:
+        """不在基线 worktree 里的调用：这边整套那次，vitest 还有单独重跑那次。"""
+        return [c["args"] for c in self.tool_calls(tool) if not c["cwd"].startswith(str(self.state / "baselines"))]
+
     def test_vitest_only_failed_files(self) -> None:
-        """vitest：基线只跑当前失败的文件（位置参数 src/ 去掉、选项保留）；B 没重跑，fixed 不统计它；有新增时 note 提示误报怎么判断"""
+        """vitest：这边先单独重跑失败的文件，基线只跑仍然失败的文件（两边同一条命令：位置参数 src/ 去掉、选项保留）；
+        B 没重跑，fixed 不统计它；两边都是单独跑的结果，note 不再提示"单独跑能过的误报\""""
         entry = self.verify("vitest", {"failures": [A, C]}, "vitest run src/ --environment node")
-        self.assertEqual(self.base_calls("vitest"), [["run", "--environment", "node", "src/a.test.ts", "src/c.test.ts"]])
+        subset = ["run", "--environment", "node", "src/a.test.ts", "src/c.test.ts"]
+        self.assertEqual(self.wt_calls("vitest"), [["run", "src/", "--environment", "node"], subset])
+        self.assertEqual(self.base_calls("vitest"), [subset])
         self.assertFalse(entry["ok"])
         self.assertEqual(entry["baseline"]["targets"], ["src/a.test.ts", "src/c.test.ts"])
         self.assertEqual(entry["baseline"]["new_failures"], [KEY_C])
         self.assertEqual(entry["baseline"]["fixed"], [])
         self.assertIn("只重跑了当前失败所在的 2 个文件", entry["note"])
+        self.assertNotIn("单独跑", entry["note"])
+        self.assertNotIn("flaky_files", entry)
+
+    def test_vitest_flaky_assert_not_new(self) -> None:
+        """整套里多出一条断言形态的失败，单独重跑不复现 → 不算新增、判通过，flaky_files 列出这个文件；
+        基线只跑仍然失败的两个文件"""
+        entry = self.verify("vitest", {"failures": [A, B, dict(C, flaky=True)]}, "vitest run")
+        self.assertTrue(entry["ok"], entry)
+        self.assertEqual(entry["flaky_files"], ["src/c.test.ts"])
+        self.assertEqual(entry["isolated_rerun"]["not_reproduced"], [KEY_C])
+        self.assertEqual(entry["isolated_rerun"]["exit_code"], 1)  # A、B 单独跑仍然失败
+        self.assertEqual(entry["baseline"]["new_failures"], [])
+        self.assertEqual(entry["baseline"]["targets"], ["src/a.test.ts", "src/b.test.ts"])
+        self.assertEqual(entry["baseline"]["current_failures"], 2)
+        self.assertEqual(self.wt_calls("vitest"), [["run"], ["run", "src/a.test.ts", "src/b.test.ts", "src/c.test.ts"]])
+        self.assertEqual(self.base_calls("vitest"), [["run", "src/a.test.ts", "src/b.test.ts"]])
+        self.assertIn("没有新增", entry["note"])
+        self.assertIn("没复现", entry["note"])
+
+    def test_vitest_flaky_file_level_not_new(self) -> None:
+        """整套里一个文件整个失败（import 时抛错），单独重跑不复现 → 不算新增、判通过，flaky_files 列出这个文件"""
+        entry = self.verify("vitest", {"failures": [A, {"file": "src/c.test.ts", "kind": "file", "flaky": True}]},
+                            "vitest run")
+        self.assertTrue(entry["ok"], entry)
+        self.assertEqual(entry["flaky_files"], ["src/c.test.ts"])
+        self.assertEqual(entry["isolated_rerun"]["not_reproduced"], ["src/c.test.ts [ src/c.test.ts ]"])
+        self.assertEqual(entry["baseline"]["new_failures"], [])
+        self.assertEqual(entry["baseline"]["targets"], ["src/a.test.ts"])
+
+    def test_vitest_flaky_and_real_new_kept_apart(self) -> None:
+        """偶发的（一条断言、一个文件整个失败）和真新增的同时出现 → 判失败；new_failures 只有单独跑也失败、基线上没有的那条，
+        偶发的两个文件在 flaky_files 里"""
+        flaky_assert = {"file": "src/b.test.ts", "test": "str > pads", "kind": "assert", "flaky": True}
+        flaky_file = {"file": "src/ok.test.ts", "kind": "file", "flaky": True}
+        entry = self.verify("vitest", {"failures": [A, flaky_assert, flaky_file, C]}, "vitest run")
+        self.assertFalse(entry["ok"], entry)
+        self.assertEqual(entry["flaky_files"], ["src/b.test.ts", "src/ok.test.ts"])
+        self.assertEqual(entry["baseline"]["new_failures"], [KEY_C])
+        self.assertEqual(entry["baseline"]["targets"], ["src/a.test.ts", "src/c.test.ts"])
+        self.assertEqual(self.base_calls("vitest"), [["run", "src/a.test.ts", "src/c.test.ts"]])
+        self.assertIn("没复现", entry["note"])
+
+    def test_vitest_all_flaky_skips_baseline(self) -> None:
+        """整套里的失败单独重跑全都不复现 → 直接判通过，不和基线比、不建基线 worktree"""
+        entry = self.verify("vitest", {"failures": [dict(C, flaky=True)]}, "vitest run")
+        self.assertTrue(entry["ok"], entry)
+        self.assertEqual(entry["flaky_files"], ["src/c.test.ts"])
+        self.assertNotIn("baseline", entry)
+        self.assertNotIn("compare_baseline", entry)
+        self.assertEqual(self.base_calls("vitest"), [])
+        self.assertFalse((self.state / "baselines").exists())
+
+    def test_vitest_flaky_does_not_change_baseline_targets(self) -> None:
+        """每次偶发的文件不一样，基线的目标文件还是稳定失败的那两个 → 第二次走缓存，基线只跑一次"""
+        first = self.verify("vitest", {"failures": [A, B, dict(C, flaky=True)]}, "vitest run")
+        second = self.verify("vitest", {"failures": [A, B, {"file": "src/ok.test.ts", "kind": "file", "flaky": True}]},
+                             "vitest run")
+        self.assertFalse(first["baseline"]["cached"])
+        self.assertTrue(second["ok"], second)
+        self.assertTrue(second["baseline"]["cached"])
+        self.assertEqual(second["flaky_files"], ["src/ok.test.ts"])
+        self.assertEqual(self.base_calls("vitest"), [["run", "src/a.test.ts", "src/b.test.ts"]])
+
+    def test_vitest_unusable_rerun_compares_full_run(self) -> None:
+        """重跑时点名的文件没跑全（没跑到的不能当成没复现）→ 重跑的结果不用，当前侧按整套那次的和基线比：
+        整套里才出现的那条照样算新增，note 提示误报怎么判断"""
+        entry = self.verify("vitest", {"failures": [A, dict(C, flaky=True)], "rerun_skip": ["src/c.test.ts"]},
+                            "vitest run")
+        self.assertFalse(entry["ok"], entry)
+        self.assertNotIn("flaky_files", entry)
+        self.assertIn("点名了 2 个文件", entry["isolated_rerun"]["note"])
+        self.assertEqual(entry["baseline"]["new_failures"], [KEY_C])
+        self.assertEqual(entry["baseline"]["targets"], ["src/a.test.ts", "src/c.test.ts"])
+        self.assertIn("没法用", entry["note"])
+        self.assertIn("单独跑", entry["note"])
+
+    def test_vitest_isolation_off_compares_full_run(self) -> None:
+        """命令行关了文件隔离 → 不做单独重跑，当前侧按整套那次的和基线比（以前的做法），note 写原因并提示误报怎么判断"""
+        entry = self.verify("vitest", {"failures": [A, dict(C, flaky=True)]}, "vitest run --no-isolate")
+        self.assertFalse(entry["ok"], entry)
+        self.assertNotIn("isolated_rerun", entry)
+        self.assertEqual(self.wt_calls("vitest"), [["run", "--no-isolate"]])
+        self.assertEqual(entry["baseline"]["new_failures"], [KEY_C])
+        self.assertIn("隔离", entry["note"])
         self.assertIn("单独跑", entry["note"])
 
     def test_vitest_no_new_note_says_subset(self) -> None:
@@ -399,7 +568,7 @@ class BaselineSubsetTests(DroverTestCase):
 
     def test_vitest_project_labels_match_unlabeled_base(self) -> None:
         """这边配了 test.projects（FAIL 行带 |ts| 标签 / 带颜色的色块）、BASE 上是旧配置（不带标签）：同一条用例对上同一个 key，
-        只有真新增的算新增；基线照样只点名失败的文件；新增的全是超时照样单独重跑"""
+        只有真新增的算新增；基线照样只点名失败的文件；整套里才出现的失败照样单独重跑、不算新增"""
         for labels in ("plain", "color"):
             with self.subTest(labels=labels):
                 same = self.verify("vitest", {"failures": [A, B], "project_labels": labels}, "vitest run")
@@ -410,11 +579,11 @@ class BaselineSubsetTests(DroverTestCase):
                 self.assertFalse(entry["ok"])
                 self.assertEqual(entry["baseline"]["new_failures"], [KEY_C])
                 self.assertEqual(entry["baseline"]["targets"], ["src/a.test.ts", "src/c.test.ts"])
-                flaky = self.verify("vitest", {"failures": [A, B, dict(C, kind="timeout")], "project_labels": labels},
-                                    "vitest run")
+                flaky = self.verify("vitest", {"failures": [A, B, dict(C, kind="timeout", flaky=True)],
+                                               "project_labels": labels}, "vitest run")
                 self.assertTrue(flaky["ok"], flaky)
-                self.assertEqual(flaky["flaky_timeouts"], ["src/c.test.ts"])
-                self.assertEqual(self.tool_calls("vitest")[-1]["args"], ["run", "src/c.test.ts"])
+                self.assertEqual(flaky["flaky_files"], ["src/c.test.ts"])
+                self.assertEqual(self.wt_calls("vitest")[-1], ["run", "src/a.test.ts", "src/b.test.ts", "src/c.test.ts"])
 
     def test_pytest_only_failed_files(self) -> None:
         """pytest：基线只跑失败 node id 所在的文件（-k 和它的值保留，目录 tests 去掉）"""
@@ -424,6 +593,19 @@ class BaselineSubsetTests(DroverTestCase):
         self.assertFalse(entry["ok"])
         self.assertEqual(entry["baseline"]["targets"], ["tests/test_a.py", "tests/test_c.py"])
         self.assertEqual(entry["baseline"]["new_failures"], [new])
+
+    def test_pytest_eslint_not_rerun_and_keep_hint(self) -> None:
+        """pytest、eslint 不做单独重跑（pytest 同进程跑，单独跑一个文件和整套跑语义不同；eslint 是确定性的）：这边只跑整条那一次，
+        当前侧就是它的失败；有新增落在基线单独跑过的文件里时，note 照旧提示误报怎么判断"""
+        for tool, command, calls in (("pytest", "pytest -q tests", [["-q", "tests"]]), ("eslint", "eslint src", [["src"]])):
+            with self.subTest(tool):
+                extra = "tests/test_a.py::test_new" if tool == "pytest" else ["src/a.ts", "no-undef"]
+                entry = self.verify(tool, {"failures": [*OTHER_TOOLS[tool][1], extra]}, command)
+                self.assertFalse(entry["ok"], entry)
+                self.assertEqual(self.wt_calls(tool), calls)
+                self.assertNotIn("isolated_rerun", entry)
+                self.assertEqual(len(entry["baseline"]["new_failures"]), 1)
+                self.assertIn("单独跑", entry["note"])
 
     def test_eslint_only_error_files(self) -> None:
         """eslint：基线只查报错的文件（只有 warning 的文件不算；--ext 的值保留，目录 src 去掉）"""
